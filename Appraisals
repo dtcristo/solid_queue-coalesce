@@ -2,6 +2,8 @@
 
 appraise "rails-7-1" do
   gem "railties", "~> 7.1.0"
+  # Active Support passes json 3 a quirks_mode option it no longer accepts
+  gem "json", "< 3"
 end
 
 appraise "rails-7-2" do
@@ -10,6 +12,8 @@ end
 
 appraise "rails-8-0" do
   gem "railties", "~> 8.0.0"
+  # Active Support passes json 3 a quirks_mode option it no longer accepts
+  gem "json", "< 3"
 end
 
 appraise "rails-8-1" do

@@ -141,7 +141,7 @@ module ActiveJob
       def deserialize_arguments_if_needed
         super
       rescue ActiveJob::DeserializationError => error
-        raise unless worker_coalesced_rows.any? && error.cause.is_a?(ActiveRecord::RecordNotFound)
+        raise unless worker_coalesced_rows.any? && record_not_found?(error)
 
         @coalesced_arguments_gone = true
         @arguments = []
@@ -174,7 +174,7 @@ module ActiveJob
       def load_coalesced_row(serialized)
         ActiveJob::Arguments.deserialize(serialized)
       rescue ActiveJob::DeserializationError => error
-        raise unless error.cause.is_a?(ActiveRecord::RecordNotFound)
+        raise unless record_not_found?(error)
       end
 
       def drop_coalesced_rows(rows, delete:)
@@ -183,6 +183,12 @@ module ActiveJob
             SolidQueue::CoalescedArgument.where(id: id).delete_all if delete
           end
         end
+      end
+
+      # Rails main has its own error for this, and its cause isn't Active Record's
+      def record_not_found?(error)
+        error.cause.is_a?(ActiveRecord::RecordNotFound) ||
+          (defined?(ActiveJob::DeserializationError::RecordNotFound) && error.is_a?(ActiveJob::DeserializationError::RecordNotFound))
       end
 
       def coalesced_call_from(call_arguments)

@@ -444,10 +444,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     RecordsCollectedJob.perform_later(@b)
     job = SolidQueue::Job.sole
     @a.destroy!
-    GlobalID::Locator.stubs(:locate).raises(ActiveRecord::ConnectionNotEstablished, "gone")
+    JobResult.stubs(:find).raises(ActiveRecord::ConnectionNotEstablished, "gone")
 
     assert_raises(ActiveJob::DeserializationError) { perform_ready_jobs }
-    GlobalID::Locator.unstub(:locate)
+    JobResult.unstub(:find)
 
     assert job.reload.failed?
     assert_equal 2, job.coalesced_arguments.count
