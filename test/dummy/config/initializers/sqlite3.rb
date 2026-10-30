@@ -1,0 +1,37 @@
+module SqliteImmediateTransactions
+  def begin_db_transaction
+    log("begin immediate transaction", "TRANSACTION") do
+      with_raw_connection(allow_retry: true, materialize_transactions: false) do |conn|
+        conn.transaction(:immediate)
+      end
+    end
+  end
+end
+
+module SQLite3Configuration
+  private
+    def configure_connection
+      super
+
+      if @config[:retries]
+        retries = self.class.type_cast_config_to_integer(@config[:retries])
+        raw_connection.busy_handler do |count|
+          (count <= retries).tap { |result| sleep count * 0.001 if result }
+        end
+      end
+    end
+end
+
+ActiveSupport.on_load :active_record do
+  if defined?(ActiveRecord::ConnectionAdapters::SQLite3Adapter)
+    # Rails 8.0+ has immediate transactions built-in
+    if Rails::VERSION::MAJOR < 8
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.prepend SqliteImmediateTransactions
+    end
+    ActiveRecord::ConnectionAdapters::SQLite3Adapter.prepend SQLite3Configuration
+  end
+
+  # Suppress fork safety warnings in the dummy app (used by test suite)
+  # Warnings are safe: https://github.com/rails/solid_queue/issues/506
+  SQLite3::ForkSafety.suppress_warnings! if defined?(SQLite3::ForkSafety)
+end

@@ -1,0 +1,81 @@
+name: Build
+on: [ push, pull_request ]
+
+jobs:
+  rubocop:
+    name: Rubocop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Ruby and install gems
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.4
+          bundler-cache: true
+          cache-version: 1
+      - name: Run rubocop
+        run: |
+          bundle exec rubocop --parallel
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version:
+        - 3.2
+        - 3.3
+        - 3.4
+        - 4.0
+        database: [ mysql, postgres, sqlite ]
+        gemfile: [ rails_7_1, rails_7_2, rails_8_0, rails_8_1, rails_main ]
+        exclude:
+          - ruby-version: "3.2"
+            gemfile: rails_main
+    services:
+      mysql:
+        image: mysql:8.0.31
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 33066:3306
+        options: --health-cmd "mysql -h localhost -e \"select now()\"" --health-interval 1s --health-timeout 5s --health-retries 30
+      postgres:
+        image: postgres:15.1
+        env:
+          POSTGRES_HOST_AUTH_METHOD: "trust"
+        ports:
+          - 55432:5432
+    env:
+      TARGET_DB: ${{ matrix.database }}
+      BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/${{ matrix.gemfile }}.gemfile
+      RAILS_ENV: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Ruby and install gems
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: true
+          cache-version: 1
+      - name: Update to latest Rails
+        run: |
+          bundle update railties
+      - name: Setup test database
+        run: |
+          bin/rails db:setup
+      - name: Run tests
+        run: bin/rails test
+      - name: Upload logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.database }}-${{ matrix.gemfile }}-ruby${{ matrix.ruby-version }}-attempt${{ github.run_attempt }}
+          path: |
+            test/dummy/log/test.log
+          if-no-files-found: ignore
+          retention-days: 30
