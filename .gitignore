@@ -1,0 +1,25 @@
+/.bundle/
+/doc/
+/gemfiles/*.lock
+/log/*.log
+/pkg/
+/tmp/
+/test/dummy/db/*.sqlite3
+/test/dummy/db/*.sqlite3-*
+/test/dummy/log/*.log*
+/test/dummy/tmp/
+
+# Folder for JetBrains IDEs
+/.idea/
+
+# Folder for Visual Studio Code
+/.vscode/
+
+# Files for RVM holdouts
+.ruby-gemset
+
+# misc
+.DS_Store
+
+# Gem, so no lockfile
+/Gemfile.lock
