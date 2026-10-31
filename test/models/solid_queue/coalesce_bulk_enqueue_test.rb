@@ -23,6 +23,19 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     def perform_batch(_calls); end
   end
 
+  class CountingCollectJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+
+    attr_reader :serializations
+
+    def serialize
+      @serializations = serializations.to_i + 1
+      super
+    end
+
+    def perform_batch(_calls); end
+  end
+
   class RaisingKeyJob < ApplicationJob
     coalesce key: ->(*) { raise ExpectedTestError, "no key" }
 
@@ -114,6 +127,19 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert_equal [ "a", 0 ], SolidQueue::Job.sole.arguments["arguments"]
   end
 
+  test "each collect call serializes once, through job creation and a deadlock retry" do
+    jobs = 3.times.map { |i| CountingCollectJob.new("a", i) }
+
+    failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(jobs.first), error: ActiveRecord::Deadlocked) do
+      assert_equal 3, SolidQueue::Job.enqueue_all(jobs)
+    end
+
+    assert_equal [ 1, 1, 1 ], jobs.map(&:serializations)
+    assert_equal [ jobs[0], jobs[2] ].map(&:job_id), SolidQueue::Job.order(:id).pluck(:active_job_id)
+    assert_equal [ "a", 0 ], SolidQueue::Job.order(:id).first.arguments["arguments"]
+    assert_equal jobs.map(&:job_id), SolidQueue::CoalescedCall.order(:id).map { |row| row.arguments["job_id"] }
+  end
+
   test "a raising subscriber leaves every call in a collecting batch with its outcome, and later calls with none" do
     batch = 2.times.map { |i| CollectJob.new("a", i) }
     later = [ CollectJob.new("a", 2), DiscardJob.new("b") ]
@@ -161,7 +187,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
   test "a failure partway through sealed batches keeps earlier work, and later calls have no outcome" do
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
 
-    failing(SolidQueue::CoalescedCall, :insert_all, on_attempt: 2) do
+    failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
       assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c ]) }
     end
 
@@ -177,8 +203,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
     discard_c = DiscardJob.new("c")
 
-    # Sorted by key: CollectJob/a takes three jobs and CollectJob/c one, then DiscardJob/b
-    failing(SolidQueue::Job, :create!, on_attempt: 5) do
+    failing(SolidQueue::Job, :create!, matching: creating(discard_b.first)) do
       assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c, discard_c ]) }
     end
 
@@ -203,7 +228,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
     jobs = [ ordinary, *collect_a, *discard_b, collect_c ]
 
-    failing(SolidQueue::CoalescedCall, :insert_all, on_attempt: 2) do
+    failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
       assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
     end
 
@@ -259,8 +284,8 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
     jobs = [ ordinary, *collect_a, *discard_b, collect_c ]
 
-    failing(SolidQueue::CoalescedCall, :insert_all, on_attempt: 2, error: ActiveRecord::Deadlocked) do
-      failing(SolidQueue::Job, :create!, on_attempt: 6, error: ActiveRecord::Deadlocked) do
+    failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2]), error: ActiveRecord::Deadlocked) do
+      failing(SolidQueue::Job, :create!, matching: creating(discard_b.first), error: ActiveRecord::Deadlocked) do
         assert_equal 8, SolidQueue::Job.enqueue_all(jobs)
       end
     end
@@ -292,7 +317,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
   test "a failure inside an enclosing transaction rolls back everything" do
     jobs = mixed_jobs
 
-    failing(SolidQueue::CoalescedCall, :insert_all, on_attempt: 2) do
+    failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(jobs.find { |job| job.is_a?(CollectJob) })) do
       assert_raises(SolidQueue::Job::EnqueueError) do
         SolidQueue::Record.transaction { SolidQueue::Job.enqueue_all(jobs) }
       end
@@ -310,19 +335,34 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
       mixed_jobs_by_kind.flatten
     end
 
-    # Runs the method, then raises as if it had failed, so its transaction has
-    # something to roll back
-    def failing(receiver, method_name, on_attempt:, error: ActiveRecord::StatementInvalid)
+    # Runs the method, then raises once as if it had failed, so its transaction has
+    # something to roll back. It has to raise, or the test wouldn't cover the failure.
+    def failing(receiver, method_name, matching:, error: ActiveRecord::StatementInvalid)
       original = receiver.method(method_name)
-      attempts = 0
+      failed = false
 
       receiver.define_singleton_method(method_name) do |*args, **options, &block|
-        original.call(*args, **options, &block).tap { raise error, "boom" if (attempts += 1) == on_attempt }
+        original.call(*args, **options, &block).tap do
+          if !failed && matching.call(*args, **options)
+            failed = true
+            raise error, "boom"
+          end
+        end
       end
 
       yield
+
+      assert failed, "#{receiver}.#{method_name} never got the call that was meant to fail"
     ensure
       receiver.singleton_class.remove_method(method_name)
+    end
+
+    def storing(call)
+      ->(rows, **) { rows.any? { |row| row[:arguments]["job_id"] == call.job_id } }
+    end
+
+    def creating(call)
+      ->(active_job_id:, **) { active_job_id == call.job_id }
     end
 
     def capture_events

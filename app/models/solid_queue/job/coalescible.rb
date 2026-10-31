@@ -180,7 +180,7 @@ module SolidQueue
               coalesce_key.destroy!
               [ 0 ]
             else
-              created_job = create_collecting(calls.first.first) if coalesce_key.job_id.nil?
+              created_job = create_collecting(*calls.first) if coalesce_key.job_id.nil?
               job_id = coalesce_key.job_id || created_job.id
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
@@ -190,10 +190,19 @@ module SolidQueue
             end
           end
 
-          def create_collecting(active_job)
-            attributes = attributes_from_active_job(active_job)
-
-            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_collecting" => true))
+          # Not attributes_from_active_job, which serializes the call again, and that
+          # could raise after earlier batches committed. A coalesced call is never in
+          # a batch, so it has no batch_id to set.
+          def create_collecting(active_job, payload)
+            create!(
+              queue_name: active_job.queue_name || singleton_class::DEFAULT_QUEUE_NAME,
+              active_job_id: active_job.job_id,
+              priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
+              scheduled_at: active_job.scheduled_at,
+              class_name: active_job.class.name,
+              arguments: payload.merge("coalesce_collecting" => true),
+              concurrency_key: active_job.concurrency_key
+            )
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
