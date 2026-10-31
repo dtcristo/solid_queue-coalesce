@@ -195,6 +195,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     assert_equal [ true, false ], jobs.map(&:successfully_enqueued?)
     assert_equal [ :created, :discarded ], jobs.map(&:coalesce_status)
+    assert_equal SolidQueue::Job.sole.id, jobs.map(&:provider_job_id).uniq.sole
     assert_equal [ :created, :discarded ], events.map { |event| event.payload[:action] }
     assert_equal jobs.map(&:job_id), events.map { |event| event.payload[:active_job_id] }
     assert_empty JobBuffer.values
@@ -207,6 +208,8 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     events = capture_events("coalesce.solid_queue") { discarded = DiscardingRefreshJob.perform_later("b", "group") }
 
     assert_nil discarded.coalesce_status
+    assert_nil discarded.provider_job_id
+    assert discarded.successfully_enqueued?, "Active Job sets it, so it doesn't mean the call was stored"
     assert_empty events
   end
 
@@ -217,6 +220,8 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     events = capture_events("coalesce.solid_queue") { assert_equal 0, SolidQueue::Job.enqueue_all(jobs) }
 
     assert_equal [ nil, nil ], jobs.map(&:coalesce_status)
+    assert_equal [ nil, nil ], jobs.map(&:provider_job_id)
+    assert_equal [ false, false ], jobs.map(&:successfully_enqueued?)
     assert_empty events
   end
 
@@ -241,6 +246,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
         second = CoalescedRefreshJob.perform_later("a")
 
         assert_equal :discarded, second.coalesce_status
+        assert second.successfully_enqueued?, "Active Job sets it, so it doesn't mean the call was stored"
         assert_equal first.provider_job_id, second.provider_job_id
         assert_not_equal first.job_id, second.job_id
       end
@@ -502,6 +508,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
       assert_equal 0, SolidQueue::Job.count
       assert_nil active_job.coalesce_status
       assert_nil active_job.provider_job_id
+      assert active_job.successfully_enqueued?
     end
 
     assert_equal :created, active_job.coalesce_status
@@ -513,11 +520,15 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   test "a deferred call is dropped when the app's transaction rolls back" do
     skip_without_enqueue_after_transaction_commit
 
+    active_job = nil
     JobResult.transaction do
-      DeferredRefreshJob.perform_later("a")
+      active_job = DeferredRefreshJob.perform_later("a")
       raise ActiveRecord::Rollback
     end
 
+    assert_nil active_job.coalesce_status
+    assert_nil active_job.provider_job_id
+    assert active_job.successfully_enqueued?
     assert_equal 0, SolidQueue::Job.count
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
@@ -531,6 +542,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     assert_equal :discarded, second.coalesce_status
     assert_equal first.provider_job_id, second.provider_job_id
+    assert second.successfully_enqueued?
     assert_equal 1, SolidQueue::Job.count
   end
 

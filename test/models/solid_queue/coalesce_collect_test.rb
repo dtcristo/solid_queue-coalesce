@@ -197,6 +197,19 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
+  class ForwardingJob < ApplicationJob
+    coalesce key: "forwarding", on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.map { |call| handle(*call.arguments) })
+    end
+
+    private
+      def handle(name, options = nil, force: false)
+        [ name, options, force ]
+      end
+  end
+
   class MutatingDeserializeJob < ApplicationJob
     coalesce key: "mutating", on_conflict: :collect
 
@@ -406,6 +419,16 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert job.reload.failed?
     assert_equal 2, job.coalesced_calls.count
     assert_empty JobBuffer.values
+  end
+
+  test "forwarding a call's arguments keeps keywords and trailing hashes apart" do
+    ForwardingJob.perform_later("a", force: true)
+    ForwardingJob.perform_later("a", { force: true })
+    ForwardingJob.perform_later("a", { "force" => true })
+
+    perform_ready_jobs
+
+    assert_equal [ [ "a", nil, true ], [ "a", { force: true }, false ], [ "a", { "force" => true }, false ] ], JobBuffer.values.sole
   end
 
   test "ids from a batch feed one bounded query" do
@@ -1030,6 +1053,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     JobResult.transaction do
       calls = 3.times.map { |i| DeferredCollectedJob.perform_later("g", i) }
       assert_equal 0, SolidQueue::CoalescedCall.count
+      assert_equal [ nil, nil, nil ], calls.map(&:coalesce_status)
+      assert_equal [ nil, nil, nil ], calls.map(&:provider_job_id)
+      assert calls.all?(&:successfully_enqueued?)
     end
 
     assert_equal [ :created, :collected, :created ], calls.map(&:coalesce_status)
