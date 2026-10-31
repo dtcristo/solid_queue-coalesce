@@ -48,6 +48,14 @@ module SolidQueue
         end
       end
 
+      # For jobs deleted in bulk, which skips their destroy callback. In the order of
+      # the keys, so that two of these can't deadlock with each other.
+      def release_all(job_ids)
+        where(job_id: job_ids).order(:key).pluck(:key, :job_id).each do |key, job_id|
+          lock.find_by(key: key, job_id: job_id)&.destroy!
+        end
+      end
+
       private
         # MySQL's check is because locking a row that isn't there takes a gap lock,
         # and that blocks the insert of every other new key.

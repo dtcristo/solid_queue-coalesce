@@ -37,6 +37,24 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
+  class LimitedBatchJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    limits_concurrency key: ->(group, *) { group }, to: 1
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.size)
+    end
+  end
+
+  class DeferredCollectedJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :always : true if respond_to?(:enqueue_after_transaction_commit=)
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.map(&:arguments))
+    end
+  end
+
   class InlineCollectedJob < ApplicationJob
     self.queue_adapter = :inline
 
@@ -885,6 +903,72 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
     assert_equal [ open ], SolidQueue::CoalescedCall.pluck(:job_id)
     assert_equal open, SolidQueue::CoalesceKey.sole.job_id
+  end
+
+  test "deferred calls are collected when the app's transaction commits, and none when it rolls back" do
+    skip "Needs Rails 7.2" unless ActiveJob::Base.respond_to?(:enqueue_after_transaction_commit=)
+
+    JobResult.transaction do
+      DeferredCollectedJob.perform_later("g", 0)
+      raise ActiveRecord::Rollback
+    end
+    assert_equal 0, SolidQueue::CoalescedCall.count
+
+    calls = nil
+    JobResult.transaction do
+      calls = 3.times.map { |i| DeferredCollectedJob.perform_later("g", i) }
+      assert_equal 0, SolidQueue::CoalescedCall.count
+    end
+
+    assert_equal [ :created, :collected, :created ], calls.map(&:coalesce_status)
+    assert_equal 3, SolidQueue::CoalescedCall.count
+  end
+
+  test "bulk deferred calls are collected when the app's transaction commits" do
+    skip "Needs a Rails that defers perform_all_later" unless defined?(ActiveJob::EnqueueAfterTransactionCommit::ActiveJobMethods)
+
+    calls = 3.times.map { |i| DeferredCollectedJob.new("g", i) }
+    JobResult.transaction do
+      ActiveJob.perform_all_later(calls)
+      assert_equal 0, SolidQueue::CoalescedCall.count
+    end
+
+    assert_equal [ :created, :collected, :created ], calls.map(&:coalesce_status)
+    assert_equal 3, SolidQueue::CoalescedCall.count
+  end
+
+  test "bulk discarding open and sealed jobs deletes their calls and frees only their keys" do
+    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 0)
+    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 1)
+    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 2)
+
+    SolidQueue::ScheduledExecution.discard_all_in_batches
+
+    assert_equal 0, SolidQueue::Job.count
+    assert_equal 0, SolidQueue::CoalescedCall.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "bulk discarding some jobs leaves another job's key alone" do
+    discarded = BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 0).provider_job_id
+    kept = BatchOfTwoJob.set(wait: 1.hour).perform_later("h", 0).provider_job_id
+
+    SolidQueue::ScheduledExecution.discard_all_from_jobs(SolidQueue::Job.where(id: discarded))
+
+    assert_equal kept, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal [ kept ], SolidQueue::CoalescedCall.pluck(:job_id)
+  end
+
+  test "clearing a queue frees the keys of its jobs, before releasing their semaphores" do
+    LimitedBatchJob.perform_later("g", 0)
+    queries = []
+    callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].match?(/\A(DELETE FROM .solid_queue_coalesce_keys|UPDATE .solid_queue_semaphores)/) }
+
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { SolidQueue::Queue.find_by_name("default").clear }
+
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal 0, SolidQueue::CoalescedCall.count
+    assert_equal [ "DELETE", "UPDATE" ], queries.map { |sql| sql.split.first }
   end
 
   test "clearing a finished job deletes its calls" do

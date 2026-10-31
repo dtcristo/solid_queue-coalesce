@@ -205,6 +205,56 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
   end
 
+  test "a bulk discard waits for an admission holding the key, instead of deadlocking with it" do
+    skip_on_sqlite
+
+    first = CollectFiveJob.perform_later("g", 0)
+    job_id = first.provider_job_id
+    admitted = Concurrent::Event.new
+    discarding = Concurrent::Event.new
+
+    admission = in_thread do
+      SolidQueue::Record.transaction do
+        key = SolidQueue::CoalesceKey.admit_exclusively("#{CollectFiveJob.name}/g")
+        admitted.set
+        discarding.wait(5)
+        sleep 0.3
+        SolidQueue::CoalescedCall.insert_all([ { job_id: key.job_id, arguments: CollectFiveJob.new("g", 1).serialize } ])
+        key.fill(key.job_id, 1, 5)
+      end
+    end
+
+    admitted.wait(5)
+    discard = in_thread do
+      discarding.set
+      SolidQueue::ReadyExecution.discard_all_from_jobs(SolidQueue::Job.where(id: job_id))
+    end
+
+    discard.value
+    admission.value
+
+    assert_equal 0, SolidQueue::Job.where(id: job_id).count
+    assert_equal 0, SolidQueue::CoalescedCall.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "bulk discards racing calls don't fail, and never leave a key or a call without its job" do
+    results = race(5) do |thread|
+      20.times.map do |i|
+        if thread.zero?
+          SolidQueue::ReadyExecution.discard_all_in_batches
+          nil
+        else
+          CollectFiveJob.perform_later("g", thread, i)
+        end
+      end
+    end
+
+    assert results.flatten.compact.all?(&:successfully_enqueued?)
+    assert_equal [], SolidQueue::CoalesceKey.pluck(:job_id) - SolidQueue::Job.pluck(:id)
+    assert_equal [], SolidQueue::CoalescedCall.pluck(:job_id).uniq - SolidQueue::Job.pluck(:id)
+  end
+
   test "appends racing discards of the open job don't fail, and every append ends up on a job" do
     rounds = 20
     results = race(5) do |thread|
