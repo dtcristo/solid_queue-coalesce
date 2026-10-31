@@ -27,7 +27,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     key, on_conflict, batch_size = ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_batch_size
 
     begin
-      ResumableCollectedJob.coalesce_key = ResumableCollectedJob.coalesce_on_conflict = ResumableCollectedJob.coalesce_batch_size = nil
+      stop_coalescing(ResumableCollectedJob)
       ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
 
       assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
@@ -42,6 +42,13 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert resumed.reload.finished?
+    assert_equal [
+      [ :run, @results.map(&:id) ],
+      [ :processed, @results.first.id ],
+      [ :run, @results.map(&:id) ],
+      [ :processed, @results.second.id ],
+      [ :processed, @results.third.id ]
+    ], JobBuffer.values
   end
 
   test "a resume keeps the calls on the new job and carries on with the standard step behaviour" do

@@ -43,11 +43,13 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
   teardown do
     collect
     ChangingJob.fail_next_batch = false
+    LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :block
+    LimitedJob.coalesce key: "limited", on_conflict: :collect
   end
 
   test "a collecting job whose class stopped coalescing fails and keeps its calls" do
     job = enqueue_calls
-    stop_coalescing
+    stop_coalescing(ChangingJob)
 
     error = assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
 
@@ -71,7 +73,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
   test "a job failed for a changed class runs all of its calls when it's restored and retried" do
     job = enqueue_calls
-    stop_coalescing
+    stop_coalescing(ChangingJob)
     assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
 
     assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) do
@@ -95,7 +97,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     perform_ready_jobs
     retrying_job = SolidQueue::Job.where(finished_at: nil).sole
     assert_equal 2, retrying_job.coalesced_calls.count
-    stop_coalescing
+    stop_coalescing(ChangingJob)
 
     assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
     assert retrying_job.reload.failed?
@@ -124,29 +126,30 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
   end
 
   test "a concurrency conflict doesn't destroy a collecting job whose class now discards conflicts" do
-    job = limited_job_whose_class_stopped_collecting
+    LimitedJob.set(wait: 1.hour).perform_later(1)
+    LimitedJob.set(wait: 1.hour).perform_later(2)
+    job = SolidQueue::Job.sole
+    stop_limited_job_collecting
+    LimitedJob.perform_later(3)
+
+    travel_to(2.hours.from_now) { SolidQueue::ScheduledExecution.dispatch_next_batch(10) }
 
     assert job.reload.blocked?
     assert_equal 2, job.coalesced_calls.count
-  ensure
-    restore_limited_job
   end
 
   test "retrying a failed collecting job through a conflict doesn't destroy it either" do
-    job = limited_job
-
-    LimitedJob.coalesce_key = LimitedJob.coalesce_on_conflict = LimitedJob.coalesce_batch_size = nil
-    LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :discard
-    SolidQueue::ReadyExecution.delete_all
-    job.failed_with(ExpectedTestError.new("boom"))
-    SolidQueue::Semaphore.wait(job)
+    LimitedJob.perform_later(1)
+    LimitedJob.perform_later(2)
+    job = SolidQueue::Job.sole
+    stop_limited_job_collecting
+    assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
+    LimitedJob.perform_later(3)
 
     SolidQueue::Job.find(job.id).retry
 
     assert job.reload.blocked?
     assert_equal 2, job.coalesced_calls.count
-  ensure
-    restore_limited_job
   end
 
   test "a collecting job drained after its class changed adapter still runs all of its calls" do
@@ -161,14 +164,34 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     ChangingJob.queue_adapter = :solid_queue
   end
 
+  test "a retry on another adapter fails the job with its calls, and restoring the adapter runs them" do
+    job = enqueue_calls
+    ChangingJob.fail_next_batch = true
+    ChangingJob.queue_adapter = :test
+
+    assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
+
+    assert job.reload.failed?
+    assert_equal 2, job.coalesced_calls.count
+
+    ChangingJob.queue_adapter = :solid_queue
+    SolidQueue::Job.find(job.id).retry
+    perform_ready_jobs
+
+    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ] * 2, JobBuffer.values
+    assert job.reload.finished?
+  ensure
+    ChangingJob.queue_adapter = :solid_queue
+  end
+
   test "a collecting job that lost its claim doesn't run its own arguments" do
     job = enqueue_calls
-    SolidQueue::CoalescedCall.where(job_id: job.id).delete_all
     active_job = ActiveJob::Base.deserialize(job.arguments.merge("provider_job_id" => job.id))
 
     assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { active_job.perform_now }
 
     assert_empty JobBuffer.values
+    assert_equal 2, job.coalesced_calls.count
   end
 
   test "enqueueing the same instance twice doesn't mark its call" do
@@ -256,7 +279,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_not ChangingJob.new(1).serialize.key?("coalesce_collecting")
   end
 
-  test "running an ordinary job never reads the calls table" do
+  test "running an ordinary job costs only the documented key read" do
     AddToBufferJob.perform_later("plain")
     queries = []
 
@@ -360,31 +383,9 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
       ChangingJob.coalesce key: "changing", on_conflict: :discard
     end
 
-    def stop_coalescing
-      ChangingJob.coalesce_key = nil
-      ChangingJob.coalesce_on_conflict = nil
-      ChangingJob.coalesce_batch_size = nil
-    end
-
-    def limited_job
-      LimitedJob.perform_later(1)
-      LimitedJob.perform_later(2)
-      SolidQueue::Job.where(class_name: LimitedJob.name).sole
-    end
-
-    def limited_job_whose_class_stopped_collecting
-      job = limited_job
-      LimitedJob.coalesce_key = LimitedJob.coalesce_on_conflict = LimitedJob.coalesce_batch_size = nil
+    def stop_limited_job_collecting
+      stop_coalescing(LimitedJob)
       LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :discard
-      SolidQueue::ReadyExecution.delete_all
-      SolidQueue::Semaphore.wait(job)
-      job.dispatch
-      job
-    end
-
-    def restore_limited_job
-      LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :block
-      LimitedJob.coalesce key: "limited", on_conflict: :collect
     end
 
     def enqueue_calls

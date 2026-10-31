@@ -285,7 +285,8 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Remove `:collect` or `coalesce` | The job fails with its calls, as above |
 | Switch `:collect` to `:discard` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
 | Switch `:discard` to `:collect` | The next call doesn't join the discarding job, and creates a new one. The old job runs a batch of one from its own arguments |
-| Add `limits_concurrency` with `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
+| Change `limits_concurrency` to `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
+| Change the queue adapter | Waiting jobs still run their calls. A retry of one raises `CollectedJobMismatch`, and the job fails with its calls |
 | Remove `perform_batch` | The run raises `NotImplementedError`, and the job fails with its calls, unless a handler such as `discard_on Exception` takes it |
 | Rename or remove the class | The job fails with its calls |
 | Change `batch_size` | Waiting calls aren't touched. An open job that's now over the new size gets sealed by the next call |
@@ -298,7 +299,7 @@ Jobs enqueued by version 0.1 don't have the record, so this doesn't protect them
 ## Rules and limitations
 
 - A coalesced job can't be enqueued inside `SolidQueue::Batch.enqueue`, either alone or in bulk. A call that joins a pending job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
-- Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
+- Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`. On any database with row locks, the same can happen inside your own transaction to a call that takes over a key from a collecting job, after its class switched to `:discard`.
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.

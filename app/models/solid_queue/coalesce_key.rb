@@ -51,9 +51,11 @@ module SolidQueue
       end
 
       # Lets go of a job from when the key's class collected. Checks again under the
-      # lock, because another call may have got here first.
+      # lock, because another call may have got here first. Doesn't check for the row
+      # first like lock_if_present: inside an older MySQL snapshot that plain read can
+      # miss a row that admission's locking read keeps finding, and we'd never seal it.
       def seal_collecting(key)
-        coalesce_key = lock_if_present(key)
+        coalesce_key = lock.find_by(key: key)
         coalesce_key.destroy! if coalesce_key&.collecting?
       end
 

@@ -13,6 +13,10 @@ module JobsTestHelper
     job.update!(class_name: name, arguments: job.arguments.merge("job_class" => name))
   end
 
+  def stop_coalescing(job_class)
+    job_class.coalesce_key = job_class.coalesce_on_conflict = job_class.coalesce_batch_size = nil
+  end
+
   # What has to hold whenever nothing is in the middle of a transaction: a key's job
   # is live and hasn't started, and its count is the number of calls that job has.
   def assert_coalesce_invariants

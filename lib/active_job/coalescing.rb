@@ -146,6 +146,8 @@ module ActiveJob
     # A retry that doesn't get enqueued has to fail the run: finishing would
     # destroy the job and the calls it owns, with no job left to process them.
     def retry_job(options = {})
+      ensure_retry_can_take_calls
+
       super.tap do |enqueued|
         if @coalesced_run && !enqueued
           raise enqueue_error || SolidQueue::Job::EnqueueError.new("Couldn't enqueue the retry of #{self.class.name} (#{job_id})")
@@ -155,13 +157,22 @@ module ActiveJob
 
     private
       # Only the run of a job a worker has claimed. perform_now on an instance that
-      # went through perform_later also has a provider_job_id.
+      # went through perform_later also has a provider_job_id. A collecting job always
+      # looks for its run, because the marker outlives the class's key and adapter.
       def start_coalesced_run
         ensure_still_collecting if @coalesce_collecting
 
         if @coalesce_collecting || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")
           @coalesced_run = SolidQueue::Job.joins(:claimed_execution).find_by(id: provider_job_id)&.start_coalesced_run
           ensure_calls_present if @coalesce_collecting
+        end
+      end
+
+      # Only Solid Queue moves the calls to the retry. On another adapter the retry
+      # would succeed, and they'd stay behind on a job that goes on to finish.
+      def ensure_retry_can_take_calls
+        if worker_coalesced_rows.any? && self.class.queue_adapter_name != "solid_queue"
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) owns collected calls, which can't move to a retry on the `#{self.class.queue_adapter_name}` adapter. Its calls are kept: restore the Solid Queue adapter and retry this failed job, or discard the job to delete them."
         end
       end
 

@@ -102,6 +102,26 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     change_mode_to :collect
   end
 
+  test "a discard call whose transaction started before the collecting key existed takes it over" do
+    skip_on_sqlite
+
+    change_mode_to :collect
+    call = nil
+
+    SolidQueue::Job.transaction do
+      SolidQueue::Job.count
+      Thread.new { ChangingModeJob.perform_later("g", :seed) }.join
+      change_mode_to :discard
+
+      call = Timeout.timeout(10) { ChangingModeJob.perform_later("g", :call) }
+    end
+
+    assert_equal :created, call.coalesce_status
+    assert_equal call.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+  ensure
+    change_mode_to :collect
+  end
+
   test "concurrent calls to a class that started collecting never join a discarding job" do
     3.times do |round|
       change_mode_to :discard

@@ -102,17 +102,18 @@ module SolidQueue
           # can't count on that job, which fails without running it, so it seals the
           # job and tries again. Sealing is outside the transaction that found it: every
           # call waiting on the key holds the same share lock, and upgrading it deadlocks
-          # with all of them.
+          # with all of them. Inside the caller's own transaction it can't be outside,
+          # so that deadlock can reach the caller, as in retrying_deadlocks.
           def admit_discarding(key, active_job)
             loop do
-              admitted = transaction { admit_coalesced(key, active_job) }
+              admitted = transaction { admit_unless_collecting(key, active_job) }
               return admitted if admitted
 
               transaction { CoalesceKey.seal_collecting(key) }
             end
           end
 
-          def admit_coalesced(key, active_job)
+          def admit_unless_collecting(key, active_job)
             coalesce_key = CoalesceKey.admit(key)
 
             unless coalesce_key.collecting?
