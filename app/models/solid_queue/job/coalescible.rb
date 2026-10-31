@@ -123,6 +123,7 @@ module SolidQueue
           # destroys the job that was just created, nothing holds the key.
           def record_coalesced(key, active_jobs, enqueued_job, open_job_id)
             collect = active_jobs.first.class.coalesce_collect?
+            joined_action = collect ? :collected : :discarded
 
             active_jobs.each_with_index do |active_job, index|
               created = enqueued_job && index.zero?
@@ -132,7 +133,7 @@ module SolidQueue
                 active_job.successfully_enqueued = collect
               end
 
-              active_job.coalesce_status = open_job_id && (created ? :created : collect ? :collected : :discarded)
+              active_job.coalesce_status = open_job_id && (created ? :created : joined_action)
 
               if open_job_id
                 SolidQueue.instrument(:coalesce, action: active_job.coalesce_status, key: key, job_id: open_job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)

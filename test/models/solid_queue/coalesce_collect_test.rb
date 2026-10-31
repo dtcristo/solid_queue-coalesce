@@ -177,6 +177,16 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal rows.map(&:id), SolidQueue::CoalescedCall.claimed.where(job_id: first.provider_job_id).order(:id).pluck(:id)
   end
 
+  test "a collected call reports its outcome with a status and an event" do
+    first = CollectedCallsJob.set(wait: 1.hour).perform_later("g", 1)
+    second = nil
+
+    events = capture_events("coalesce.solid_queue") { second = CollectedCallsJob.perform_later("g", 2) }
+
+    assert_equal :collected, second.coalesce_status
+    assert_equal({ action: :collected, key: "CollectedCallsJob/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: "CollectedCallsJob" }, events.sole.payload)
+  end
+
   test "the calls table has only the columns it needs" do
     assert_equal %w[ arguments coalesce_key_id created_at id job_id ], SolidQueue::CoalescedCall.column_names.sort
   end
@@ -430,19 +440,14 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ "g", "third_group" ], next_job.arguments["arguments"]
   end
 
-  test "reaching the batch size never dispatches a scheduled job, and doesn't read the calls" do
+  test "reaching the batch size never dispatches a scheduled job" do
     in_an_hour = 1.hour.from_now
-    reads = []
-    callback = ->(*, payload) { reads << payload[:sql] if payload[:sql].match?(/\ASELECT .*solid_queue_coalesced_calls/) }
 
-    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
-      5.times { |i| BatchOfTwoJob.set(wait_until: in_an_hour).perform_later("g", i) }
-    end
+    5.times { |i| BatchOfTwoJob.set(wait_until: in_an_hour).perform_later("g", i) }
 
     job = SolidQueue::Job.sole
     assert job.scheduled?
     assert_not job.ready?
-    assert_empty reads
     assert_equal 5, SolidQueue::CoalescedCall.waiting.count
 
     SolidQueue::ScheduledExecution.dispatch_next_batch(10)

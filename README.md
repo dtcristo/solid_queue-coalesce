@@ -6,7 +6,7 @@ It's a separate gem that adds to Solid Queue from the outside, with its own tabl
 
 Coalescing protects pending work. It doesn't stop two runs from overlapping, so use `limits_concurrency` if you need that.
 
-## Table of Contents
+## Table of contents
 
 - [Installation](#installation)
 - [Usage](#usage)
@@ -136,7 +136,7 @@ The first pending call's schedule wins. Later calls don't move it, and reaching 
 
 When a job starts it claims up to `batch_size` calls, oldest first, in one transaction. If more are waiting, a follow-up job takes over the key, in the same queue and with the same priority and concurrency key. It's due when the oldest waiting call asked to run, read from that call's `job_data["scheduled_at"]`, so it runs right away if that time has passed. A backlog that's already due drains one batch after another, and calls dated in the future wait for their time.
 
-A call that joins a pending job runs with it, even if it asked for a later time. A call that arrives after the last batch started opens a new job for its own time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
+A call that joins a pending job doesn't get its own schedule, even if it asked for a later time. It runs with that job, or in a follow-up if the batch is full. A call that arrives after the last batch started opens a new job for its own time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
 
 ## Enqueue outcomes
 
