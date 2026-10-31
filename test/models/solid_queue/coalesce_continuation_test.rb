@@ -21,6 +21,36 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     ResumableCollectedJob.stop_after = nil
   end
 
+  test "a resumed job whose class stopped coalescing fails, and runs its remaining steps once restored" do
+    perform_ready_jobs
+    resumed = SolidQueue::Job.where(finished_at: nil).sole
+    key, on_conflict, batch_size = ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_batch_size
+
+    begin
+      stop_coalescing(ResumableCollectedJob)
+      ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
+
+      assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
+      assert resumed.reload.failed?
+      assert_equal 3, resumed.coalesced_calls.count
+    ensure
+      ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_batch_size = key, on_conflict, batch_size
+    end
+
+    ResumableCollectedJob.stop_after = nil
+    resumed.retry
+    perform_ready_jobs
+
+    assert resumed.reload.finished?
+    assert_equal [
+      [ :run, @results.map(&:id) ],
+      [ :processed, @results.first.id ],
+      [ :run, @results.map(&:id) ],
+      [ :processed, @results.second.id ],
+      [ :processed, @results.third.id ]
+    ], JobBuffer.values
+  end
+
   test "a resume keeps the calls on the new job and carries on with the standard step behaviour" do
     old_job = SolidQueue::Job.sole
     rows = SolidQueue::CoalescedCall.waiting.order(:id).pluck(:id)

@@ -19,6 +19,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Deleted records](#deleted-records)
 - [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits)
 - [Discarding and retention](#discarding-and-retention)
+- [Changing a job's configuration](#changing-a-jobs-configuration)
 - [Rules and limitations](#rules-and-limitations)
 - [Monitoring](#monitoring)
 - [Testing](#testing)
@@ -162,14 +163,15 @@ Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` 
 
 `after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
 
-Two notifications exist:
+Three notifications exist:
 
 | Event | When | Payload |
 | --- | --- | --- |
 | `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
 | `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `exception_class` |
+| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `expected`, `actual` |
 
-`SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, but the key is logged, so keep secrets out of it.
+`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, but the key is logged, so keep secrets out of it.
 
 `coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
 
@@ -272,14 +274,35 @@ Calls belong to their job, and are deleted with it. Discarding a pending job del
 
 A job that fails before starting, for example because its worker died or because its class no longer exists, keeps its calls as if it had started. When you bring the class back and retry the job, it runs those same calls.
 
+## Changing a job's configuration
+
+A collecting job records that it collects in its own payload, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
+
+That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce` without failures, stop enqueuing, wait for `SolidQueue::CoalescedCall.waiting` to be empty, and only then deploy the change. Workers on the old and new code can overlap in a rolling deploy, so a job can fail on one of them and need the same recovery.
+
+| Change while calls wait | What happens |
+| --- | --- |
+| Remove `:collect` or `coalesce` | The job fails with its calls, as above |
+| Switch `:collect` to `:discard` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
+| Switch `:discard` to `:collect` | The next call doesn't join the discarding job, and creates a new one. The old job runs a batch of one from its own arguments |
+| Change `limits_concurrency` to `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
+| Change the queue adapter | Waiting jobs still run their calls. A retry of one raises `CollectedJobMismatch`, and the job fails with its calls |
+| Remove `perform_batch` | The run raises `NotImplementedError`, and the job fails with its calls, unless a handler such as `discard_on Exception` takes it |
+| Rename or remove the class | The job fails with its calls |
+| Change `batch_size` | Waiting calls aren't touched. An open job that's now over the new size gets sealed by the next call |
+| Change the key | Waiting jobs still run their calls. New calls open a job under the new key |
+
+Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
+
+Jobs enqueued by version 0.1 don't have the record, so this doesn't protect them. Drain them before you upgrade.
+
 ## Rules and limitations
 
 - A coalesced job can't be enqueued inside `SolidQueue::Batch.enqueue`, either alone or in bulk. A call that joins a pending job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
-- Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
+- Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`. On any database with row locks, the same can happen inside your own transaction to a call that takes over a key from a collecting job, after its class switched to `:discard`.
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
-- Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it. Each pending job would run once with its first call's arguments, and its other calls wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
 - Each time any job finishes, fails or gets destroyed, coalescing or not, Solid Queue does one extra indexed read of the keys table.
 
 ## Monitoring

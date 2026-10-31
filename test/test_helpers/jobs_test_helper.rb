@@ -13,6 +13,26 @@ module JobsTestHelper
     job.update!(class_name: name, arguments: job.arguments.merge("job_class" => name))
   end
 
+  def stop_coalescing(job_class)
+    job_class.coalesce_key = job_class.coalesce_on_conflict = job_class.coalesce_batch_size = nil
+  end
+
+  # What has to hold whenever nothing is in the middle of a transaction: a key's job
+  # is live and hasn't started, and its count is the number of calls that job has.
+  def assert_coalesce_invariants
+    SolidQueue::CoalesceKey.find_each do |coalesce_key|
+      job = coalesce_key.job
+
+      assert job, "#{coalesce_key.key} has no job"
+      assert_not job.finished?, "#{coalesce_key.key} is held by a finished job"
+      assert_nil job.claimed_execution, "#{coalesce_key.key} is held by a job that started"
+      assert_nil job.failed_execution, "#{coalesce_key.key} is held by a failed job"
+      assert_equal coalesce_key.calls_count, job.coalesced_calls.count, "#{coalesce_key.key} has the wrong count"
+    end
+
+    assert_empty SolidQueue::CoalescedCall.where.missing(:job).pluck(:id), "calls without a job"
+  end
+
   # Calls the block in the middle of each job's run, after it has started.
   def perform_ready_jobs_with_callback(&block)
     results = []

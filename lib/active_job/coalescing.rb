@@ -7,6 +7,10 @@ module ActiveJob
     COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
     DEFAULT_COALESCE_BATCH_SIZE = 100
 
+    # A job created as a collecting job can't run the way its class says now, or has
+    # lost the calls it collected. Nothing has run, and the job fails with its calls.
+    class CollectedJobMismatch < StandardError; end
+
     # One accepted call in a batch. job_data is the call's Active Job payload as it
     # was at enqueue, frozen at the top level. A call that never went through the
     # queue passes a Proc, so only reading it needs the arguments to be serializable.
@@ -86,11 +90,24 @@ module ActiveJob
         end
     end
 
-    # Runs before the arguments are deserialized. Raising here reaches the rescue
-    # in ClaimedExecution#execute, which turns it into a failed execution.
+    # Runs before the arguments are deserialized, and outside the rescue_from of
+    # super, so retry_on can't swallow what's raised here. It reaches the rescue in
+    # ClaimedExecution#execute, which turns it into a failed execution.
     def perform_now
       start_coalesced_run
       super
+    end
+
+    # Whether the job was created collecting is stored with the job, so it survives
+    # retries and outlives the class's declaration. Only the job's row starts with
+    # this, in create_collecting, so an instance only has it if it was read from one.
+    def serialize
+      @coalesce_collecting ? super.merge("coalesce_collecting" => true) : super
+    end
+
+    def deserialize(job_data)
+      super
+      @coalesce_collecting = job_data["coalesce_collecting"]
     end
 
     # Scoped to the job class name, and built like concurrency_key
@@ -129,6 +146,8 @@ module ActiveJob
     # A retry that doesn't get enqueued has to fail the run: finishing would
     # destroy the job and the calls it owns, with no job left to process them.
     def retry_job(options = {})
+      ensure_retry_can_take_calls
+
       super.tap do |enqueued|
         if @coalesced_run && !enqueued
           raise enqueue_error || SolidQueue::Job::EnqueueError.new("Couldn't enqueue the retry of #{self.class.name} (#{job_id})")
@@ -138,10 +157,34 @@ module ActiveJob
 
     private
       # Only the run of a job a worker has claimed. perform_now on an instance that
-      # went through perform_later also has a provider_job_id.
+      # went through perform_later also has a provider_job_id. A collecting job always
+      # looks for its run, because the marker outlives the class's key and adapter.
       def start_coalesced_run
-        if self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue"
+        ensure_still_collecting if @coalesce_collecting
+
+        if @coalesce_collecting || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")
           @coalesced_run = SolidQueue::Job.joins(:claimed_execution).find_by(id: provider_job_id)&.start_coalesced_run
+          ensure_calls_present if @coalesce_collecting
+        end
+      end
+
+      # Only Solid Queue moves the calls to the retry. On another adapter the retry
+      # would succeed, and they'd stay behind on a job that goes on to finish.
+      def ensure_retry_can_take_calls
+        if worker_coalesced_rows.any? && self.class.queue_adapter_name != "solid_queue"
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) owns collected calls, which can't move to a retry on the `#{self.class.queue_adapter_name}` adapter. Its calls are kept: restore the Solid Queue adapter and retry this failed job, or discard the job to delete them."
+        end
+      end
+
+      def ensure_calls_present
+        if worker_coalesced_rows.empty?
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but it has no calls to run: either something other than Solid Queue deleted them, or this worker no longer has the job's claim. Its own arguments are only a copy of its first call, so it won't run them. If its calls are gone, discard this failed job."
+        end
+      end
+
+      def ensure_still_collecting
+        unless self.class.coalesce_collect?
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but its class no longer has that. Its calls are kept: restore the declaration and retry this failed job, or discard the job to delete them."
         end
       end
 
@@ -182,8 +225,8 @@ module ActiveJob
       # Anything but a deleted record raises on the way, before any row has been
       # dropped, and fails the run with its rows. When every record is gone the rows
       # stay until the job is destroyed: if this run crashes before finishing, the
-      # re-run needs them to tell it has nothing to do, because a job without rows
-      # runs its own arguments.
+      # re-run needs them to tell it has nothing to do, because a collecting job
+      # without rows fails with CollectedJobMismatch.
       def calls_from_coalesced_rows
         missing = {}
 
