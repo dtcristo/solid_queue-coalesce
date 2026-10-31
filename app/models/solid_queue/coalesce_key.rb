@@ -4,6 +4,8 @@ module SolidQueue
   # A row means "this job is the open job for this key": it exists only while its
   # job exists, hasn't started and has room. job_id is null only between the insert
   # and the end of the admission that inserted it, so it's never visible to others.
+  # calls_count is how many calls the job owns: at least one if it's collecting, and
+  # zero if it's discarding. A sealed or started job has no row, and so no count.
   class CoalesceKey < Record
     class PendingMigrations < StandardError
       def initialize(message = "The coalescing schema hasn't been installed yet. Run `bin/rails generate solid_queue:coalesce:install` to copy the migration to your application, and then `bin/rails db:migrate` to run it")
@@ -81,9 +83,18 @@ module SolidQueue
         end
     end
 
-    # How many more calls the open job can take
+    # How many more calls the open job can take. A job created while its class was
+    # discarding runs from its own arguments, so a call that joined it would replace them.
     def capacity(batch_size)
-      batch_size - calls_count
+      discarding? ? 0 : batch_size - calls_count
+    end
+
+    def collecting?
+      calls_count.positive?
+    end
+
+    def discarding?
+      job_id.present? && calls_count.zero?
     end
 
     # Records calls added to the job. A full job is sealed by deleting this row, so

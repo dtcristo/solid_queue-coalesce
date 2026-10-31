@@ -7,6 +7,10 @@ module ActiveJob
     COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
     DEFAULT_COALESCE_BATCH_SIZE = 100
 
+    # A job created as a collecting job can't run the way its class says now, or has
+    # lost the calls it collected. Nothing has run, and the job fails with its calls.
+    class CollectedJobMismatch < StandardError; end
+
     # One accepted call in a batch. job_data is the call's Active Job payload as it
     # was at enqueue, frozen at the top level. A call that never went through the
     # queue passes a Proc, so only reading it needs the arguments to be serializable.
@@ -40,6 +44,7 @@ module ActiveJob
 
       attr_accessor :coalesce_status
       attr_reader :coalesced_calls
+      attr_writer :coalesce_collecting
     end
 
     class_methods do
@@ -86,11 +91,24 @@ module ActiveJob
         end
     end
 
-    # Runs before the arguments are deserialized. Raising here reaches the rescue
-    # in ClaimedExecution#execute, which turns it into a failed execution.
+    # Runs before the arguments are deserialized, and outside the rescue_from of
+    # super, so retry_on can't swallow what's raised here. It reaches the rescue in
+    # ClaimedExecution#execute, which turns it into a failed execution.
     def perform_now
       start_coalesced_run
       super
+    end
+
+    # Whether the job was created collecting is stored with the job, so it survives
+    # retries and outlives the class's declaration. Only the job has this, not the
+    # calls it collects, because admit_collected sets it after they're serialized.
+    def serialize
+      @coalesce_collecting ? super.merge("coalesce_collecting" => true) : super
+    end
+
+    def deserialize(job_data)
+      super
+      @coalesce_collecting = job_data["coalesce_collecting"]
     end
 
     # Scoped to the job class name, and built like concurrency_key
@@ -140,8 +158,23 @@ module ActiveJob
       # Only the run of a job a worker has claimed. perform_now on an instance that
       # went through perform_later also has a provider_job_id.
       def start_coalesced_run
+        ensure_still_collecting if @coalesce_collecting
+
         if self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue"
           @coalesced_run = SolidQueue::Job.joins(:claimed_execution).find_by(id: provider_job_id)&.start_coalesced_run
+          ensure_calls_present if @coalesce_collecting && @coalesced_run
+        end
+      end
+
+      def ensure_calls_present
+        if worker_coalesced_rows.empty?
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but its calls are gone. Solid Queue only deletes them with their job, so something else did. Its own arguments are only a copy of its first call, so it won't run them: discard this failed job."
+        end
+      end
+
+      def ensure_still_collecting
+        unless self.class.coalesce_collect?
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but its class no longer has that. Its calls are kept: restore the declaration and retry this failed job, or discard the job to delete them."
         end
       end
 

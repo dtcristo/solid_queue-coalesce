@@ -110,6 +110,10 @@ class SolidQueue::LogSubscriber
     debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:key, :job_id, :active_job_id, :class_name), outcome: event.payload[:action])
   end
 
+  def coalesced_calls_mismatch(event)
+    warn formatted_event(event, action: "Coalesced calls don't match the key's count", **event.payload.slice(:job_id, :expected, :actual))
+  end
+
   def drop_coalesced_call(event)
     warn formatted_event(event, action: "Drop coalesced call for a deleted record", **event.payload.slice(:call_id, :job_id, :active_job_id, :exception_class))
   end

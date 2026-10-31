@@ -33,6 +33,14 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
   end
 
+  class ChangingModeJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect
+
+    def perform_batch(calls)
+      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    end
+  end
+
   RACED_BATCHES = Concurrent::Array.new
 
   setup do
@@ -79,7 +87,40 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end.flatten
 
     assert_jobs_hold_their_calls_within_capacity results, total: 48
-    assert_equal (SolidQueue::CoalesceKey.first&.calls_count).to_i, SolidQueue::CoalescedCall.where(job_id: SolidQueue::CoalesceKey.first&.job_id).count
+    assert_coalesce_invariants
+  end
+
+  test "concurrent calls to a class that stopped collecting take over the key from a collecting job once" do
+    3.times do |round|
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+      collecting_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :discard
+
+      results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
+
+      assert_equal 1, results.count { |active_job| active_job.coalesce_status == :created }
+      assert_not_includes results.map(&:provider_job_id), collecting_job
+      assert_coalesce_invariants
+    end
+  ensure
+    ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+  end
+
+  test "concurrent calls to a class that started collecting never join a discarding job" do
+    3.times do |round|
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :discard
+      discarding_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+
+      results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
+
+      assert_equal 1, results.map(&:provider_job_id).uniq.size
+      assert_not_includes results.map(&:provider_job_id), discarding_job
+      assert_equal 0, SolidQueue::CoalescedCall.where(job_id: discarding_job).count
+      assert_coalesce_invariants
+    end
+  ensure
+    ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
   end
 
   test "simultaneous fills of a nearly full job create one new open job" do
