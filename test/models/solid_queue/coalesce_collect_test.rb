@@ -178,6 +178,72 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
+  class WrappedPayloadJob < ApplicationJob
+    coalesce key: "wrapped", on_conflict: :collect
+
+    def serialize
+      payload = super
+      payload.merge("arguments" => [ "wrapped", payload["arguments"] ])
+    end
+
+    def deserialize(job_data)
+      raise ArgumentError, "corrupt payload" if job_data["corrupt"]
+
+      super(job_data.merge("arguments" => job_data["arguments"].last))
+    end
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+  end
+
+  class ForwardingJob < ApplicationJob
+    coalesce key: "forwarding", on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.map { |call| handle(*call.arguments) })
+    end
+
+    private
+      def handle(name, options = nil, force: false)
+        [ name, options, force ]
+      end
+  end
+
+  class MutatingDeserializeJob < ApplicationJob
+    coalesce key: "mutating", on_conflict: :collect
+
+    def serialize
+      super.merge("field" => "kept")
+    end
+
+    def deserialize(job_data)
+      super
+      job_data.delete("field")
+    end
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+  end
+
+  class ReversedArgumentsJob < ApplicationJob
+    coalesce key: "reversed", on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+
+    private
+      def serialize_arguments(arguments)
+        arguments.map(&:reverse)
+      end
+
+      def deserialize_arguments(serialized_arguments)
+        serialized_arguments.map(&:reverse)
+      end
+  end
+
   setup do
     @a, @b = JobResult.create!, JobResult.create!
   end
@@ -187,9 +253,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     second = CollectedCallsJob.set(wait: 1.hour).perform_later("g", 2)
 
     assert first.successfully_enqueued?
-    assert_not first.coalesced?
+    assert_equal :created, first.coalesce_status
     assert second.successfully_enqueued?
-    assert second.coalesced?
+    assert_equal :collected, second.coalesce_status
     assert_equal first.provider_job_id, second.provider_job_id
 
     assert_equal 1, SolidQueue::Job.count
@@ -294,6 +360,75 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert_not Hash.ruby2_keywords_hash?(JobBuffer.values.sole.first.last)
+  end
+
+  test "call arguments go through the job's own serialize and deserialize, and job_data stays as stored" do
+    WrappedPayloadJob.perform_later("x")
+    WrappedPayloadJob.perform_later("y", force: true)
+
+    perform_ready_jobs
+
+    calls = JobBuffer.values.sole
+    assert_equal [ [ "x" ], [ "y", { force: true } ] ], calls.map(&:arguments)
+    assert Hash.ruby2_keywords_hash?(calls.last.arguments.last)
+    assert_equal [ "wrapped", [ "x" ] ], calls.first.job_data["arguments"]
+  end
+
+  test "call arguments go through the job's own argument serialization, and job_data stays as stored" do
+    ReversedArgumentsJob.perform_later("abc")
+    ReversedArgumentsJob.perform_later("xyz")
+
+    perform_ready_jobs
+
+    calls = JobBuffer.values.sole
+    assert_equal [ [ "abc" ], [ "xyz" ] ], calls.map(&:arguments)
+    assert_equal [ "cba" ], calls.first.job_data["arguments"]
+  end
+
+  test "a deserialize override that changes its argument leaves job_data as stored" do
+    MutatingDeserializeJob.perform_later("x")
+
+    perform_ready_jobs
+
+    assert_equal "kept", JobBuffer.values.sole.sole.job_data["field"]
+  end
+
+  test "a job with its own deserialize drops the call whose record is gone, and runs the others" do
+    gone = JobResult.create!
+    WrappedPayloadJob.perform_later(@a)
+    WrappedPayloadJob.perform_later(gone)
+    WrappedPayloadJob.perform_later(@b)
+    gone.destroy!
+
+    events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
+
+    assert_equal [ [ @a ], [ @b ] ], JobBuffer.values.sole.map(&:arguments)
+    assert_equal 2, SolidQueue::CoalescedCall.count
+    assert_equal 1, events.size
+  end
+
+  test "an error from a job's own deserialize fails the run and keeps the calls" do
+    WrappedPayloadJob.perform_later("x")
+    WrappedPayloadJob.perform_later("y")
+    job = SolidQueue::Job.sole
+    corrupt = SolidQueue::CoalescedCall.order(:id).last
+    corrupt.update!(arguments: corrupt.arguments.merge("corrupt" => true))
+
+    assert_raises(ArgumentError) { perform_ready_jobs }
+
+    assert job.reload.failed?
+    assert_equal 2, job.coalesced_calls.count
+    assert_empty JobBuffer.values
+  end
+
+  test "forwarding a call's arguments keeps keywords and trailing hashes apart" do
+    ForwardingJob.perform_later("a", force: true)
+    ForwardingJob.perform_later("a", { force: true })
+    ForwardingJob.perform_later("a", { "force" => true })
+
+    perform_ready_jobs
+
+    assert_equal [ [ "a", nil, true ], [ "a", { force: true }, false ], [ "a", { "force" => true }, false ] ], JobBuffer.values.sole
   end
 
   test "ids from a batch feed one bounded query" do
@@ -563,7 +698,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
     DefaultBatchSizeJob.set(wait_until: in_an_hour).perform_later("g", 0)
     job = SolidQueue::Job.sole
-    assert DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesced?
+    assert_equal :collected, DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesce_status
     assert_in_delta in_an_hour.to_f, job.reload.scheduled_at.to_f, 0.001
 
     travel_to in_an_hour + 1.second do
@@ -573,7 +708,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
         DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 2)
       end
 
-      assert_not after_start.sole.coalesced?
+      assert_equal :created, after_start.sole.coalesce_status
     end
     assert_equal [ [ 0, 1 ] ], JobBuffer.values
 
@@ -620,9 +755,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     CollectedCallsJob.perform_later("g", 0)
     CollectedCallsJob.perform_later("g", 1)
 
-    joined = perform_ready_jobs_with_callback { CollectedCallsJob.perform_later("g", 2).coalesced? }
+    joined = perform_ready_jobs_with_callback { CollectedCallsJob.perform_later("g", 2).coalesce_status }
 
-    assert_equal [ false ], joined
+    assert_equal [ :created ], joined
     assert_equal [ [ [ "g", 0 ], [ "g", 1 ] ] ], JobBuffer.values
     assert_equal 1, SolidQueue::CoalescedCall.waiting.count
     assert_equal 1, SolidQueue::ReadyExecution.count
@@ -918,6 +1053,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     JobResult.transaction do
       calls = 3.times.map { |i| DeferredCollectedJob.perform_later("g", i) }
       assert_equal 0, SolidQueue::CoalescedCall.count
+      assert_equal [ nil, nil, nil ], calls.map(&:coalesce_status)
+      assert_equal [ nil, nil, nil ], calls.map(&:provider_job_id)
+      assert calls.all?(&:successfully_enqueued?)
     end
 
     assert_equal [ :created, :collected, :created ], calls.map(&:coalesce_status)

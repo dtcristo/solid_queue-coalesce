@@ -66,7 +66,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       results = race(8) { |thread| 5.times.map { |i| CollectAllJob.perform_later("g#{round}", thread, i) } }.flatten
 
       assert_equal [ results.first.provider_job_id ], results.map(&:provider_job_id).uniq
-      assert_equal 1, results.count { |active_job| !active_job.coalesced? }
+      assert_equal 1, results.count { |active_job| active_job.coalesce_status == :created }
       assert results.all?(&:successfully_enqueued?)
       assert_equal 40, SolidQueue::CoalescedCall.where(job_id: results.first.provider_job_id).count
     end
@@ -327,7 +327,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     second = in_thread { CollectFiveJob.perform_later("g", 1) }.value
     starter.value
 
-    assert_not second.coalesced?
+    assert_equal :created, second.coalesce_status
     assert_not_equal job.id, second.provider_job_id
     assert_equal 1, SolidQueue::CoalescedCall.where(job_id: second.provider_job_id).count
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id

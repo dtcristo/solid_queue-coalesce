@@ -42,8 +42,8 @@ module ActiveJob
       class_attribute :coalesce_on_conflict, instance_accessor: false
       class_attribute :coalesce_batch_size, instance_accessor: false
 
-      attr_accessor :coalesce_status
-      attr_reader :coalesced_calls
+      attr_reader :coalesce_status, :coalesced_calls
+      private attr_writer :coalesce_status
     end
 
     class_methods do
@@ -122,11 +122,6 @@ module ActiveJob
           [ self.class.name, param ]
         end.compact.join("/")
       end
-    end
-
-    # Whether this call found a job that was already open
-    def coalesced?
-      coalesce_status == :discarded || coalesce_status == :collected
     end
 
     def perform_batch(_calls)
@@ -231,7 +226,7 @@ module ActiveJob
         missing = {}
 
         calls = worker_coalesced_rows.filter_map do |id, job_data|
-          Call.new(id: id, arguments: ActiveJob::Arguments.deserialize(job_data.fetch("arguments")), job_data: job_data)
+          Call.new(id: id, arguments: deserialize_call_arguments(job_data), job_data: job_data)
         rescue ActiveJob::DeserializationError => error
           raise unless record_not_found?(error)
 
@@ -242,6 +237,12 @@ module ActiveJob
         drop_coalesced_rows(missing, delete: calls.any?)
 
         calls
+      end
+
+      # On an instance of its own, as in a normal run, so the job's overrides apply.
+      # That instance has no rows, so its deserialize_arguments_if_needed lets errors out.
+      def deserialize_call_arguments(job_data)
+        self.class.deserialize(job_data.dup).tap { |call| call.send(:deserialize_arguments_if_needed) }.arguments
       end
 
       def drop_coalesced_rows(rows, delete:)

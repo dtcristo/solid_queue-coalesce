@@ -17,7 +17,7 @@ class ReloadingTest < ActiveSupport::TestCase
 
       active_job = CoalescedRefreshJob.perform_later("reloaded")
       joined = CoalescedRefreshJob.perform_later("reloaded")
-      raise "Job.enqueue lost its patch" unless joined.coalesced?
+      raise "Job.enqueue lost its patch" unless joined.coalesce_status == :discarded
 
       job = SolidQueue::Job.find(active_job.provider_job_id)
       raise "Job lost its coalesced_calls" unless job.coalesced_calls.none?

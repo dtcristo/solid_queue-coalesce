@@ -125,9 +125,21 @@ call.arguments # The deserialized positional array
 call.job_data  # The call's whole serialized Active Job payload
 ```
 
-`arguments` goes through `ActiveJob::Arguments.deserialize`, so GlobalID and custom serializers work as usual. Keyword arguments are a trailing hash with Ruby's keyword marker, so `some_method(*call.arguments)` passes them as keywords.
+`arguments` comes from the same deserialization as a normal run. Each call is rebuilt on its own instance of the job, from its payload, through `deserialize` and `deserialize_arguments`. So GlobalID, custom serializers and your own overrides of those methods all apply. Keyword arguments are a trailing hash with Ruby's keyword marker, so `some_method(*call.arguments)` passes them as keywords. A trailing hash that was passed positionally stays a plain hash, and stays positional.
 
-`job_data` is the raw snapshot taken when the call was enqueued: `job_id`, `queue_name`, `priority`, `locale`, `timezone`, `enqueued_at`, `scheduled_at`, and whatever your `serialize` adds. It's frozen at the top level. It describes the request, not this run, and nothing restores that call's locale or timezone for you.
+If a call refers to a deleted record, that call is dropped. Any other error while deserializing, including one from your own override, fails the job with its calls. See [Deleted records](#deleted-records).
+
+`job_data` is the raw snapshot taken when the call was enqueued: `job_id`, `queue_name`, `priority`, `locale`, `timezone`, `enqueued_at`, `scheduled_at`, and whatever your `serialize` adds. It's the payload as stored, so it doesn't go through your `deserialize`, and arguments that `serialize` wrapped are still wrapped. It's frozen at the top level.
+
+Those fields describe the request, not this run. `perform_batch` runs once, in the context of the job that owns the calls, which is its first call's. Nothing restores another call's locale, timezone or custom fields for you, so read them from `job_data` if they matter:
+
+```ruby
+def perform_batch(calls)
+  calls.group_by { |call| call.job_data["locale"] }.each do |locale, calls_in_locale|
+    I18n.with_locale(locale) { notify(calls_in_locale) }
+  end
+end
+```
 
 `coalesced_calls` holds the same array, and perform callbacks can read it. `arguments` on the job itself keeps holding the arguments of the batch's first call, which is what the `limits_concurrency` key sees.
 
@@ -151,18 +163,56 @@ To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up 
 
 ## Enqueue outcomes
 
-`coalesce_status` on the Active Job instance says what happened to the call:
+`coalesce_status` on the Active Job instance says what happened to the call. It's read-only.
 
 - `:created` means it created a pending job. With `:collect`, that's the first call of each batch.
 - `:discarded` means a pending job already held the key, and the call was suppressed.
 - `:collected` means it was stored for the pending job.
-- `nil` means there's no outcome: before an enqueue, with `perform_now`, on another adapter, or when `limits_concurrency` with `on_conflict: :discard` destroyed the new job.
+- `nil` means this instance has no recorded admission.
 
-`coalesced?` is true for `:discarded` and `:collected`. For any admitted call, `provider_job_id` is the pending job's ID. With `:collect`, that's the job that will run the call.
+So a call's data was stored if the status is `:created` or `:collected`, and it wasn't if it's `:discarded`:
 
-Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` after `perform_later` even when the call was discarded.
+```ruby
+# on_conflict: :collect
+call = BulkReindexProductsJob.perform_later(account_id, product_id)
+call.coalesce_status # :created or :collected. Either way, perform_batch gets this call
 
-`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
+# on_conflict: :discard, the default
+call = ReindexProductJob.perform_later(product_id)
+call.coalesce_status # :created, so a job runs with these arguments
+                     # :discarded, so the pending job runs with its own, and these are gone
+```
+
+`nil` isn't a failure on its own. It's also what you read before an enqueue, on a class that doesn't coalesce, and on a worker's instance, including inside `perform` and `perform_batch` and on retries, because the status isn't serialized. The table has the rest:
+
+| Situation | `coalesce_status` | `provider_job_id` | `successfully_enqueued?` | Call's data stored |
+| --- | --- | --- | --- | --- |
+| Created a job | `:created` | The new job | `true` | Yes |
+| Joined with `:collect` | `:collected` | The open job | `true` | Yes |
+| Joined with `:discard`, single | `:discarded` | The open job | `true`, set by Active Job | No |
+| Joined with `:discard`, bulk | `:discarded` | The open job | `false` | No |
+| Concurrency conflict destroyed the job, single | `nil` | `nil` | `true`, set by Active Job | No |
+| Concurrency conflict destroyed the job, bulk | `nil` | `nil` | `false` | No |
+| `before_enqueue` abort | `nil` | `nil` | `false` | No |
+| Deferred, before the commit | `nil` | `nil` | `true` | Not yet |
+| Failed enqueue, fresh instance | `nil` | `nil` | `false` | No |
+| Failed enqueue or abort, reused instance | Previous value | Previous value | `false` | No |
+| Rollback of your own transaction | Stale | Stale | Unchanged | No |
+| Another adapter | `nil` | The adapter's ID, if it sets one | `true` | The adapter has the job |
+| `perform_now` on a new instance | `nil` | `nil` | `false` | Not enqueued |
+| A worker's instance | `nil` | The current run's job | `false`, and `true` on what `retry_job` returns | Calls move with a retry |
+
+- `false` here includes `nil`, which is what `successfully_enqueued?` returns until an enqueue has been tried.
+- After a `before_enqueue` abort, `perform_later` returns `false`, as it does for any job. Pass a block to `perform_later` if you need the instance.
+- A failed enqueue raises `SolidQueue::Job::EnqueueError`, so only an instance you built yourself can be read afterwards. Nothing resets a reused instance's status or `provider_job_id`.
+- A deferred call that gets rolled back stays as it was before the commit, and is never stored. Rails 7.2 with `load_defaults 7.2` defers by default on Solid Queue, so there a rollback looks like this too, instead of leaving stale values.
+- On Rails 7.2 and 8.0, `retry_job` enqueues a copy of the job, so the worker's instance doesn't change at all. Read the result from what `retry_job` returns.
+
+Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` after `perform_later` even when the call was discarded. It stays that way on purpose: `false` would make `perform_later` return `false`, and you'd lose the instance you read `coalesce_status` from.
+
+`provider_job_id` is the job that held the key at admission. It's a snapshot. A retry moves collected calls to a new job with a new ID, and their call IDs stay the same, so the ID you read at enqueue can stop being the job that will run the call. A call that joined also has its own `job_id`, which differs from the `active_job_id` of the job that owns it. That job has the `active_job_id` of its first call.
+
+`after_enqueue` can read `coalesce_status` for a single enqueue, including `:collected`. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
 
 Three notifications exist:
 

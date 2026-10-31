@@ -27,7 +27,7 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     5.times do |round|
       results = race(8) { DropJob.perform_later("g#{round}") }
 
-      assert_equal 1, results.count { |active_job| !active_job.coalesced? }
+      assert_equal 1, results.count { |active_job| active_job.coalesce_status == :created }
       assert_equal [ results.first.provider_job_id ], results.map(&:provider_job_id).uniq
     end
 
@@ -57,7 +57,7 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     drain
 
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_equal results.count { |active_job| !active_job.coalesced? }, RACED_RUNS.size
+    assert_equal results.count { |active_job| active_job.coalesce_status == :created }, RACED_RUNS.size
   end
 
   test "a call waiting on a start that deletes the key opens a new job" do
@@ -80,7 +80,7 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     second = in_thread { DropJob.perform_later("g") }.value
     starter.value
 
-    assert_not second.coalesced?
+    assert_equal :created, second.coalesce_status
     assert_not_equal job.id, second.provider_job_id
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
   end

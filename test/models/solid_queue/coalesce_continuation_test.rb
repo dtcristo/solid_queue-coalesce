@@ -65,7 +65,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     assert_equal rows, resumed.coalesced_calls.order(:id).pluck(:id)
 
     # The call that arrived during the first run opened its own job
-    assert_not late.coalesced?
+    assert_equal :created, late.coalesce_status
     assert_not_equal resumed.id, late.provider_job_id
 
     ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
