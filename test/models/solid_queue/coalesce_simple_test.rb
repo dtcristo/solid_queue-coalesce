@@ -21,6 +21,15 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class DeferredRefreshJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :always : true if respond_to?(:enqueue_after_transaction_commit=)
+    coalesce key: ->(name) { name }
+    after_enqueue { JobBuffer.add(coalesce_status) }
+
+    def perform(name)
+    end
+  end
+
   class RetriedRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }
     retry_on ExpectedTestError, wait: 0.seconds
@@ -457,6 +466,66 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_includes [ [ "FOR SHARE" ], [ "LOCK IN SHARE MODE" ] ], key_locks.call { 2.times { CoalescedRefreshJob.perform_later("a") } }
   end
 
+  test "a collecting admission for a held key locks it without trying to insert it" do
+    CollectingRefreshJob.perform_later("a")
+
+    queries = capture_key_queries { CollectingRefreshJob.perform_later("a") }
+
+    assert_empty queries.grep(/\AINSERT/), queries.to_s
+  end
+
+  test "a collecting admission for a new key on MySQL inserts it without a locking read first" do
+    skip "Gap locks only exist on InnoDB" unless SolidQueue::Record.connection_pool.db_config.adapter.match?(/mysql|trilogy/)
+
+    queries = capture_key_queries { CollectingRefreshJob.perform_later("a") }
+    insert = queries.index { |sql| sql.start_with?("INSERT") }
+
+    assert insert, queries.to_s
+    assert_empty queries.first(insert).grep(/FOR UPDATE/), queries.to_s
+  end
+
+  test "a deferred call reaches the queue when the app's transaction commits" do
+    skip_without_enqueue_after_transaction_commit
+
+    active_job = nil
+    JobResult.transaction do
+      active_job = DeferredRefreshJob.perform_later("a")
+
+      assert_equal 0, SolidQueue::Job.count
+      assert_nil active_job.coalesce_status
+      assert_nil active_job.provider_job_id
+    end
+
+    assert_equal :created, active_job.coalesce_status
+    assert_equal SolidQueue::Job.sole.id, active_job.provider_job_id
+    # Before Rails 8.1, enqueue callbacks run before the commit
+    assert_equal [ ActiveJob.version < "8.1" ? nil : :created ], JobBuffer.values
+  end
+
+  test "a deferred call is dropped when the app's transaction rolls back" do
+    skip_without_enqueue_after_transaction_commit
+
+    JobResult.transaction do
+      DeferredRefreshJob.perform_later("a")
+      raise ActiveRecord::Rollback
+    end
+
+    assert_equal 0, SolidQueue::Job.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "a deferred call coalesces on commit, with the job that's pending by then" do
+    skip_without_enqueue_after_transaction_commit
+
+    first = DeferredRefreshJob.perform_later("a")
+    second = nil
+    JobResult.transaction { second = DeferredRefreshJob.perform_later("a") }
+
+    assert_equal :discarded, second.coalesce_status
+    assert_equal first.provider_job_id, second.provider_job_id
+    assert_equal 1, SolidQueue::Job.count
+  end
+
   test "a failure in the start step becomes a failed execution and perform doesn't run" do
     CoalescedRefreshJob.perform_later("a")
     job = SolidQueue::Job.sole
@@ -585,6 +654,17 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   end
 
   private
+    def capture_key_queries(&block)
+      queries = []
+      callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce_keys") && payload[:name] != "SCHEMA" }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+      queries
+    end
+
+    def skip_without_enqueue_after_transaction_commit
+      skip "Needs Rails 7.2" unless ActiveJob::Base.respond_to?(:enqueue_after_transaction_commit=)
+    end
+
     def enqueued_count_for(jobs)
       SolidQueue::Job.enqueue_all(jobs)
     end

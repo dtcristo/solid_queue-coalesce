@@ -54,6 +54,28 @@ module SolidQueue
         end
       end
 
+      # Prepended to each execution class that can be discarded, rather than to their
+      # parent, because ReadyExecution signals semaphores in its own discard_jobs.
+      # Admission locks the key, then the job and its semaphore, so this has to lock
+      # the key before either. Left to the cascade, they'd deadlock. On MySQL they
+      # still can, because the locks on the executions also cover the gaps where
+      # admission inserts its own, so these get retried like admission.
+      module BulkDiscarding
+        def discard_all_in_batches(...)
+          Job.retrying_deadlocks { super }
+        end
+
+        def discard_all_from_jobs(...)
+          Job.retrying_deadlocks { super }
+        end
+
+        private
+          def discard_jobs(job_ids)
+            CoalesceKey.release_all(job_ids) if CoalesceKey.migrated?
+            super
+          end
+      end
+
       module RecurringValidation
         extend ActiveSupport::Concern
 
@@ -76,6 +98,7 @@ module SolidQueue
         SolidQueue::Job.singleton_class.prepend Enqueuing
         SolidQueue::Job.prepend Failing
         SolidQueue::Job.prepend Finishing
+        [ ReadyExecution, ScheduledExecution, BlockedExecution, FailedExecution ].each { |execution| execution.singleton_class.prepend BulkDiscarding }
         SolidQueue::RecurringTask.include RecurringValidation
       end
     end

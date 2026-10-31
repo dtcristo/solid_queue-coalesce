@@ -14,6 +14,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Collecting calls](#collecting-calls)
 - [Batches and scheduling](#batches-and-scheduling)
 - [Enqueue outcomes](#enqueue-outcomes)
+- [Transactions](#transactions)
 - [Retries](#retries)
 - [Deleted records](#deleted-records)
 - [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits)
@@ -172,6 +173,38 @@ Two notifications exist:
 
 `coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
 
+## Transactions
+
+If Solid Queue has its own database, which it recommends, your app's transaction doesn't cover the enqueue. A `perform_later` inside that transaction is committed straight away, whether your transaction commits or not, and coalescing makes this more likely to matter:
+
+1. Your transaction changes a record, and calls `perform_later`.
+2. The call finds a pending job for its key, and is discarded.
+3. A worker starts that job before your transaction commits, and reads the old record.
+4. Your transaction commits, and nothing runs again to pick up the change.
+
+To avoid this, enqueue after your transaction commits:
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  self.enqueue_after_transaction_commit = true
+
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+```
+
+The call now waits for your commit, and a rollback drops it. It also holds no lock on the key during your transaction, so it avoids the limit in [Batches and scheduling](#batches-and-scheduling).
+
+- On Rails 7.2, set it to `:always` instead of `true`. Rails 7.1 doesn't have this setting.
+- `ActiveJob.perform_all_later` only waits for your commit from Rails 8.1.2. Before that, call it after your transaction.
+- `coalesce_status` and `provider_job_id` are `nil` until the commit. From Rails 8.1, `after_enqueue` runs after the commit and can read them. Before that it runs too early, so subscribe to `coalesce.solid_queue` instead.
+- There's still a gap between your commit and the enqueue. A process that dies there loses the call. With `:discard`, the next call for that key covers it, if there is one. With `:collect`, that call's data is gone. If it has to survive, store it in your app's database in the same transaction, and process it from there.
+
+If Solid Queue shares your app's database, a `perform_later` inside your transaction commits or rolls back with it, so the job can't start before your commit, and none of this is needed.
+
 ## Retries
 
 A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps its calls through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
@@ -242,12 +275,12 @@ A job that fails before starting, for example because its worker died or because
 ## Rules and limitations
 
 - A coalesced job can't be enqueued inside `SolidQueue::Batch.enqueue`, either alone or in bulk. A call that joins a pending job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
-- Calling `perform_later` inside a transaction on the same database as Solid Queue is safe: a call for a pending job doesn't abort the transaction. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
+- Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
+- Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
 - Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it. Each pending job would run once with its first call's arguments, and its other calls wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
 - Each time any job finishes, fails or gets destroyed, coalescing or not, Solid Queue does one extra indexed read of the keys table.
-- Solid Queue's bulk discards, such as `discard_all_in_batches`, delete jobs without going through the key's lock first. On a key taking calls at that moment, the database can pick the discard as a deadlock victim, and it raises.
 
 ## Monitoring
 
