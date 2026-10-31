@@ -419,7 +419,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   test "a job that isn't coalesced only reads the coalescing tables, once, when it finishes" do
     AddToBufferJob.perform_later("a")
     queries = []
-    callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") }
+    callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") && payload[:name] != "SCHEMA" }
 
     ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
       AddToBufferJob.perform_later("b")

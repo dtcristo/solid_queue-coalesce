@@ -461,13 +461,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "overlap-worker")
     first, second = SolidQueue::ReadyExecution.claim("*", 2, process.id).sort_by(&:job_id)
 
-    callback = ->(*) { ActiveSupport::Notifications.unsubscribe("perform_start.active_job"); second.perform }
-    ActiveSupport::Notifications.subscribe("perform_start.active_job", &callback)
-    first.perform
+    overlapping = [ second ]
+    callback = ->(*) { overlapping.shift&.perform }
+
+    ActiveSupport::Notifications.subscribed(callback, "perform_start.active_job") { first.perform }
 
     assert_equal [ [ [ "g", 2 ], [ "g", 3 ] ], [ [ "g", 0 ], [ "g", 1 ] ] ], JobBuffer.values
-  ensure
-    ActiveSupport::Notifications.unsubscribe("perform_start.active_job")
   end
 
   test "every call in a batch runs with its own payload" do
