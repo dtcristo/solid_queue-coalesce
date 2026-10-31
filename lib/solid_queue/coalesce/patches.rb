@@ -70,8 +70,8 @@ module SolidQueue
           # A tick that joins an open job would record that job again, and the unique
           # index on recurring_executions.job_id would roll back the call it collected.
           def ensure_job_class_not_collecting
-            if class_name.present? && job_class&.try(:coalesce_collect)
-              errors.add :class_name, :collecting, message: "can't be a job that uses `coalesce` with `collect: true`"
+            if class_name.present? && job_class&.try(:coalesce_collect?)
+              errors.add :class_name, :collecting, message: "can't be a job that uses `coalesce` with `on_conflict: :collect`"
             end
           end
       end
@@ -89,10 +89,10 @@ end
 
 class SolidQueue::LogSubscriber
   def coalesce(event)
-    debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:key, :job_id, :active_job_id), outcome: event.payload[:action])
+    debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:key, :job_id, :active_job_id, :class_name), outcome: event.payload[:action])
   end
 
-  def drop_coalesced_argument(event)
-    warn formatted_event(event, action: "Drop coalesced call for a deleted record", **event.payload.slice(:argument_id, :job_id, :active_job_id))
+  def drop_coalesced_call(event)
+    warn formatted_event(event, action: "Drop coalesced call for a deleted record", **event.payload.slice(:call_id, :job_id, :active_job_id, :exception_class))
   end
 end

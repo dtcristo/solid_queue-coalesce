@@ -4,68 +4,84 @@ module ActiveJob
   module Coalescing
     extend ActiveSupport::Concern
 
-    DEFAULT_COALESCE_LIMIT = 100
+    COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
+    DEFAULT_COALESCE_BATCH_SIZE = 100
+
+    # One accepted call in a batch. job_data is the call's Active Job payload as it
+    # was at enqueue, frozen at the top level. A call that never went through the
+    # queue passes a Proc, so only reading it needs the arguments to be serializable.
+    class Call
+      attr_reader :id, :arguments
+
+      def initialize(id:, arguments:, job_data:)
+        @id = id
+        @arguments = arguments
+        @job_data = job_data
+      end
+
+      def job_data
+        @job_data = @job_data.call if @job_data.respond_to?(:call)
+        @job_data.freeze
+      end
+    end
 
     # Sits in front of the job's own #perform, whichever class defines it, so
-    # #arguments can keep holding this call's own arguments.
+    # a collecting job runs #perform_batch instead.
     module CollectedPerform
       def perform(*)
-        super(@coalesced_calls)
+        perform_batch(coalesced_calls)
       end
     end
 
     included do
       class_attribute :coalesce_key, instance_accessor: false
-      class_attribute :coalesce_collect, default: false, instance_accessor: false
-      class_attribute :coalesce_limit, instance_accessor: false
-      class_attribute :coalesce_flush_when_full, instance_accessor: false
+      class_attribute :coalesce_on_conflict, instance_accessor: false
+      class_attribute :coalesce_batch_size, instance_accessor: false
 
-      attr_writer :coalesced
+      attr_accessor :coalesce_status
+      attr_reader :coalesced_calls
     end
 
     class_methods do
-      def coalesce(key:, collect: false, limit: nil, flush_when_full: nil)
+      def coalesce(key:, on_conflict: :discard, batch_size: nil)
         unless (key.is_a?(String) || key.is_a?(Symbol) || key.is_a?(Proc)) && key.present?
           raise ArgumentError, "`key` must be a non-blank String or Symbol, or a Proc"
         end
 
-        if limit && !collect
-          raise ArgumentError, "`limit` needs `collect: true`"
+        unless on_conflict.in?(COALESCE_ON_CONFLICT_BEHAVIOUR)
+          raise ArgumentError, "`on_conflict` must be :discard or :collect"
         end
 
-        if !flush_when_full.nil? && !collect
-          raise ArgumentError, "`flush_when_full` needs `collect: true`"
+        if on_conflict == :collect
+          batch_size = DEFAULT_COALESCE_BATCH_SIZE if batch_size.nil?
+
+          unless batch_size.is_a?(Integer) && batch_size.positive?
+            raise ArgumentError, "`batch_size` must be a positive integer"
+          end
+        elsif !batch_size.nil?
+          raise ArgumentError, "`batch_size` needs `on_conflict: :collect`"
         end
 
-        limit ||= DEFAULT_COALESCE_LIMIT if collect
-
-        if limit && !(limit.is_a?(Integer) && limit.positive?)
-          raise ArgumentError, "`limit` must be a positive integer"
-        end
-
-        flush_when_full = true if collect && flush_when_full.nil?
-
-        unless flush_when_full.nil? || flush_when_full == true || flush_when_full == false
-          raise ArgumentError, "`flush_when_full` must be true or false"
-        end
-
-        ensure_coalesce_compatible_with_concurrency_controls(collect, concurrency_on_conflict)
+        ensure_coalesce_compatible_with_concurrency_controls(on_conflict, concurrency_on_conflict)
 
         self.coalesce_key = key
-        self.coalesce_collect = collect
-        self.coalesce_limit = limit
-        self.coalesce_flush_when_full = flush_when_full
+        self.coalesce_on_conflict = on_conflict
+        self.coalesce_batch_size = batch_size
+      end
+
+      def coalesce_collect?
+        coalesce_on_conflict == :collect
       end
 
       def limits_concurrency(**)
-        super.tap { ensure_coalesce_compatible_with_concurrency_controls(coalesce_collect, concurrency_on_conflict) }
+        super.tap { ensure_coalesce_compatible_with_concurrency_controls(coalesce_on_conflict, concurrency_on_conflict) }
       end
 
       private
         # A conflict destroys the job, and with it the calls it has collected
-        def ensure_coalesce_compatible_with_concurrency_controls(collect, on_conflict)
-          if collect && on_conflict == :discard
-            raise ArgumentError, "`coalesce` with `collect: true` can't be combined with `limits_concurrency` with `on_conflict: :discard`"
+        def ensure_coalesce_compatible_with_concurrency_controls(coalesce_on_conflict, concurrency_on_conflict)
+          if coalesce_on_conflict == :collect && concurrency_on_conflict == :discard
+            raise ArgumentError, "`coalesce` with `on_conflict: :collect` can't be combined with `limits_concurrency` with `on_conflict: :discard`"
           end
         end
     end
@@ -91,9 +107,13 @@ module ActiveJob
       end
     end
 
-    # Whether this call joined a job that was already open
+    # Whether this call found a job that was already open
     def coalesced?
-      !!@coalesced
+      coalesce_status == :discarded || coalesce_status == :collected
+    end
+
+    def perform_batch(_calls)
+      raise NotImplementedError, "#{self.class.name} uses `coalesce` with `on_conflict: :collect`, so it needs a `perform_batch(calls)` method"
     end
 
     # A retry is the same work continuing, so it can't join or suppress anything
@@ -126,9 +146,9 @@ module ActiveJob
       end
 
       def _perform_job
-        return super unless self.class.coalesce_collect
+        return super unless self.class.coalesce_collect?
 
-        @coalesced_calls = coalesced_calls
+        @coalesced_calls = load_coalesced_calls
 
         if @coalesced_calls.any?
           extend CollectedPerform
@@ -151,11 +171,11 @@ module ActiveJob
         @coalesced_run&.fetch("calls") || []
       end
 
-      def coalesced_calls
+      def load_coalesced_calls
         if worker_coalesced_rows.any?
           calls_from_coalesced_rows
         else
-          [ coalesced_call_from(arguments) ]
+          [ Call.new(id: nil, arguments: arguments, job_data: -> { serialize }) ]
         end
       end
 
@@ -165,22 +185,26 @@ module ActiveJob
       # re-run needs them to tell it has nothing to do, because a job without rows
       # runs its own arguments.
       def calls_from_coalesced_rows
-        loaded, missing = worker_coalesced_rows.map { |id, serialized| [ id, load_coalesced_row(serialized) ] }.partition(&:last)
-        drop_coalesced_rows(missing, delete: loaded.any?)
+        missing = {}
 
-        loaded.map { |_, call_arguments| coalesced_call_from(call_arguments) }
-      end
+        calls = worker_coalesced_rows.filter_map do |id, job_data|
+          Call.new(id: id, arguments: ActiveJob::Arguments.deserialize(job_data.fetch("arguments")), job_data: job_data)
+        rescue ActiveJob::DeserializationError => error
+          raise unless record_not_found?(error)
 
-      def load_coalesced_row(serialized)
-        ActiveJob::Arguments.deserialize(serialized)
-      rescue ActiveJob::DeserializationError => error
-        raise unless record_not_found?(error)
+          missing[id] = error
+          nil
+        end
+
+        drop_coalesced_rows(missing, delete: calls.any?)
+
+        calls
       end
 
       def drop_coalesced_rows(rows, delete:)
-        rows.each do |id, _|
-          SolidQueue.instrument(:drop_coalesced_argument, argument_id: id, job_id: provider_job_id, active_job_id: job_id) do
-            SolidQueue::CoalescedArgument.where(id: id).delete_all if delete
+        rows.each do |id, error|
+          SolidQueue.instrument(:drop_coalesced_call, call_id: id, job_id: provider_job_id, active_job_id: job_id, exception_class: error.class.name) do
+            SolidQueue::CoalescedCall.where(id: id).delete_all if delete
           end
         end
       end
@@ -189,10 +213,6 @@ module ActiveJob
       def record_not_found?(error)
         error.cause.is_a?(ActiveRecord::RecordNotFound) ||
           (defined?(ActiveJob::DeserializationError::RecordNotFound) && error.is_a?(ActiveJob::DeserializationError::RecordNotFound))
-      end
-
-      def coalesced_call_from(call_arguments)
-        call_arguments.size == 1 ? call_arguments.first : call_arguments
       end
   end
 end

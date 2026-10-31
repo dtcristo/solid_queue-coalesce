@@ -20,7 +20,7 @@ class ReloadingTest < ActiveSupport::TestCase
       raise "Job.enqueue lost its patch" unless joined.coalesced?
 
       job = SolidQueue::Job.find(active_job.provider_job_id)
-      raise "Job lost its coalesced_arguments" unless job.coalesced_arguments.none?
+      raise "Job lost its coalesced_calls" unless job.coalesced_calls.none?
 
       job.failed_with(RuntimeError.new("boom"))
       raise "Job#failed_with lost its patch" if SolidQueue::CoalesceKey.exists?(key: active_job.coalesce_key)

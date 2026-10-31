@@ -4,9 +4,9 @@ require "test_helper"
 
 class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
   class CollectingRecurringJob < ApplicationJob
-    coalesce key: "recurring", collect: true
+    coalesce key: "recurring", on_conflict: :collect
 
-    def perform(calls)
+    def perform_batch(calls)
     end
   end
 
@@ -18,33 +18,45 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
-  test "limit needs collect" do
-    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", limit: 5 } }
-    assert_match(/collect/, error.message)
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: false, limit: 5 } }
+  test "on_conflict defaults to discard, with no batch size" do
+    job_class = new_job_class { coalesce key: "a" }
+
+    assert_equal :discard, job_class.coalesce_on_conflict
+    assert_nil job_class.coalesce_batch_size
   end
 
-  test "flush_when_full needs collect" do
-    [ true, false ].each do |value|
-      error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", flush_when_full: value } }
-      assert_match(/collect/, error.message)
-      assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: false, flush_when_full: value } }
+  test "on_conflict is discard or collect, and anything else raises" do
+    assert_equal :discard, new_job_class { coalesce key: "a", on_conflict: :discard }.coalesce_on_conflict
+    assert_equal :collect, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_on_conflict
+
+    [ :replace, :block, "collect", nil ].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: value } }
+      assert_match(/on_conflict/, error.message)
     end
   end
 
-  test "flush_when_full is true by default in collect mode and has to be a boolean" do
-    assert new_job_class { coalesce key: "a", collect: true }.coalesce_flush_when_full
-    assert_equal false, new_job_class { coalesce key: "a", collect: true, flush_when_full: false }.coalesce_flush_when_full
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: true, flush_when_full: "no" } }
+  test "batch_size needs on_conflict collect" do
+    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", batch_size: 5 } }
+    assert_match(/on_conflict: :collect/, error.message)
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :discard, batch_size: 5 } }
   end
 
-  test "limit has to be a positive integer" do
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: true, limit: 0 } }
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: true, limit: "5" } }
+  test "batch_size has to be a positive integer" do
+    [ 0, -1, "5", 1.5, false ].each do |value|
+      assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: :collect, batch_size: value } }
+    end
+
+    assert_equal 5, new_job_class { coalesce key: "a", on_conflict: :collect, batch_size: 5 }.coalesce_batch_size
   end
 
-  test "limit defaults to 100 in collect mode" do
-    assert_equal 100, new_job_class { coalesce key: "a", collect: true }.coalesce_limit
+  test "batch_size defaults to 100 when collecting" do
+    assert_equal 100, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_batch_size
+  end
+
+  test "the options from before don't exist" do
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: true } }
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :collect, limit: 5 } }
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :collect, flush_when_full: false } }
   end
 
   test "key is required and has to be a string, a symbol or a proc" do
@@ -67,7 +79,7 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
   test "collect can't be combined with on_conflict discard, whichever comes first" do
     assert_raises(ArgumentError) do
       new_job_class do
-        coalesce key: "a", collect: true
+        coalesce key: "a", on_conflict: :collect
         limits_concurrency key: "b", on_conflict: :discard
       end
     end
@@ -75,14 +87,14 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) do
       new_job_class do
         limits_concurrency key: "b", on_conflict: :discard
-        coalesce key: "a", collect: true
+        coalesce key: "a", on_conflict: :collect
       end
     end
   end
 
   test "collect composes with blocking concurrency limits, and simple mode with discarding ones" do
     assert new_job_class {
-      coalesce key: "a", collect: true
+      coalesce key: "a", on_conflict: :collect
       limits_concurrency key: "b"
     }
 
@@ -145,20 +157,48 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_match(/collect/, configuration.errors.full_messages.to_sentence)
   end
 
-  test "a recurring task for a simple job is valid and a suppressed tick records nothing" do
+  test "a recurring task for a discarding job is valid and a suppressed tick records nothing" do
     task = SolidQueue::RecurringTask.new(key: "simple", class_name: SimpleRecurringJob.name, schedule: "every hour")
     assert task.valid?
     task.save!
 
     first = task.enqueue(at: 2.hours.ago)
     assert first.successfully_enqueued?
+    assert_equal :created, first.coalesce_status
     assert_equal 1, SolidQueue::RecurringExecution.count
 
     second = task.enqueue(at: 1.hour.ago)
-    assert second.coalesced?
+    assert_equal :discarded, second.coalesce_status
     assert_equal first.provider_job_id, second.provider_job_id
     assert_not second.successfully_enqueued?
     assert_equal 1, SolidQueue::RecurringExecution.count
+  end
+
+  test "a tick that collides with the open job doesn't raise or roll anything back" do
+    task = SolidQueue::RecurringTask.create!(key: "simple", class_name: SimpleRecurringJob.name, schedule: "every hour")
+    run_at = 1.hour.ago
+
+    first = task.enqueue(at: run_at)
+
+    # Another scheduler taking the same tick
+    assert_nothing_raised { assert_not task.enqueue(at: run_at).successfully_enqueued? }
+
+    assert_equal [ first.provider_job_id ], SolidQueue::RecurringExecution.where(task_key: "simple", run_at: run_at).pluck(:job_id)
+    assert_equal [ first.provider_job_id ], SolidQueue::CoalesceKey.pluck(:job_id)
+    assert_equal [ first.provider_job_id ], SolidQueue::Job.pluck(:id)
+
+    perform_ready_jobs
+    assert_equal [ "ran" ], JobBuffer.values
+  end
+
+  test "a tick after the open job has started enqueues and records again" do
+    task = SolidQueue::RecurringTask.create!(key: "simple", class_name: SimpleRecurringJob.name, schedule: "every hour")
+
+    task.enqueue(at: 2.hours.ago)
+    perform_ready_jobs
+
+    assert task.enqueue(at: 1.hour.ago).successfully_enqueued?
+    assert_equal 2, SolidQueue::RecurringExecution.count
   end
 
   private

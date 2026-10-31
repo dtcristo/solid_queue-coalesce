@@ -6,11 +6,11 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class FlakyCollectedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, collect: true, limit: 3
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 3
     retry_on ExpectedTestError, wait: 0.seconds, attempts: 3
 
-    def perform(calls)
-      JobBuffer.add([ executions, calls ])
+    def perform_batch(calls)
+      JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError if executions < self.class.succeed_on
     end
 
@@ -18,20 +18,20 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
   end
 
   class ManuallyRetriedJob < ApplicationJob
-    coalesce key: "manual", collect: true
+    coalesce key: "manual", on_conflict: :collect
     rescue_from(ExpectedTestError) { retry_job }
 
-    def perform(calls)
-      JobBuffer.add([ executions, calls ])
+    def perform_batch(calls)
+      JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError if executions == 1
     end
   end
 
   class FailingCollectedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, collect: true, limit: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
 
-    def perform(calls)
-      JobBuffer.add(calls)
+    def perform_batch(calls)
+      JobBuffer.add(calls.map(&:arguments))
       raise ExpectedTestError unless self.class.fixed
     end
 
@@ -39,22 +39,22 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
   end
 
   class AbortedRetryJob < ApplicationJob
-    coalesce key: "aborted", collect: true
+    coalesce key: "aborted", on_conflict: :collect
     retry_on ExpectedTestError, wait: 0.seconds
     before_enqueue { throw :abort if executions > 0 }
 
-    def perform(calls)
+    def perform_batch(calls)
       raise ExpectedTestError
     end
   end
 
   class RetriedLimitedJob < ApplicationJob
-    coalesce key: "limited", collect: true
+    coalesce key: "limited", on_conflict: :collect
     limits_concurrency key: ->(result) { result }
     retry_on ExpectedTestError, wait: 0.seconds
 
-    def perform(calls)
-      JobBuffer.add([ executions, calls ])
+    def perform_batch(calls)
+      JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError
     end
   end
@@ -64,20 +64,20 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     FailingCollectedJob.fixed = false
   end
 
-  test "retry_on keeps the exact frozen set on the new job and the old job's finish doesn't delete it" do
+  test "retry_on keeps the exact claimed calls on the new job and the old job's finish doesn't delete it" do
     FlakyCollectedJob.perform_later("g", 1)
     FlakyCollectedJob.perform_later("g", 2)
     old_job = SolidQueue::Job.sole
-    rows = SolidQueue::CoalescedArgument.waiting.order(:id).pluck(:id)
+    rows = SolidQueue::CoalescedCall.waiting.order(:id).pluck(:id)
 
     # A call that arrives during the failed run can't get into the set
     perform_ready_jobs_with_callback { FlakyCollectedJob.perform_later("g", 3) }
 
     assert old_job.reload.finished?
-    assert_empty old_job.coalesced_arguments
+    assert_empty old_job.coalesced_calls
 
     retry_job = SolidQueue::Job.where(active_job_id: old_job.active_job_id, finished_at: nil).sole
-    assert_equal rows, retry_job.coalesced_arguments.order(:id).pluck(:id)
+    assert_equal rows, retry_job.coalesced_calls.order(:id).pluck(:id)
     assert_not SolidQueue::CoalesceKey.exists?(job_id: retry_job.id)
 
     # The batch stays out of what a retry serializes
@@ -86,7 +86,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
 
     # With the old job gone too, nothing cascades to the rows that moved
     SolidQueue::Job.clear_finished_in_batches(finished_before: 1.minute.from_now)
-    assert_equal rows, retry_job.coalesced_arguments.order(:id).pluck(:id)
+    assert_equal rows, retry_job.coalesced_calls.order(:id).pluck(:id)
 
     SolidQueue::ReadyExecution.where.not(job_id: retry_job.id).delete_all
     perform_ready_jobs
@@ -94,14 +94,14 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal [ [ 1, [ [ "g", 1 ], [ "g", 2 ] ] ], [ 2, [ [ "g", 1 ], [ "g", 2 ] ] ] ], JobBuffer.values
   end
 
-  test "rescue_from with retry_job keeps the frozen set" do
+  test "rescue_from with retry_job keeps the claimed calls" do
     ManuallyRetriedJob.perform_later("a")
     ManuallyRetriedJob.perform_later("b")
 
     perform_ready_jobs
     perform_ready_jobs
 
-    assert_equal [ [ 1, %w[ a b ] ], [ 2, %w[ a b ] ] ], JobBuffer.values
+    assert_equal [ [ 1, [ [ "a" ], [ "b" ] ] ], [ 2, [ [ "a" ], [ "b" ] ] ] ], JobBuffer.values
   end
 
   test "a retry that can't be enqueued fails the run, which keeps its rows" do
@@ -113,7 +113,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     SolidQueue::Job.unstub(:create!)
 
     assert job.reload.failed?
-    assert_equal [ [ "g", 1 ] ], job.coalesced_arguments.map { |row| ActiveJob::Arguments.deserialize(row.arguments) }
+    assert_equal [ [ "g", 1 ] ], job.coalesced_calls.map { |row| row.arguments["arguments"] }
     assert_equal SolidQueue::Job::EnqueueError.name, job.failed_execution.exception_class
   end
 
@@ -128,8 +128,8 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
 
     retried = SolidQueue::Job.where(active_job_id: job.active_job_id, finished_at: nil).sole
     assert_equal job.concurrency_key, retried.concurrency_key
-    assert_equal 1, retried.coalesced_arguments.count
-    assert_equal [ [ 1, [ other ] ] ], JobBuffer.values
+    assert_equal 1, retried.coalesced_calls.count
+    assert_equal [ [ 1, [ [ other ] ] ] ], JobBuffer.values
   end
 
   test "a retry stopped by a callback fails the run too" do
@@ -139,7 +139,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_raises(SolidQueue::Job::EnqueueError) { perform_ready_jobs }
 
     assert job.reload.failed?
-    assert_equal 1, job.coalesced_arguments.count
+    assert_equal 1, job.coalesced_calls.count
   end
 
   test "exhausted retries leave a failed execution and manual retry reprocesses the same rows" do
@@ -152,7 +152,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_raises(ExpectedTestError) { perform_ready_jobs }
 
     failed = SolidQueue::FailedExecution.sole.job
-    rows = failed.coalesced_arguments.order(:id).pluck(:id)
+    rows = failed.coalesced_calls.order(:id).pluck(:id)
     assert_equal 2, rows.size
 
     FlakyCollectedJob.succeed_on = 1
@@ -161,7 +161,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert_equal [ [ 1, [ [ "g", 1 ], [ "g", 2 ] ] ] ], JobBuffer.values
-    assert_equal rows, failed.reload.coalesced_arguments.order(:id).pluck(:id)
+    assert_equal rows, failed.reload.coalesced_calls.order(:id).pluck(:id)
     assert failed.finished?
   end
 
@@ -169,9 +169,9 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     FailingCollectedJob.perform_later("g", 1)
     assert_raises(ExpectedTestError) { perform_ready_jobs }
 
-    assert_equal 1, SolidQueue::CoalescedArgument.count
+    assert_equal 1, SolidQueue::CoalescedCall.count
     SolidQueue::FailedExecution.sole.discard
-    assert_equal 0, SolidQueue::CoalescedArgument.count
+    assert_equal 0, SolidQueue::CoalescedCall.count
   end
 
   test "a released job re-runs with the rows it claimed, even with new ones waiting" do
@@ -185,7 +185,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "crashed-worker")
     claimed = SolidQueue::ReadyExecution.claim("*", 1, process.id).sole
     job.start_coalesced_run
-    assert_equal 2, job.coalesced_arguments.count
+    assert_equal 2, job.coalesced_calls.count
 
     claimed.release
     assert job.reload.ready?
@@ -208,7 +208,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     SolidQueue::Process.prune
 
     assert job.reload.failed?
-    assert_equal 1, job.coalesced_arguments.count
+    assert_equal 1, job.coalesced_calls.count
   end
 
   test "a job of a pruned process that hadn't started claims its rows on failure, overflow included" do
@@ -223,11 +223,11 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     SolidQueue::Process.prune
 
     assert job.reload.failed?
-    assert_equal 2, job.coalesced_arguments.count
+    assert_equal 2, job.coalesced_calls.count
 
     next_job = SolidQueue::CoalesceKey.sole.job
     assert_not_equal job.id, next_job.id
-    assert_equal 1, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
   end
 
   test "a failure in the start step of a collecting job becomes a failed execution and perform doesn't run" do
@@ -250,8 +250,8 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_raises(NameError) { perform_ready_jobs }
 
     assert job.reload.failed?
-    assert_equal 5, job.coalesced_arguments.count
-    assert_equal 0, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 5, job.coalesced_calls.count
+    assert_equal 0, SolidQueue::CoalescedCall.waiting.count
     assert_equal 0, SolidQueue::CoalesceKey.count
 
     rename_job_class(job, "SolidQueue::CoalesceRetriesTest::FailingCollectedJob")
@@ -271,9 +271,9 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
 
     SolidQueue::CoalesceKey.release_stranded(10)
 
-    assert_equal 2, job.coalesced_arguments.count
+    assert_equal 2, job.coalesced_calls.count
     assert_not_equal job.id, SolidQueue::CoalesceKey.sole.job_id
-    assert_equal 1, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
   end
 
   test "the sweeper never loses waiting calls of a finished job" do
@@ -288,7 +288,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
 
     next_job = SolidQueue::CoalesceKey.sole.job
     assert_not_equal job.id, next_job.id
-    assert_equal 2, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 2, SolidQueue::CoalescedCall.waiting.count
 
     perform_ready_jobs
     assert_equal [ [ [ "g", 1 ], [ "g", 2 ] ] ], JobBuffer.values
@@ -298,13 +298,13 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     job = SolidQueue::Job.create!(queue_name: "default", class_name: "AddToBufferJob", active_job_id: SecureRandom.uuid, scheduled_at: Time.current, arguments: AddToBufferJob.new("a").serialize)
     SolidQueue::ReadyExecution.delete_all
     key = SolidQueue::CoalesceKey.create!(key: "stopped", job: job)
-    SolidQueue::CoalescedArgument.create!(coalesce_key: key, arguments: [ "a" ], scheduled_at: Time.current)
+    SolidQueue::CoalescedCall.create!(coalesce_key: key, arguments: AddToBufferJob.new("a").serialize)
     job.update!(finished_at: Time.current)
 
     SolidQueue::CoalesceKey.release_stranded(10)
 
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_equal 1, job.coalesced_arguments.count
+    assert_equal 1, job.coalesced_calls.count
     assert_equal 1, SolidQueue::Job.count
   end
 end

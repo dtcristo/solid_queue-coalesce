@@ -15,7 +15,9 @@ class InstallGeneratorTest < Rails::Generators::TestCase
     assert_migration "db/queue_migrate/create_solid_queue_coalesce_tables.rb" do |migration|
       assert_match(/class CreateSolidQueueCoalesceTables/, migration)
       assert_match(/create_table :solid_queue_coalesce_keys/, migration)
-      assert_match(/create_table :solid_queue_coalesced_arguments/, migration)
+      assert_match(/create_table :solid_queue_coalesced_calls/, migration)
+      assert_match(/t\.string :key, null: false$/, migration)
+      assert_no_match(/collation|scheduled_at/, migration)
     end
   end
 

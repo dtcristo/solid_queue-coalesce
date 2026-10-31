@@ -1,7 +1,7 @@
 class CollectedResultsJob < ApplicationJob
-  coalesce key: ->(group, *) { group }, collect: true, limit: 5
+  coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
 
-  def perform(calls)
-    JobResult.create!(status: "batch", value: calls.map(&:last).to_json)
+  def perform_batch(calls)
+    JobResult.create!(status: "batch", value: calls.map { |call| call.arguments.last }.to_json)
   end
 end

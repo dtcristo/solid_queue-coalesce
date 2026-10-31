@@ -69,6 +69,33 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class InlineRefreshJob < ApplicationJob
+    self.queue_adapter = :inline
+
+    coalesce key: ->(name) { name }
+
+    def perform(name)
+      JobBuffer.add(name)
+    end
+  end
+
+  class StatusInCallbackJob < ApplicationJob
+    coalesce key: ->(name) { name }
+
+    after_enqueue { JobBuffer.add(coalesce_status) }
+
+    def perform(name)
+    end
+  end
+
+  class KeywordRefreshJob < ApplicationJob
+    coalesce key: ->(name, **) { name }
+
+    def perform(name, force:)
+      JobBuffer.add([ name, force, coalesced_calls ])
+    end
+  end
+
   class StringKeyedRefreshJob < ApplicationJob
     coalesce key: "everything"
 
@@ -76,24 +103,119 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
-  test "the first call creates a job" do
-    assert_difference -> { SolidQueue::Job.count }, +1 do
-      active_job = CoalescedRefreshJob.perform_later("a")
+  test "the first call creates a job, and says so" do
+    events = capture_events("coalesce.solid_queue") do
+      assert_difference -> { SolidQueue::Job.count }, +1 do
+        active_job = CoalescedRefreshJob.perform_later("a")
 
-      assert active_job.successfully_enqueued?
-      assert_not active_job.coalesced?
-      assert_equal SolidQueue::Job.last.id, active_job.provider_job_id
+        assert active_job.successfully_enqueued?
+        assert_not active_job.coalesced?
+        assert_equal :created, active_job.coalesce_status
+        assert_equal SolidQueue::Job.last.id, active_job.provider_job_id
+      end
     end
+
+    assert_equal({ action: :created, key: "CoalescedRefreshJob/a", job_id: SolidQueue::Job.last.id, active_job_id: SolidQueue::Job.last.active_job_id, class_name: "CoalescedRefreshJob" }, events.sole.payload)
   end
 
-  test "another call with the same key is dropped and reports the open job" do
+  test "coalesce_status is nil until an enqueue, and for perform_now" do
+    assert_nil CoalescedRefreshJob.new("a").coalesce_status
+
+    active_job = CoalescedRefreshJob.new("a")
+    active_job.perform_now
+    assert_nil active_job.coalesce_status
+    assert_not active_job.coalesced?
+  end
+
+  test "coalesce_status is nil on another adapter" do
+    active_job = InlineRefreshJob.perform_later("a")
+
+    assert_nil active_job.coalesce_status
+    assert_not active_job.coalesced?
+    assert_equal [ "a" ], JobBuffer.values
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "after_enqueue sees the outcome of a single enqueue" do
+    StatusInCallbackJob.perform_later("a")
+    StatusInCallbackJob.perform_later("a")
+
+    assert_equal [ :created, :discarded ], JobBuffer.values
+  end
+
+  test "a discarding job performs with its own arguments and has no coalesced calls" do
+    KeywordRefreshJob.perform_later("a", force: true)
+
+    perform_ready_jobs
+
+    assert_equal [ [ "a", true, nil ] ], JobBuffer.values
+    assert_equal 0, SolidQueue::CoalescedCall.count
+  end
+
+  test "the first call's queue, priority and arguments win" do
+    CoalescedRefreshJob.set(queue: "first", priority: 7).perform_later("a", "first")
+    CoalescedRefreshJob.set(queue: "second", priority: 1).perform_later("a", "second")
+
+    job = SolidQueue::Job.sole
+    assert_equal "first", job.queue_name
+    assert_equal 7, job.priority
+    assert_equal [ "a", "first" ], job.arguments["arguments"]
+  end
+
+  test "perform_all_later counts discarded calls as not enqueued and reports them with events, skipping enqueue callbacks" do
+    jobs = [ StatusInCallbackJob.new("bulk"), StatusInCallbackJob.new("bulk") ]
+
+    events = capture_events("coalesce.solid_queue") { ActiveJob.perform_all_later(jobs) }
+
+    assert_equal [ true, false ], jobs.map(&:successfully_enqueued?)
+    assert_equal [ :created, :discarded ], jobs.map(&:coalesce_status)
+    assert_equal [ :created, :discarded ], events.map { |event| event.payload[:action] }
+    assert_equal jobs.map(&:job_id), events.map { |event| event.payload[:active_job_id] }
+    assert_empty JobBuffer.values
+  end
+
+  test "no event and no status when a concurrency conflict destroys the new job" do
+    DiscardingRefreshJob.perform_later("a", "group")
+
+    discarded = nil
+    events = capture_events("coalesce.solid_queue") { discarded = DiscardingRefreshJob.perform_later("b", "group") }
+
+    assert_nil discarded.coalesce_status
+    assert_empty events
+  end
+
+  test "a bulk enqueue destroyed by a concurrency conflict has no outcome for any of its calls" do
+    DiscardingRefreshJob.perform_later("a", "group")
+    jobs = 2.times.map { DiscardingRefreshJob.new("b", "group") }
+
+    events = capture_events("coalesce.solid_queue") { assert_equal 0, SolidQueue::Job.enqueue_all(jobs) }
+
+    assert_equal [ nil, nil ], jobs.map(&:coalesce_status)
+    assert_empty events
+  end
+
+  test "an enqueue that fails has no outcome and no event" do
+    active_job = CoalescedRefreshJob.new("a")
+    SolidQueue::Job.stubs(:create!).raises(ActiveRecord::StatementInvalid, "database went away")
+
+    events = capture_events("coalesce.solid_queue") do
+      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue(active_job) }
+    end
+
+    assert_nil active_job.coalesce_status
+    assert_empty events
+  end
+
+  test "another call with the same key is discarded and reports the open job" do
     first = CoalescedRefreshJob.perform_later("a")
+    second = nil
 
     events = capture_events("coalesce.solid_queue") do
       assert_no_difference -> { SolidQueue::Job.count } do
         second = CoalescedRefreshJob.perform_later("a")
 
         assert second.coalesced?
+        assert_equal :discarded, second.coalesce_status
         assert_equal first.provider_job_id, second.provider_job_id
         assert_not_equal first.job_id, second.job_id
       end
@@ -102,18 +224,19 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal 1, events.size
     assert_equal "CoalescedRefreshJob/a", events.first.payload[:key]
     assert_equal first.provider_job_id, events.first.payload[:job_id]
-    assert_equal :dropped, events.first.payload[:action]
-    assert events.first.payload[:active_job_id].present?
+    assert_equal :discarded, events.first.payload[:action]
+    assert_equal "CoalescedRefreshJob", events.first.payload[:class_name]
+    assert_equal second.job_id, events.first.payload[:active_job_id]
   end
 
-  test "enqueueing directly reports a dropped call as not enqueued" do
+  test "enqueueing directly reports a discarded call as not enqueued" do
     CoalescedRefreshJob.perform_later("a")
 
-    dropped = CoalescedRefreshJob.new("a")
-    SolidQueue::Job.enqueue(dropped)
+    discarded = CoalescedRefreshJob.new("a")
+    SolidQueue::Job.enqueue(discarded)
 
-    assert_not dropped.successfully_enqueued?
-    assert dropped.coalesced?
+    assert_not discarded.successfully_enqueued?
+    assert discarded.coalesced?
   end
 
   test "different keys and different classes are independent" do
@@ -124,12 +247,27 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
-  test "keys that differ only by case or accent are independent" do
-    %w[ a A á ].each do |name|
-      assert_not CoalescedRefreshJob.perform_later(name).coalesced?, name
+  test "keys are built the way limits_concurrency builds its key, and stored in the same kind of column" do
+    result = JobResult.create!
+
+    [ [ "literal", [] ], [ :literal, [] ], [ ->(name) { name }, [ "a" ] ], [ ->(record) { record }, [ result ] ], [ ->(*) { nil }, [] ] ].each do |key, arguments|
+      job_class = Class.new(ApplicationJob) do
+        def self.name = "ParityJob"
+
+        coalesce key: key
+        limits_concurrency key: key
+      end
+
+      assert_equal job_class.new(*arguments).concurrency_key, job_class.new(*arguments).coalesce_key
     end
 
-    assert_equal 3, SolidQueue::Job.count
+    coalesce_key = SolidQueue::CoalesceKey.columns_hash["key"]
+    semaphore_key = SolidQueue::Semaphore.columns_hash["key"]
+    assert_equal [ semaphore_key.sql_type, semaphore_key.null, semaphore_key.collation ], [ coalesce_key.sql_type, coalesce_key.null, coalesce_key.collation ]
+
+    SolidQueue::Record.connection_pool.with_connection do |connection|
+      assert connection.index_exists?(:solid_queue_coalesce_keys, :key, unique: true)
+    end
   end
 
   test "keys are built from a record's class and id, or a string" do
@@ -405,6 +543,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     assert_equal [ true, true, false, false, false, true ], jobs.map(&:successfully_enqueued?)
     assert_equal [ false, false, true, true, true, false ], jobs.map(&:coalesced?)
+    assert_equal [ :created, :created, :discarded, :discarded, :discarded, nil ], jobs.map(&:coalesce_status)
     assert_equal jobs[0].provider_job_id, jobs[2].provider_job_id
     assert_equal jobs[0].provider_job_id, jobs[4].provider_job_id
     assert jobs[5].provider_job_id.present?

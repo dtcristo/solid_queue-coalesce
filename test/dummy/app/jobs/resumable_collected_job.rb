@@ -9,12 +9,13 @@ end
 class ResumableCollectedJob < ApplicationJob
   include ActiveJob::Continuable
 
-  coalesce key: "resumable", collect: true
+  coalesce key: "resumable", on_conflict: :collect
 
   cattr_accessor :stop_after
   self.resume_options = { wait: 0 }
 
-  def perform(results)
+  def perform_batch(calls)
+    results = calls.map { |call| call.arguments.first }
     JobBuffer.add([ :run, results.map(&:id) ])
 
     step :process do |step|

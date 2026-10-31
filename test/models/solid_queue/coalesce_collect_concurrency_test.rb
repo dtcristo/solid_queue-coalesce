@@ -3,33 +3,33 @@
 require "test_helper"
 
 # These run on separate connections and threads on purpose: what they test is
-# the locking between appends, starts and early flush, and any error raised by
+# the locking between appends and starts, and any error raised by
 # a thread, deadlocks included, fails the test when the thread is joined.
 class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class CollectAllJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, collect: true, limit: 10_000
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 10_000
 
-    def perform(calls)
-      RACED_BATCHES << [ provider_job_id, calls ]
+    def perform_batch(calls)
+      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectFiveJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, collect: true, limit: 5
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
 
-    def perform(calls)
-      RACED_BATCHES << [ provider_job_id, calls ]
+    def perform_batch(calls)
+      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectFiveLimitedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, collect: true, limit: 5
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
     limits_concurrency key: "shared", to: 1
 
-    def perform(calls)
-      RACED_BATCHES << [ provider_job_id, calls ]
+    def perform_batch(calls)
+      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
@@ -47,7 +47,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       assert_equal [ results.first.provider_job_id ], results.map(&:provider_job_id).uniq
       assert_equal 1, results.count { |active_job| !active_job.coalesced? }
       assert results.all?(&:successfully_enqueued?)
-      assert_equal 40, SolidQueue::CoalesceKey.find_by(job_id: results.first.provider_job_id).coalesced_arguments.count
+      assert_equal 40, SolidQueue::CoalesceKey.find_by(job_id: results.first.provider_job_id).coalesced_calls.count
     end
 
     assert_equal 5, SolidQueue::Job.count
@@ -60,7 +60,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
 
     assert_equal 4, SolidQueue::Job.count
-    assert_equal 6 * 4 * 3, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 6 * 4 * 3, SolidQueue::CoalescedCall.waiting.count
   end
 
   test "appends racing starts lose nothing, strand nothing and claim every row once" do
@@ -68,7 +68,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     assert_every_call_ran_once calls
     assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
-    assert_equal 0, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 0, SolidQueue::CoalescedCall.waiting.count
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_batches_match_claimed_rows
   end
@@ -91,7 +91,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     appender = in_thread do
       SolidQueue::Record.transaction do
-        SolidQueue::CoalesceKey.admit("#{CollectFiveJob.name}/g").collect([ CollectFiveJob.new("g", 1) ])
+        SolidQueue::CoalesceKey.admit("#{CollectFiveJob.name}/g").collect([ CollectFiveJob.new("g", 1).serialize ])
         appending.set
         starting.wait(5)
         sleep 0.3
@@ -133,7 +133,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     assert_not second.coalesced?
     assert_not_equal job.id, second.provider_job_id
-    assert_equal 1, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
   end
 
@@ -156,36 +156,8 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     if SolidQueue::CoalesceKey.any?
       assert_equal SolidQueue::CoalesceKey.sole.job_id, SolidQueue::Job.sole.id
     else
-      assert_equal 0, SolidQueue::CoalescedArgument.count
+      assert_equal 0, SolidQueue::CoalescedCall.count
     end
-  end
-
-  test "concurrent early flushes and the dispatcher dispatch a job once" do
-    5.times do |round|
-      group = "g#{round}"
-      first = CollectFiveLimitedJob.set(wait: 1.minute).perform_later(group, 0)
-      3.times { |i| CollectFiveLimitedJob.set(wait: 1.minute).perform_later(group, i + 1) }
-      job_id = first.provider_job_id
-
-      # Due now, so the dispatcher competes with the flushes
-      SolidQueue::ScheduledExecution.where(job_id: job_id).update_all(scheduled_at: 1.second.ago)
-
-      race(6) do |thread|
-        if thread.zero?
-          SolidQueue::ScheduledExecution.dispatch_next_batch(10)
-        else
-          CollectFiveLimitedJob.set(wait: 1.minute).perform_later(group, 10 + thread)
-        end
-      end
-
-      assert_equal 0, SolidQueue::ScheduledExecution.where(job_id: job_id).count
-      assert_equal 1, SolidQueue::ReadyExecution.where(job_id: job_id).count + SolidQueue::BlockedExecution.where(job_id: job_id).count
-    end
-
-    # Each of the five took its turn at the only semaphore, once
-    assert_equal 1, SolidQueue::ReadyExecution.count
-    assert_equal 4, SolidQueue::BlockedExecution.count
-    assert_equal 0, SolidQueue::Semaphore.sole.value
   end
 
   private
@@ -261,7 +233,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     def assert_batches_match_claimed_rows
       RACED_BATCHES.each do |job_id, batch|
-        rows = SolidQueue::CoalescedArgument.where(job_id: job_id).order(:id).map { |row| ActiveJob::Arguments.deserialize(row.arguments) }
+        rows = SolidQueue::CoalescedCall.where(job_id: job_id).order(:id).map { |row| row.arguments["arguments"] }
         assert_equal rows, batch
       end
     end

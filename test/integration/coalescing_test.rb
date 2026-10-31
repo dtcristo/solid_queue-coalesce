@@ -39,7 +39,7 @@ class CoalescingTest < ActiveSupport::TestCase
     assert_operator runs, :<=, 100
   end
 
-  test "collected calls from several processes reach running workers exactly once and in limited batches" do
+  test "collected calls from several processes reach running workers exactly once and in bounded batches" do
     writers = 4
     calls_per_writer = 25
 
@@ -63,7 +63,7 @@ class CoalescingTest < ActiveSupport::TestCase
 
     assert_equal expected.sort, batches.flatten.sort
     assert_operator batches.map(&:size).max, :<=, 5
-    assert_equal 0, SolidQueue::CoalescedArgument.waiting.count
+    assert_equal 0, SolidQueue::CoalescedCall.waiting.count
   end
 
   private

@@ -21,18 +21,18 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     ResumableCollectedJob.stop_after = nil
   end
 
-  test "a resume keeps the frozen set on the new job and carries on from the cursor" do
+  test "a resume keeps the claimed calls on the new job and carries on with the standard step behaviour" do
     old_job = SolidQueue::Job.sole
-    rows = SolidQueue::CoalescedArgument.waiting.order(:id).pluck(:id)
+    rows = SolidQueue::CoalescedCall.waiting.order(:id).pluck(:id)
     late = nil
 
     perform_ready_jobs_with_callback { late = ResumableCollectedJob.perform_later(@results.first) }
 
     assert old_job.reload.finished?
-    assert_empty old_job.coalesced_arguments
+    assert_empty old_job.coalesced_calls
 
     resumed = SolidQueue::Job.where(active_job_id: old_job.active_job_id, finished_at: nil).sole
-    assert_equal rows, resumed.coalesced_arguments.order(:id).pluck(:id)
+    assert_equal rows, resumed.coalesced_calls.order(:id).pluck(:id)
 
     # The call that arrived during the first run opened its own job
     assert_not late.coalesced?
@@ -52,21 +52,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     ], JobBuffer.values
   end
 
-  test "a cursor that's a record id survives a call being dropped from the set" do
-    perform_ready_jobs
-
-    ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
-    ResumableCollectedJob.stop_after = nil
-    @results.second.destroy!
-    JobBuffer.clear
-
-    perform_ready_jobs
-
-    # An array index of 1 would have skipped the third result
-    assert_equal [ [ :run, [ @results.first.id, @results.third.id ] ], [ :processed, @results.third.id ] ], JobBuffer.values
-  end
-
-  test "a failed enqueue of a resume leaves a failed execution with the rows" do
+  test "a failed enqueue of a resume leaves a failed execution with the calls" do
     old_job = SolidQueue::Job.sole
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::StatementInvalid, "database went away")
 
@@ -74,6 +60,6 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
 
     SolidQueue::Job.unstub(:create!)
     assert old_job.reload.failed?
-    assert_equal 3, old_job.coalesced_arguments.count
+    assert_equal 3, old_job.coalesced_calls.count
   end
 end
