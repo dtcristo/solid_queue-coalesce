@@ -16,16 +16,24 @@ class LogSubscriberTest < ActiveSupport::TestCase
 
   test "coalesce a call" do
     attach_log_subscriber
-    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", action: :dropped
+    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :discarded
 
-    assert_match_logged :debug, "Coalesce call", "key: \"MyJob/1\", job_id: 42, active_job_id: \"abc\", outcome: :dropped"
+    assert_match_logged :debug, "Coalesce call", "key: \"MyJob/1\", job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", outcome: :discarded"
   end
 
   test "drop a coalesced call" do
     attach_log_subscriber
-    instrument "drop_coalesced_argument.solid_queue", argument_id: 7, job_id: 42, active_job_id: "abc"
+    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", exception_class: "ActiveJob::DeserializationError"
 
-    assert_match_logged :warn, "Drop coalesced call for a deleted record", "argument_id: 7, job_id: 42, active_job_id: \"abc\""
+    assert_match_logged :warn, "Drop coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", exception_class: \"ActiveJob::DeserializationError\""
+  end
+
+  test "neither event logs arguments or payloads, whatever it's given" do
+    attach_log_subscriber
+    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :created, arguments: [ "secret" ], job_data: { "arguments" => [ "secret" ] }
+    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", exception_class: "E", arguments: [ "secret" ]
+
+    assert_no_match(/secret/, (@logger.logged(:debug) + @logger.logged(:warn)).join)
   end
 
   private

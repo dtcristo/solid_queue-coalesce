@@ -12,14 +12,14 @@ module SolidQueue
     end
 
     belongs_to :job, optional: true
-    has_many :coalesced_arguments
+    has_many :coalesced_calls
 
     scope :stranded, -> { left_joins(job: :failed_execution).merge(Job.finished.or(Job.where.not(failed_execution: { id: nil }))) }
 
     class << self
       # Until the app has run the gem's migration everything else works as before.
       def migrated?
-        @migrated ||= table_exists? && CoalescedArgument.table_exists?
+        @migrated ||= table_exists? && CoalescedCall.table_exists?
       end
 
       # Returns the row for this key, inserted if nobody holds it, and locked so
@@ -75,18 +75,8 @@ module SolidQueue
       job.finished? || job.failed?
     end
 
-    def collect(active_jobs)
-      CoalescedArgument.insert_all(active_jobs.map { |active_job| argument_attributes_from(active_job) })
-    end
-
-    # Early flush. Bounded by the limit, however big the backlog is. A concurrent
-    # dispatcher holding the scheduled execution is dispatching it already, and if
-    # it's been dispatched before we got here there's nothing to lock.
-    def flush_if_full(limit)
-      if at_least?(limit)
-        scheduled = ScheduledExecution.where(job_id: job_id).non_blocking_lock.pluck(:job_id)
-        ScheduledExecution.dispatch_jobs(scheduled) if scheduled.any?
-      end
+    def collect(payloads)
+      CoalescedCall.insert_all(payloads.map { |payload| { coalesce_key_id: id, arguments: payload } })
     end
 
     # Hands the waiting rows over as the job leaves the queue. Requires this row
@@ -96,14 +86,14 @@ module SolidQueue
     # row with rows we didn't see would cascade to them.
     #
     # A finished job won't run again, so it claims nothing when there's a next job
-    # that can process the rows. Without a limit there can't be one: the class that
-    # would process them is gone, or stopped collecting.
+    # that can process the rows. Without a batch size there can't be one: the class
+    # that would process them is gone, or stopped collecting.
     def release(claiming: true)
-      limit = job.coalesce_limit
-      claim(claiming || limit.nil? ? limit : 0)
+      batch_size = job.coalesce_batch_size
+      claim(claiming || batch_size.nil? ? batch_size : 0)
 
-      if oldest = coalesced_arguments.order(:id).lock.first
-        next_job = job.enqueue_next_coalesced(oldest, due_now: next_job_due_now?(limit))
+      if oldest = coalesced_calls.order(:id).lock.first
+        next_job = job.enqueue_next_coalesced(oldest)
         update_columns(job_id: next_job.id)
       else
         destroy!
@@ -111,21 +101,9 @@ module SolidQueue
     end
 
     private
-      def next_job_due_now?(limit)
-        limit.present? && job.coalesce_flush_when_full? && at_least?(limit)
-      end
-
-      def argument_attributes_from(active_job)
-        { coalesce_key_id: id, arguments: active_job.serialize["arguments"], scheduled_at: active_job.scheduled_at }
-      end
-
-      def at_least?(count)
-        coalesced_arguments.order(:id).offset(count - 1).limit(1).pick(:id).present?
-      end
-
-      # A nil limit means we can't know it, so nothing is left behind
-      def claim(limit)
-        claimed = limit ? coalesced_arguments.where(id: coalesced_arguments.order(:id).limit(limit).lock.pluck(:id)) : coalesced_arguments
+      # A nil batch size means we can't know it, so nothing is left behind
+      def claim(batch_size)
+        claimed = batch_size ? coalesced_calls.where(id: coalesced_calls.order(:id).limit(batch_size).lock.pluck(:id)) : coalesced_calls
         claimed.update_all(job_id: job_id, coalesce_key_id: nil)
       end
   end

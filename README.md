@@ -4,12 +4,19 @@ Coalescing for [Solid Queue](https://github.com/rails/solid_queue). Many `perfor
 
 It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
 
+Coalescing protects pending work. It doesn't stop two runs from overlapping, so use `limits_concurrency` if you need that.
+
 ## Table of Contents
 
 - [Installation](#installation)
 - [Usage](#usage)
+- [Keys](#keys)
 - [Collecting calls](#collecting-calls)
-- [Retries and partial success](#retries-and-partial-success)
+- [Scheduling and overflow](#scheduling-and-overflow)
+- [Enqueue outcomes](#enqueue-outcomes)
+- [Retries](#retries)
+- [Deleted records](#deleted-records)
+- [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits)
 - [Discarding and retention](#discarding-and-retention)
 - [Rules and limitations](#rules-and-limitations)
 - [Monitoring](#monitoring)
@@ -42,128 +49,214 @@ A dispatcher with `concurrency_maintenance` on, which is the default, is what re
 
 ## Usage
 
-With coalescing, many `perform_later` calls with the same key share one pending job. The key has to be open for this to happen: it's taken when the first call creates a job, and it's free again the moment that job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
-
 ```ruby
-class RefreshAccountJob < ApplicationJob
-  coalesce key: ->(account) { account }
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }
 
-  def perform(account)
-    account.refresh!
+  def perform(product_id)
+    Product.find(product_id).reindex!
   end
 end
 ```
 
-`key` is the only required parameter, and it works like the one in `limits_concurrency`: a symbol, a string or a proc that receives the job arguments. If the proc returns an Active Record record, the key is built from its class name and `id`. Keys are always scoped to the job class name.
+The default is `on_conflict: :discard`. A call that finds a pending job for its key is suppressed, and the pending job keeps its own schedule, queue, priority and arguments. The key is free again the moment that job starts, so a call that arrives during the run creates the next pending job.
 
-By default a call that finds an open job for its key is dropped. It sets `coalesced?` to `true` on the Active Job instance and `provider_job_id` to the job it found, and emits a `coalesce.solid_queue` event with `key`, `job_id`, `active_job_id` and `action` (`:dropped` or `:collected`). Bear in mind that Active Job sets `successfully_enqueued?` to `true` after `perform_later` regardless, so `coalesced?` is what tells you the call was dropped. `ActiveJob.perform_all_later` counts dropped calls as not enqueued, as it does for `on_conflict: :discard`.
-
-The first call's schedule, queue and priority win. A later call's `wait:` doesn't move the open job.
-
-Coalescing doesn't change `limits_concurrency`, and you can use both in the same job. The concurrency key is the one computed for the call that created the job, and a job that's blocked still holds its coalesce key, since it hasn't started. If `on_conflict: :discard` destroys the job, that frees the key.
-
-### Collecting calls
-
-With `collect: true`, no call is dropped. Each one stores its arguments, and the job receives them all:
+The options are:
 
 ```ruby
-class ReindexDocumentsJob < ApplicationJob
-  coalesce key: ->(document) { document.account_id }, collect: true, limit: 100
+coalesce key:, on_conflict: :discard, batch_size: nil
+```
 
-  def perform(documents)
-    Search.index(documents)
+- `key` is required. See [Keys](#keys).
+- `on_conflict` is `:discard` or `:collect`. Anything else raises `ArgumentError`.
+- `batch_size` is only allowed with `:collect`. It's a positive integer, 100 by default.
+
+## Keys
+
+`key` works like the one in `limits_concurrency`, with the same derivation:
+
+```ruby
+coalesce key: :global                       # Static job-wide key
+coalesce key: "global"                      # Same literal component
+coalesce key: ->(account_id) { account_id } # Distinct per account
+coalesce key: ->(account) { account }       # Active Record class and ID
+```
+
+Keys are always scoped to the job class name. `coalesce key: :account_id` doesn't read a parameter called `account_id`. It's a static string, as it is in `limits_concurrency`.
+
+The key column is declared like the one on Solid Queue's semaphores, with the database's default collation and a unique index. That's upstream parity, and it isn't a guarantee of bytewise uniqueness. Under a case- and accent-insensitive collation such as MySQL's `utf8mb4_0900_ai_ci`, `Job/a`, `Job/A` and `Job/á` compare equal and coalesce together. Under a case-sensitive or binary collation they stay distinct.
+
+## Collecting calls
+
+With `on_conflict: :collect`, no call is suppressed. Every accepted call is stored, including the first, and the job runs `perform_batch` with them:
+
+```ruby
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id },
+           on_conflict: :collect,
+           batch_size: 100
+
+  def perform_batch(calls)
+    account_id = calls.first.arguments.first
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+
+    products = Product.where(account_id: account_id, id: product_ids).to_a
+    SearchIndex.bulk_index(products)
   end
 end
 ```
 
-`perform` receives an array with one element per call, in the order they were stored. For a call with one argument the element is that argument, as above. For a call with several it's an array of them, and keyword arguments are a hash at the end of that array, so `perform_later(document, force: true)` gives `[ document, { force: true } ]`.
+```ruby
+BulkReindexProductsJob
+  .set(wait: 30.seconds)
+  .perform_later(product.account_id, product.id)
+```
 
-`arguments` isn't part of this: it keeps holding the arguments of the call that created the job, which is what callbacks and the `limits_concurrency` key see.
+Pass IDs, and do one bounded load and one bulk operation per batch. That's the reason to collect in the first place. `SearchIndex.bulk_index` stands in for your own code.
 
-`limit` is 100 by default, and each run gets at most that many calls. If more are waiting when a job starts, it takes the oldest `limit` and a new job is created for the rest, in the same queue and with the same priority and concurrency key. It's due when the oldest call left asked to run, or right away if at least `limit` calls are left, unless you turn off `flush_when_full` (see below).
+A collecting job always runs `perform_batch`, and ignores any `perform` it has. If `perform_batch` is missing, the run raises `NotImplementedError` and the job fails with its calls.
 
-Reaching `limit` also flushes a job that's scheduled: it's dispatched right away instead of waiting for its time. So you can use `wait:` to collect calls for a while, with `limit` as the point where you stop waiting. Concurrency limits apply to a flushed job as usual, and jobs already ready or blocked aren't affected. A call that arrives after a flush still has its own `wait:` stored, so if it ends up in the next job, that's the time the next job will run. Concurrent calls can leave slightly more than `limit` calls waiting, but that doesn't matter because the limit is enforced when the job starts.
-
-Use `flush_when_full: false` for a job that has to wait for its time, such as one that runs at a fixed time of day. Solid Queue can't work this out on its own, because `wait:` and `wait_until:` both end up as the same `scheduled_at`.
+`calls` is an array of `ActiveJob::Coalescing::Call`, oldest first, with three readers:
 
 ```ruby
-class SendDigestJob < ApplicationJob
-  coalesce key: ->(entry) { entry.account_id }, collect: true, limit: 100, flush_when_full: false
+call.id        # The row's ID, nil for perform_now and other adapters
+call.arguments # The deserialized positional array
+call.job_data  # The call's whole serialized Active Job payload
+```
 
-  def self.perform_tonight(entry)
-    set(wait_until: Time.current.tomorrow.change(hour: 2)).perform_later(entry)
-  end
+`arguments` goes through `ActiveJob::Arguments.deserialize`, so GlobalID and custom serializers work as usual. Keyword arguments are a trailing hash with Ruby's keyword marker, so `some_method(*call.arguments)` passes them as keywords.
 
-  def perform(entries)
-    DigestMailer.with(entries: entries).digest.deliver_now
+`job_data` is the raw snapshot taken when the call was enqueued: `job_id`, `queue_name`, `priority`, `locale`, `timezone`, `enqueued_at`, `scheduled_at`, and whatever your `serialize` adds. It's frozen at the top level. It describes the request, not this run, and nothing restores that call's locale or timezone for you.
+
+`coalesced_calls` holds the same array, and perform callbacks can read it. `arguments` on the job itself keeps holding the arguments of the call that created the job, which is what the `limits_concurrency` key sees.
+
+## Scheduling and overflow
+
+The first pending call's schedule wins. Later calls don't move it, and reaching `batch_size` doesn't dispatch anything early. `batch_size` is the most calls one run takes, not a limit on how many can wait.
+
+When a job starts it claims up to `batch_size` calls, oldest first, in one transaction. If more are waiting, a follow-up job takes over the key, in the same queue and with the same priority and concurrency key. It's due when the oldest waiting call asked to run, read from that call's `job_data["scheduled_at"]`, so it runs right away if that time has passed. A backlog that's already due drains one batch after another, and calls dated in the future wait for their time.
+
+A call that joins a pending job runs with it, even if it asked for a later time. A call that arrives after the last batch started opens a new job for its own time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
+
+## Enqueue outcomes
+
+`coalesce_status` on the Active Job instance says what happened to the call:
+
+- `:created` means it created the pending job, including the first collected call.
+- `:discarded` means a pending job already held the key, and the call was suppressed.
+- `:collected` means it was stored for the pending job.
+- `nil` means there's no outcome: before an enqueue, with `perform_now`, on another adapter, or when `limits_concurrency` with `on_conflict: :discard` destroyed the new job.
+
+`coalesced?` is true for `:discarded` and `:collected`. `provider_job_id` is the pending job's ID for any admitted call.
+
+Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` after `perform_later` even when the call was discarded.
+
+`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` on each job, and subscribers to the event below see every outcome.
+
+Two notifications exist:
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
+| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `exception_class` |
+
+`SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, but the key is logged, so keep secrets out of it.
+
+`coalesce.solid_queue` fires right after the admission. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
+
+## Retries
+
+A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps the calls it claimed through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
+
+Delivery is at-least-once. There's no per-call acknowledgement or per-call continuation, so a retry runs the whole batch again and `perform_batch` has to be idempotent.
+
+## Deleted records
+
+Each call is deserialized on its own. If a call refers to a deleted record, that call is deleted and `drop_coalesced_call.solid_queue` is emitted, while the others run. If that happens to every call in the batch, `perform_batch` and its callbacks are skipped and the job finishes normally. The job never falls back to its own arguments: those calls stay until the job is destroyed, so a re-run after a crash skips them too. Any other deserialization error fails the job and keeps all of its calls.
+
+## Recurring jobs and concurrency limits
+
+A recurring task can use `:discard`. A tick that finds a pending job is suppressed and not recorded in `solid_queue_recurring_executions`. A recurring task can't use `:collect`: its configuration is invalid.
+
+To skip busy ticks, use a concurrency limit on its own. This suits a job that syncs full state, and it doesn't need coalescing:
+
+```ruby
+class SyncInventoryJob < ApplicationJob
+  limits_concurrency to: 1,
+                     key: :global,
+                     on_conflict: :discard,
+                     duration: 30.minutes
+
+  def perform
+    InventorySynchronizer.sync!
   end
 end
 ```
 
-With this option, reaching `limit` doesn't dispatch the job, and it stays scheduled. When it starts with more than `limit` calls waiting, the new job for the rest is due when the oldest call left asked to run, however many are left. So a backlog that's already due drains in batches of `limit`, one after another, and calls dated in the future wait for their time.
-
-The first call since the previous job started sets the schedule, and later calls' times don't move an open job. A later call that joins a job still waiting to start runs with that job, even if it asked for a later time. A call that arrives after the last batch started opens a new job for its own time. This means any caller that might arrive first needs the right time: a plain `perform_later` would open a job that runs right away. That's why the example wraps `set(wait_until:)` in a class method.
-
-If you alert on the age of the oldest row in `solid_queue_coalesced_arguments`, allow for the wait you expect, because these calls sit there until their time comes.
-
-Each call is deserialized on its own. If a call refers to a record that has been deleted, that call is deleted and a `drop_coalesced_argument.solid_queue` event is emitted, while the others run. If every call refers to a deleted record, the events are emitted, `perform` is skipped and the job finishes normally. Those calls stay until the job is destroyed, so a re-run after a crash skips `perform` too. Any other deserialization error fails the job and keeps all of its calls.
-
-### Retries and partial success
-
-A retry is the same work continuing. It never coalesces: it can't be dropped because another job is open for its key, and later calls can't join it. A job that's retried or resumed keeps the exact calls it started with, including after `retry_on`, `rescue_from` with `retry_job`, and `ActiveJob::Continuable`. If the retry can't be enqueued, the job fails and keeps its calls. Retrying a failed job manually runs the same calls again, and so does a job that gets released after its worker was shut down.
-
-To avoid repeating calls that have already been processed, use `ActiveJob::Continuable` with a cursor. Use a record's `id` as the cursor instead of a position in the array, because calls for deleted records are dropped between runs and positions move:
+To keep one follow-up, coalesce pending work and block on the limit:
 
 ```ruby
-class ReindexDocumentsJob < ApplicationJob
-  include ActiveJob::Continuable
+class SyncInventoryJob < ApplicationJob
+  coalesce key: :global
 
-  coalesce key: ->(document) { document.account_id }, collect: true
+  limits_concurrency to: 1,
+                     key: :global,
+                     on_conflict: :block,
+                     duration: 30.minutes
 
-  def perform(documents)
-    step :index do |step|
-      documents.sort_by(&:id).each do |document|
-        next if step.cursor && document.id <= step.cursor
-
-        Search.index(document)
-        step.set! document.id
-      end
-    end
+  def perform
+    InventorySynchronizer.sync!
   end
 end
 ```
 
-Coalescing has no per-call acknowledgement. Without a cursor a retry processes every call in the job again.
+Both use the same recurring configuration:
 
-### Discarding and retention
+```yaml
+production:
+  sync_inventory:
+    class: SyncInventoryJob
+    schedule: every minute
+```
 
-Calls belong to their job, and are deleted with it. Discarding an open job deletes it, its key and every call waiting on it. If `preserve_finished_jobs` is on, a job's calls stay until the job is cleared, along with the finished job itself.
+These behave differently. With `:block`, one tick during a run creates a blocked job, later ticks are coalesced because that job hasn't started, and it runs when the current one finishes. With concurrency `:discard` alone, busy ticks disappear and nothing catches up afterwards.
 
-A job that fails before starting, for example because its worker died or because its class no longer exists, takes care of its calls in the same way as if it had started. If the class is gone, there's no way to know the limit, so the failed job takes all the waiting calls. When you bring the class back and retry the job, it will run them all, even if that's more than `limit`.
+`:global` is a literal in both APIs, and coalescing and concurrency keep separate database records. A semaphore's `duration` can expire, so a concurrency limit isn't an absolute guarantee against overlap.
 
-### Rules and limitations
+The concurrency key of a coalesced job is the one computed for the call that created it, and a blocked job still holds its coalesce key, since it hasn't started. `:collect` works with `on_conflict: :block`. It can't be combined with `limits_concurrency` with `on_conflict: :discard`, in either order, because a conflict would destroy a job holding calls, so that raises `ArgumentError` when the class loads. `:discard` can, and the destroyed job frees the key.
 
-- `limit` and `flush_when_full` need `collect: true`, and `collect: true` can't be combined with `limits_concurrency` with `on_conflict: :discard`, because a conflict would destroy a job holding calls. Both raise `ArgumentError` when the class loads. Without `collect`, `on_conflict: :discard` is fine, and the job being discarded frees the key.
-- A coalesced job can't be enqueued inside `SolidQueue::Batch.enqueue`, either alone or in bulk. A call that joins an open job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
-- A recurring task can't use a job with `collect: true`: its configuration is invalid. Without `collect`, it works. A tick that finds an open job is dropped and isn't recorded.
-- Calling `perform_later` inside a transaction on the same database as Solid Queue is safe: a call for an open job doesn't abort the transaction. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
+## Discarding and retention
+
+Calls belong to their job, and are deleted with it. Discarding a pending job deletes it, its key and every call waiting on it. If `preserve_finished_jobs` is on, a job's calls stay until the job is cleared, along with the finished job itself.
+
+A job that fails before starting, for example because its worker died or because its class no longer exists, takes care of its calls in the same way as if it had started. If the class is gone, there's no way to know the batch size, so the failed job takes all the waiting calls. When you bring the class back and retry the job, it will run them all, even if that's more than `batch_size`.
+
+## Rules and limitations
+
+- A coalesced job can't be enqueued inside `SolidQueue::Batch.enqueue`, either alone or in bulk. A call that joins a pending job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
+- Calling `perform_later` inside a transaction on the same database as Solid Queue is safe: a call for a pending job doesn't abort the transaction. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
-- Keys longer than 255 characters fail on MySQL. `"a"` and `"a "` count as the same key there, because `utf8mb4_bin` pads spaces.
-- Concurrent calls that reach `limit` together can miss the early flush. The next call or the job's schedule covers it.
-- Removing `collect: true` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it: they wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedArgument.waiting` to be empty before you deploy the change.
+- Keys longer than 255 characters fail on MySQL.
+- Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it: they wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
 
-### Monitoring
+## Monitoring
 
-Queue depth hides the backlog, because any number of calls waiting may be a single job. To see it, look at the calls instead:
+Queue depth hides the backlog, because any number of waiting calls may be a single job. To see it, look at the calls instead:
 
 ```ruby
-SolidQueue::CoalescedArgument.waiting.count
-SolidQueue::CoalescedArgument.waiting.minimum(:created_at) # nil when nothing is waiting
+SolidQueue::CoalescedCall.waiting.count
+SolidQueue::CoalescedCall.waiting.minimum(:created_at) # nil when nothing is waiting
 ```
 
-### Testing
+If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes.
 
-Everything above needs the Solid Queue adapter, so other adapters ignore `coalesce`. With the test adapter, the inline adapter or `perform_now`, each call runs on its own, and `perform` receives a batch of one built from that call's arguments. `assert_enqueued_with(args: [ document ])` still works, and the Solid Queue tables aren't touched.
+To count outcomes, subscribe to `coalesce.solid_queue` and group by `action`. Job IDs and keys make poor metric labels, because there are too many of them.
+
+## Testing
+
+Everything above needs the Solid Queue adapter, so other adapters ignore `coalesce`. With the test adapter, the inline adapter or `perform_now`, each call runs on its own, and a collecting job's `perform_batch` receives a batch of one whose `id` is `nil`. `assert_enqueued_with(args: [ product_id ])` still works, and the Solid Queue tables aren't touched.
+
+A batch of one builds `job_data` when you read it, so `perform_now` with arguments that can't be serialized only raises if you read it.
 
 ## License
 
