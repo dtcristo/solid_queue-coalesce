@@ -178,6 +178,59 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
+  class WrappedPayloadJob < ApplicationJob
+    coalesce key: "wrapped", on_conflict: :collect
+
+    def serialize
+      payload = super
+      payload.merge("arguments" => [ "wrapped", payload["arguments"] ])
+    end
+
+    def deserialize(job_data)
+      raise ArgumentError, "corrupt payload" if job_data["corrupt"]
+
+      super(job_data.merge("arguments" => job_data["arguments"].last))
+    end
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+  end
+
+  class MutatingDeserializeJob < ApplicationJob
+    coalesce key: "mutating", on_conflict: :collect
+
+    def serialize
+      super.merge("field" => "kept")
+    end
+
+    def deserialize(job_data)
+      super
+      job_data.delete("field")
+    end
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+  end
+
+  class ReversedArgumentsJob < ApplicationJob
+    coalesce key: "reversed", on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls)
+    end
+
+    private
+      def serialize_arguments(arguments)
+        arguments.map(&:reverse)
+      end
+
+      def deserialize_arguments(serialized_arguments)
+        serialized_arguments.map(&:reverse)
+      end
+  end
+
   setup do
     @a, @b = JobResult.create!, JobResult.create!
   end
@@ -294,6 +347,65 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert_not Hash.ruby2_keywords_hash?(JobBuffer.values.sole.first.last)
+  end
+
+  test "call arguments go through the job's own serialize and deserialize, and job_data stays as stored" do
+    WrappedPayloadJob.perform_later("x")
+    WrappedPayloadJob.perform_later("y", force: true)
+
+    perform_ready_jobs
+
+    calls = JobBuffer.values.sole
+    assert_equal [ [ "x" ], [ "y", { force: true } ] ], calls.map(&:arguments)
+    assert Hash.ruby2_keywords_hash?(calls.last.arguments.last)
+    assert_equal [ "wrapped", [ "x" ] ], calls.first.job_data["arguments"]
+  end
+
+  test "call arguments go through the job's own argument serialization, and job_data stays as stored" do
+    ReversedArgumentsJob.perform_later("abc")
+    ReversedArgumentsJob.perform_later("xyz")
+
+    perform_ready_jobs
+
+    calls = JobBuffer.values.sole
+    assert_equal [ [ "abc" ], [ "xyz" ] ], calls.map(&:arguments)
+    assert_equal [ "cba" ], calls.first.job_data["arguments"]
+  end
+
+  test "a deserialize override that changes its argument leaves job_data as stored" do
+    MutatingDeserializeJob.perform_later("x")
+
+    perform_ready_jobs
+
+    assert_equal "kept", JobBuffer.values.sole.sole.job_data["field"]
+  end
+
+  test "a job with its own deserialize drops the call whose record is gone, and runs the others" do
+    gone = JobResult.create!
+    WrappedPayloadJob.perform_later(@a)
+    WrappedPayloadJob.perform_later(gone)
+    WrappedPayloadJob.perform_later(@b)
+    gone.destroy!
+
+    events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
+
+    assert_equal [ [ @a ], [ @b ] ], JobBuffer.values.sole.map(&:arguments)
+    assert_equal 2, SolidQueue::CoalescedCall.count
+    assert_equal 1, events.size
+  end
+
+  test "an error from a job's own deserialize fails the run and keeps the calls" do
+    WrappedPayloadJob.perform_later("x")
+    WrappedPayloadJob.perform_later("y")
+    job = SolidQueue::Job.sole
+    corrupt = SolidQueue::CoalescedCall.order(:id).last
+    corrupt.update!(arguments: corrupt.arguments.merge("corrupt" => true))
+
+    assert_raises(ArgumentError) { perform_ready_jobs }
+
+    assert job.reload.failed?
+    assert_equal 2, job.coalesced_calls.count
+    assert_empty JobBuffer.values
   end
 
   test "ids from a batch feed one bounded query" do
