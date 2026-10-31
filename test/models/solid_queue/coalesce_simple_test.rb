@@ -126,7 +126,6 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
         active_job = CoalescedRefreshJob.perform_later("a")
 
         assert active_job.successfully_enqueued?
-        assert_not active_job.coalesced?
         assert_equal :created, active_job.coalesce_status
         assert_equal SolidQueue::Job.last.id, active_job.provider_job_id
       end
@@ -141,16 +140,26 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     active_job = CoalescedRefreshJob.new("a")
     active_job.perform_now
     assert_nil active_job.coalesce_status
-    assert_not active_job.coalesced?
   end
 
   test "coalesce_status is nil on another adapter" do
     active_job = InlineRefreshJob.perform_later("a")
 
     assert_nil active_job.coalesce_status
-    assert_not active_job.coalesced?
     assert_equal [ "a" ], JobBuffer.values
     assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "coalesce_status is the only outcome an Active Job exposes, and it's read-only" do
+    active_job = CoalescedRefreshJob.perform_later("a")
+
+    assert_raises(NoMethodError) { active_job.coalesce_status = :discarded }
+    assert_equal :created, active_job.coalesce_status
+    assert_not_respond_to active_job, :coalesced?
+  end
+
+  test "a Solid Queue job doesn't expose whether its class coalesces" do
+    assert_not_respond_to SolidQueue::Job.new, :coalesced?
   end
 
   test "after_enqueue sees the outcome of a single enqueue" do
@@ -231,7 +240,6 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
       assert_no_difference -> { SolidQueue::Job.count } do
         second = CoalescedRefreshJob.perform_later("a")
 
-        assert second.coalesced?
         assert_equal :discarded, second.coalesce_status
         assert_equal first.provider_job_id, second.provider_job_id
         assert_not_equal first.job_id, second.job_id
@@ -253,7 +261,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     SolidQueue::Job.enqueue(discarded)
 
     assert_not discarded.successfully_enqueued?
-    assert discarded.coalesced?
+    assert_equal :discarded, discarded.coalesce_status
   end
 
   test "different keys and different classes are independent" do
@@ -292,7 +300,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     active_job = RecordKeyedRefreshJob.perform_later(result)
     assert_equal "SolidQueue::CoalesceSimpleTest::RecordKeyedRefreshJob/JobResult/#{result.id}", active_job.coalesce_key
-    assert RecordKeyedRefreshJob.perform_later(JobResult.find(result.id)).coalesced?
+    assert_equal :discarded, RecordKeyedRefreshJob.perform_later(JobResult.find(result.id)).coalesce_status
 
     assert_equal "SolidQueue::CoalesceSimpleTest::StringKeyedRefreshJob/everything", StringKeyedRefreshJob.new.coalesce_key
   end
@@ -303,8 +311,8 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     scheduled_at = job.scheduled_at
 
     assert_no_changes -> { job.reload.scheduled_at } do
-      assert CoalescedRefreshJob.set(wait: 1.minute).perform_later("a").coalesced?
-      assert CoalescedRefreshJob.perform_later("a").coalesced?
+      assert_equal :discarded, CoalescedRefreshJob.set(wait: 1.minute).perform_later("a").coalesce_status
+      assert_equal :discarded, CoalescedRefreshJob.perform_later("a").coalesce_status
     end
 
     assert job.scheduled?
@@ -320,7 +328,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal [ 0 ], keys_while_performing
     assert_equal [ "a" ], JobBuffer.values
 
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
     assert_equal 1, SolidQueue::CoalesceKey.count
   end
 
@@ -328,9 +336,9 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     CoalescedRefreshJob.perform_later("a")
     joined = nil
 
-    perform_ready_jobs_with_callback { joined = CoalescedRefreshJob.perform_later("a").coalesced? }
+    perform_ready_jobs_with_callback { joined = CoalescedRefreshJob.perform_later("a").coalesce_status }
 
-    assert_equal false, joined
+    assert_equal :created, joined
     assert_equal 1, SolidQueue::ReadyExecution.count
   end
 
@@ -344,7 +352,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     SolidQueue::Job.find(active_job.provider_job_id).discard
 
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
   test "deleting the open job frees the key" do
@@ -353,17 +361,17 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     SolidQueue::Job.where(class_name: "CoalescedRefreshJob").delete_all
 
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
   test "a job discarded by a concurrency conflict on enqueue leaves no key" do
     DiscardingRefreshJob.perform_later("a", "group")
     discarded = DiscardingRefreshJob.perform_later("b", "group")
 
-    assert_not discarded.coalesced?
+    assert_nil discarded.coalesce_status
     assert_nil discarded.provider_job_id
     assert_equal [ "SolidQueue::CoalesceSimpleTest::DiscardingRefreshJob/a" ], SolidQueue::CoalesceKey.pluck(:key)
-    assert_not DiscardingRefreshJob.perform_later("b", "another_group").coalesced?
+    assert_equal :created, DiscardingRefreshJob.perform_later("b", "another_group").coalesce_status
   end
 
   test "a scheduled job discarded by a concurrency conflict when it's due frees the key" do
@@ -374,8 +382,8 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
       SolidQueue::ScheduledExecution.dispatch_next_batch(10)
     end
 
-    assert_not DiscardingRefreshJob.perform_later("b", "another_group").coalesced?
-    assert DiscardingRefreshJob.perform_later("a", "another_group").coalesced?
+    assert_equal :created, DiscardingRefreshJob.perform_later("b", "another_group").coalesce_status
+    assert_equal :discarded, DiscardingRefreshJob.perform_later("a", "another_group").coalesce_status
   end
 
   test "a retry doesn't get suppressed by a pending job or absorb later calls" do
@@ -384,7 +392,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     pending = nil
     perform_ready_jobs_with_callback { pending ||= RetriedRefreshJob.perform_later("a") }
 
-    assert_not pending.coalesced?
+    assert_equal :created, pending.coalesce_status
     assert_equal 2, SolidQueue::ReadyExecution.count
     assert_equal pending.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
 
@@ -399,7 +407,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     assert_equal 1, SolidQueue::ReadyExecution.count
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_not RetriedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, RetriedRefreshJob.perform_later("a").coalesce_status
   end
 
   test "a retry that can't be enqueued fails the run" do
@@ -547,7 +555,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     SolidQueue::Process.prune
 
     assert job.reload.failed?
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
   test "a job whose class is gone frees the key when it fails" do
@@ -558,7 +566,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_raises(NameError) { perform_ready_jobs }
 
     assert job.reload.failed?
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
   test "a key left on a job that finishes without starting is released, so calls can't join a job that won't run them" do
@@ -598,7 +606,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     # Joining the blocked job doesn't change it, and its concurrency key stays
     # the one computed for the call that created it
     joined = LimitedRefreshJob.perform_later("b", "another_group")
-    assert joined.coalesced?
+    assert_equal :discarded, joined.coalesce_status
     assert_equal blocked.provider_job_id, joined.provider_job_id
     assert_equal "#{LimitedRefreshJob.name}/group", job.reload.concurrency_key
 
@@ -621,7 +629,6 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
 
     assert_equal [ true, true, false, false, false, true ], jobs.map(&:successfully_enqueued?)
-    assert_equal [ false, false, true, true, true, false ], jobs.map(&:coalesced?)
     assert_equal [ :created, :created, :discarded, :discarded, :discarded, nil ], jobs.map(&:coalesce_status)
     assert_equal jobs[0].provider_job_id, jobs[2].provider_job_id
     assert_equal jobs[0].provider_job_id, jobs[4].provider_job_id
@@ -650,7 +657,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
 
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_not CoalescedRefreshJob.perform_later("a").coalesced?
+    assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
   private

@@ -240,9 +240,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     second = CollectedCallsJob.set(wait: 1.hour).perform_later("g", 2)
 
     assert first.successfully_enqueued?
-    assert_not first.coalesced?
+    assert_equal :created, first.coalesce_status
     assert second.successfully_enqueued?
-    assert second.coalesced?
+    assert_equal :collected, second.coalesce_status
     assert_equal first.provider_job_id, second.provider_job_id
 
     assert_equal 1, SolidQueue::Job.count
@@ -675,7 +675,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
     DefaultBatchSizeJob.set(wait_until: in_an_hour).perform_later("g", 0)
     job = SolidQueue::Job.sole
-    assert DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesced?
+    assert_equal :collected, DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesce_status
     assert_in_delta in_an_hour.to_f, job.reload.scheduled_at.to_f, 0.001
 
     travel_to in_an_hour + 1.second do
@@ -685,7 +685,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
         DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 2)
       end
 
-      assert_not after_start.sole.coalesced?
+      assert_equal :created, after_start.sole.coalesce_status
     end
     assert_equal [ [ 0, 1 ] ], JobBuffer.values
 
@@ -732,9 +732,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     CollectedCallsJob.perform_later("g", 0)
     CollectedCallsJob.perform_later("g", 1)
 
-    joined = perform_ready_jobs_with_callback { CollectedCallsJob.perform_later("g", 2).coalesced? }
+    joined = perform_ready_jobs_with_callback { CollectedCallsJob.perform_later("g", 2).coalesce_status }
 
-    assert_equal [ false ], joined
+    assert_equal [ :created ], joined
     assert_equal [ [ [ "g", 0 ], [ "g", 1 ] ] ], JobBuffer.values
     assert_equal 1, SolidQueue::CoalescedCall.waiting.count
     assert_equal 1, SolidQueue::ReadyExecution.count

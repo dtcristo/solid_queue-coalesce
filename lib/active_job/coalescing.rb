@@ -42,8 +42,8 @@ module ActiveJob
       class_attribute :coalesce_on_conflict, instance_accessor: false
       class_attribute :coalesce_batch_size, instance_accessor: false
 
-      attr_accessor :coalesce_status
-      attr_reader :coalesced_calls
+      attr_reader :coalesce_status, :coalesced_calls
+      private attr_writer :coalesce_status
     end
 
     class_methods do
@@ -122,11 +122,6 @@ module ActiveJob
           [ self.class.name, param ]
         end.compact.join("/")
       end
-    end
-
-    # Whether this call found a job that was already open
-    def coalesced?
-      coalesce_status == :discarded || coalesce_status == :collected
     end
 
     def perform_batch(_calls)

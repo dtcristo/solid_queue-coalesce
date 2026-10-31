@@ -214,7 +214,7 @@ module SolidQueue
 
               active_job.provider_job_id = job_id
               active_job.successfully_enqueued = created_by_this_call || collect
-              active_job.coalesce_status = job_id && (created_by_this_call ? :created : (collect ? :collected : :discarded))
+              active_job.send(:coalesce_status=, job_id && (created_by_this_call ? :created : (collect ? :collected : :discarded)))
             end
 
             # After every outcome, because a subscriber can raise. These calls are stored,
@@ -225,10 +225,6 @@ module SolidQueue
               end
             end
           end
-      end
-
-      def coalesced?
-        job_class.try(:coalesce_key).present?
       end
 
       # The start step. Returns what the Active Job needs to know about this run,
@@ -255,6 +251,11 @@ module SolidQueue
       end
 
       private
+        # Whether this job's class coalesces
+        def coalesced?
+          job_class.try(:coalesce_key).present?
+        end
+
         # A sealed job has no row, and lock_for_release won't touch a newer job's
         def release_coalesce_key
           CoalesceKey.lock_for_release(id)&.destroy! if CoalesceKey.migrated?
