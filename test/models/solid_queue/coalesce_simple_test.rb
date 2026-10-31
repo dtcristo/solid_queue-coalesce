@@ -13,6 +13,14 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class CollectingRefreshJob < ApplicationJob
+    coalesce key: ->(name) { name }, on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.size)
+    end
+  end
+
   class RetriedRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }
     retry_on ExpectedTestError, wait: 0.seconds
@@ -416,17 +424,37 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal SolidQueue::Job::EnqueueError.name, job.failed_execution.exception_class
   end
 
-  test "a job that isn't coalesced doesn't touch the coalescing tables" do
-    AddToBufferJob.perform_later("a")
-    queries = []
-    callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") }
+  test "a job that isn't coalesced only reads the coalescing tables, once per job, when it finishes" do
+    [ true, false ].each do |preserve|
+      SolidQueue.with(preserve_finished_jobs: preserve) do
+        queries = []
+        callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") && payload[:name] != "SCHEMA" }
 
-    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
-      AddToBufferJob.perform_later("b")
-      perform_ready_jobs
+        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+          AddToBufferJob.perform_later("a")
+        end
+        assert_empty queries
+
+        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { perform_ready_jobs }
+
+        assert_equal 1, queries.size, "preserve_finished_jobs: #{preserve}"
+        assert queries.all? { |sql| sql.start_with?("SELECT") && !sql.include?("FOR UPDATE") }, queries.to_s
+      end
+    end
+  end
+
+  test "admission locks the key exclusively to collect, and shares it to discard" do
+    skip "Row locks don't exist on SQLite" if SolidQueue::Record.connection_pool.db_config.adapter == "sqlite3"
+
+    key_locks = ->(&enqueues) do
+      queries = []
+      callback = ->(*, payload) { queries << payload[:sql][/FOR UPDATE|FOR SHARE|LOCK IN SHARE MODE/] if payload[:sql].include?("solid_queue_coalesce_keys") }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &enqueues)
+      queries.compact.uniq
     end
 
-    assert_empty queries
+    assert_equal [ "FOR UPDATE" ], key_locks.call { 2.times { CollectingRefreshJob.perform_later("a") } }
+    assert_includes [ [ "FOR SHARE" ], [ "LOCK IN SHARE MODE" ] ], key_locks.call { 2.times { CoalescedRefreshJob.perform_later("a") } }
   end
 
   test "a failure in the start step becomes a failed execution and perform doesn't run" do
@@ -464,48 +492,30 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_not CoalescedRefreshJob.perform_later("a").coalesced?
   end
 
-  test "the sweeper deletes the key of a finished job and respects the batch size" do
-    2.times { |i| CoalescedRefreshJob.perform_later("a#{i}") }
-    SolidQueue::ReadyExecution.delete_all
-    SolidQueue::Job.update_all(finished_at: Time.current)
+  test "a key left on a job that finishes without starting is released, so calls can't join a job that won't run them" do
+    [ true, false ].each do |preserve|
+      SolidQueue.with(preserve_finished_jobs: preserve) do
+        job = SolidQueue::Job.find_by!(active_job_id: AddToBufferJob.perform_later("no longer coalesced").job_id)
+        SolidQueue::CoalesceKey.create!(key: "#{CoalescedRefreshJob.name}/a", job: job)
 
-    SolidQueue::CoalesceKey.release_stranded(1)
-    assert_equal 1, SolidQueue::CoalesceKey.count
+        perform_ready_jobs
 
-    SolidQueue::CoalesceKey.release_stranded(1)
-    assert_equal 0, SolidQueue::CoalesceKey.count
+        assert_equal 0, SolidQueue::CoalesceKey.count
+        assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
+        perform_ready_jobs
+      end
+    end
+
+    assert_equal [ "no longer coalesced", "a", "no longer coalesced", "a" ], JobBuffer.values
   end
 
-  test "the sweeper deletes the key of a failed job" do
-    CoalescedRefreshJob.perform_later("a")
-    job = SolidQueue::Job.sole
-    SolidQueue::ReadyExecution.delete_all
-    SolidQueue::FailedExecution.create!(job: job, exception: ExpectedTestError.new("boom"))
+  test "finishing a job that was never coalesced leaves other keys alone" do
+    CoalescedRefreshJob.set(wait: 1.hour).perform_later("a")
+    AddToBufferJob.perform_later("other")
 
-    SolidQueue::CoalesceKey.release_stranded(10)
-
-    assert_equal 0, SolidQueue::CoalesceKey.count
-  end
-
-  test "the sweeper leaves keys of pending jobs alone" do
-    CoalescedRefreshJob.perform_later("a")
-
-    SolidQueue::CoalesceKey.release_stranded(10)
+    perform_ready_jobs
 
     assert_equal 1, SolidQueue::CoalesceKey.count
-  end
-
-  test "the dispatcher's maintenance runs the sweeper" do
-    CoalescedRefreshJob.perform_later("a")
-    SolidQueue::ReadyExecution.delete_all
-    SolidQueue::Job.update_all(finished_at: Time.current)
-
-    maintenance = SolidQueue::Dispatcher::Maintenance.new(600, 10, concurrency: true, batches: false)
-    maintenance.start
-    wait_for(timeout: 2.seconds) { SolidQueue::CoalesceKey.none? }
-    maintenance.stop
-
-    assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
   test "concurrency limits stay independent and a blocked job holds its key" do

@@ -3,6 +3,7 @@ class CreateSolidQueueCoalesceTables < ActiveRecord::Migration[7.1]
     create_table :solid_queue_coalesce_keys do |t|
       t.string :key, null: false
       t.bigint :job_id
+      t.integer :calls_count, null: false, default: 0
       t.datetime :created_at, null: false
 
       t.index :key, unique: true
@@ -11,14 +12,11 @@ class CreateSolidQueueCoalesceTables < ActiveRecord::Migration[7.1]
     end
 
     create_table :solid_queue_coalesced_calls do |t|
-      t.bigint :coalesce_key_id
-      t.bigint :job_id
+      t.bigint :job_id, null: false
       t.text :arguments, null: false
       t.datetime :created_at, null: false
 
-      t.index :coalesce_key_id
       t.index :job_id
-      t.foreign_key :solid_queue_coalesce_keys, column: :coalesce_key_id, on_delete: :cascade
       t.foreign_key :solid_queue_jobs, column: :job_id, on_delete: :cascade
     end
   end

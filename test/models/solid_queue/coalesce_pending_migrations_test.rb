@@ -42,12 +42,6 @@ class SolidQueue::CoalescePendingMigrationsTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::FailedExecution.count
   end
 
-  test "maintenance skips the sweeper" do
-    maintenance = SolidQueue::Dispatcher::Maintenance.new(600, 10, concurrency: true, batches: false)
-
-    assert_nothing_raised { maintenance.send(:release_stranded_coalesce_keys) }
-  end
-
   test "perform_now of a coalesced job doesn't need the tables" do
     CoalescedRefreshJob.perform_now("a")
 
