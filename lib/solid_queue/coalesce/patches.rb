@@ -45,10 +45,11 @@ module SolidQueue
 
       # Before super, so the key is locked before the job, as in admission. A key
       # always means a live job: one left on a job that finished without starting,
-      # because its class stopped coalescing, would accept calls that never run.
+      # because its class stopped coalescing, would accept calls that never run. A
+      # job that isn't preserved gets destroyed, and the destroy callback releases it.
       module Finishing
         def finished!
-          release_coalesce_key
+          release_coalesce_key if SolidQueue.preserve_finished_jobs?
           super
         end
       end

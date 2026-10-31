@@ -13,6 +13,14 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class CollectingRefreshJob < ApplicationJob
+    coalesce key: ->(name) { name }, on_conflict: :collect
+
+    def perform_batch(calls)
+      JobBuffer.add(calls.size)
+    end
+  end
+
   class RetriedRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }
     retry_on ExpectedTestError, wait: 0.seconds
@@ -416,20 +424,37 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal SolidQueue::Job::EnqueueError.name, job.failed_execution.exception_class
   end
 
-  test "a job that isn't coalesced only reads the coalescing tables, once, when it finishes" do
-    AddToBufferJob.perform_later("a")
-    queries = []
-    callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") && payload[:name] != "SCHEMA" }
+  test "a job that isn't coalesced only reads the coalescing tables, once per job, when it finishes" do
+    [ true, false ].each do |preserve|
+      SolidQueue.with(preserve_finished_jobs: preserve) do
+        queries = []
+        callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") && payload[:name] != "SCHEMA" }
 
-    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
-      AddToBufferJob.perform_later("b")
+        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+          AddToBufferJob.perform_later("a")
+        end
+        assert_empty queries
+
+        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { perform_ready_jobs }
+
+        assert_equal 1, queries.size, "preserve_finished_jobs: #{preserve}"
+        assert queries.all? { |sql| sql.start_with?("SELECT") && !sql.include?("FOR UPDATE") }, queries.to_s
+      end
     end
-    assert_empty queries
+  end
 
-    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { perform_ready_jobs }
+  test "admission locks the key exclusively to collect, and shares it to discard" do
+    skip "Row locks don't exist on SQLite" if SolidQueue::Record.connection_pool.db_config.adapter == "sqlite3"
 
-    assert_equal 2, queries.size
-    assert queries.all? { |sql| sql.start_with?("SELECT") && !sql.include?("FOR UPDATE") }, queries.to_s
+    key_locks = ->(&enqueues) do
+      queries = []
+      callback = ->(*, payload) { queries << payload[:sql][/FOR UPDATE|FOR SHARE|LOCK IN SHARE MODE/] if payload[:sql].include?("solid_queue_coalesce_keys") }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &enqueues)
+      queries.compact.uniq
+    end
+
+    assert_equal [ "FOR UPDATE" ], key_locks.call { 2.times { CollectingRefreshJob.perform_later("a") } }
+    assert_includes [ [ "FOR SHARE" ], [ "LOCK IN SHARE MODE" ] ], key_locks.call { 2.times { CoalescedRefreshJob.perform_later("a") } }
   end
 
   test "a failure in the start step becomes a failed execution and perform doesn't run" do
