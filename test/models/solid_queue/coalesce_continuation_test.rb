@@ -21,7 +21,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     ResumableCollectedJob.stop_after = nil
   end
 
-  test "a resume keeps the claimed calls on the new job and carries on with the standard step behaviour" do
+  test "a resume keeps the calls on the new job and carries on with the standard step behaviour" do
     old_job = SolidQueue::Job.sole
     rows = SolidQueue::CoalescedCall.waiting.order(:id).pluck(:id)
     late = nil

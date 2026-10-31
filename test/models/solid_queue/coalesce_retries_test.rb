@@ -64,7 +64,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     FailingCollectedJob.fixed = false
   end
 
-  test "retry_on keeps the exact claimed calls on the new job and the old job's finish doesn't delete it" do
+  test "retry_on keeps the exact calls on the new job and the old job's finish doesn't delete it" do
     FlakyCollectedJob.perform_later("g", 1)
     FlakyCollectedJob.perform_later("g", 2)
     old_job = SolidQueue::Job.sole
@@ -94,7 +94,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal [ [ 1, [ [ "g", 1 ], [ "g", 2 ] ] ], [ 2, [ [ "g", 1 ], [ "g", 2 ] ] ] ], JobBuffer.values
   end
 
-  test "rescue_from with retry_job keeps the claimed calls" do
+  test "rescue_from with retry_job keeps the calls" do
     ManuallyRetriedJob.perform_later("a")
     ManuallyRetriedJob.perform_later("b")
 
@@ -174,16 +174,17 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalescedCall.count
   end
 
-  test "a released job re-runs with the rows it claimed, even with new ones waiting" do
+  test "a released job re-runs with its own rows, even with others waiting" do
     FailingCollectedJob.fixed = true
     FailingCollectedJob.perform_later("g", 1)
     FailingCollectedJob.perform_later("g", 2)
     FailingCollectedJob.perform_later("g", 3)
-    job = SolidQueue::Job.sole
+    job = SolidQueue::Job.order(:id).first
 
     # The worker's claim and start happened, and then it died
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "crashed-worker")
     claimed = SolidQueue::ReadyExecution.claim("*", 1, process.id).sole
+    assert_equal job.id, claimed.job_id
     job.start_coalesced_run
     assert_equal 2, job.coalesced_calls.count
 
@@ -194,6 +195,21 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert_equal [ [ [ "g", 1 ], [ "g", 2 ] ] ], JobBuffer.values
+  end
+
+  test "a job released before it started stays open until it starts" do
+    FailingCollectedJob.fixed = true
+    FailingCollectedJob.perform_later("g", 1)
+    job = SolidQueue::Job.sole
+
+    process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "crashed-worker")
+    SolidQueue::ReadyExecution.claim("*", 1, process.id).sole.release
+
+    assert_equal :collected, FailingCollectedJob.perform_later("g", 2).coalesce_status
+    perform_ready_jobs
+
+    assert_equal [ [ [ "g", 1 ], [ "g", 2 ] ] ], JobBuffer.values
+    assert job.reload.finished?
   end
 
   test "a job of a pruned process that had started fails with its rows" do
@@ -211,10 +227,8 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal 1, job.coalesced_calls.count
   end
 
-  test "a job of a pruned process that hadn't started claims its rows on failure, overflow included" do
+  test "a job of a pruned process that hadn't started fails with its rows, and frees the key" do
     FailingCollectedJob.perform_later("g", 1)
-    FailingCollectedJob.perform_later("g", 2)
-    FailingCollectedJob.perform_later("g", 3)
     job = SolidQueue::Job.sole
 
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "pruned-worker")
@@ -223,11 +237,12 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     SolidQueue::Process.prune
 
     assert job.reload.failed?
-    assert_equal 2, job.coalesced_calls.count
+    assert_equal 1, job.coalesced_calls.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
 
-    next_job = SolidQueue::CoalesceKey.sole.job
-    assert_not_equal job.id, next_job.id
-    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
+    next_call = FailingCollectedJob.perform_later("g", 2)
+    assert_equal :created, next_call.coalesce_status
+    assert_equal 1, job.coalesced_calls.count
   end
 
   test "a failure in the start step of a collecting job becomes a failed execution and perform doesn't run" do
@@ -241,70 +256,51 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert job.reload.failed?
   end
 
-  test "failing a job with a missing class keeps every row on it, and retrying after the class is back works" do
+  test "failing a job with a missing class keeps its own rows, and retrying after the class is back works" do
     FailingCollectedJob.fixed = true
-    5.times { |i| FailingCollectedJob.perform_later("g", i) }
+    FailingCollectedJob.perform_later("g", 1)
+    FailingCollectedJob.perform_later("g", 2)
     job = SolidQueue::Job.sole
+    open_job = FailingCollectedJob.perform_later("g", 3).provider_job_id
+    SolidQueue::ReadyExecution.where(job_id: open_job).delete_all
     rename_job_class(job, "RemovedCollectedJob")
 
     assert_raises(NameError) { perform_ready_jobs }
 
     assert job.reload.failed?
-    assert_equal 5, job.coalesced_calls.count
-    assert_equal 0, SolidQueue::CoalescedCall.waiting.count
-    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal 2, job.coalesced_calls.count
+    assert_equal 0, SolidQueue::CoalescedCall.waiting.where(job_id: job.id).count
+    assert_equal open_job, SolidQueue::CoalesceKey.sole.job_id
 
     rename_job_class(job, "SolidQueue::CoalesceRetriesTest::FailingCollectedJob")
     SolidQueue::Job.find(job.id).retry
     perform_ready_jobs
 
-    assert_equal [ 5 ], JobBuffer.values.map(&:size)
-  end
-
-  test "the sweeper hands over the key of a failed job" do
-    FailingCollectedJob.perform_later("g", 1)
-    FailingCollectedJob.perform_later("g", 2)
-    FailingCollectedJob.perform_later("g", 3)
-    job = SolidQueue::Job.sole
-    SolidQueue::ReadyExecution.delete_all
-    SolidQueue::FailedExecution.create!(job: job, exception: ExpectedTestError.new("boom"))
-
-    SolidQueue::CoalesceKey.release_stranded(10)
-
-    assert_equal 2, job.coalesced_calls.count
-    assert_not_equal job.id, SolidQueue::CoalesceKey.sole.job_id
-    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
-  end
-
-  test "the sweeper never loses waiting calls of a finished job" do
-    FailingCollectedJob.fixed = true
-    FailingCollectedJob.perform_later("g", 1)
-    FailingCollectedJob.perform_later("g", 2)
-    job = SolidQueue::Job.sole
-    SolidQueue::ReadyExecution.delete_all
-    job.update!(finished_at: Time.current)
-
-    SolidQueue::CoalesceKey.release_stranded(10)
-
-    next_job = SolidQueue::CoalesceKey.sole.job
-    assert_not_equal job.id, next_job.id
-    assert_equal 2, SolidQueue::CoalescedCall.waiting.count
-
-    perform_ready_jobs
     assert_equal [ [ [ "g", 1 ], [ "g", 2 ] ] ], JobBuffer.values
   end
 
-  test "the sweeper moves waiting calls onto a finished job when the class stopped collecting" do
-    job = SolidQueue::Job.create!(queue_name: "default", class_name: "AddToBufferJob", active_job_id: SecureRandom.uuid, scheduled_at: Time.current, arguments: AddToBufferJob.new("a").serialize)
+  test "a failed job releases the key it held, and keeps its calls" do
+    FailingCollectedJob.perform_later("g", 1)
+    job = SolidQueue::Job.sole
     SolidQueue::ReadyExecution.delete_all
-    key = SolidQueue::CoalesceKey.create!(key: "stopped", job: job)
-    SolidQueue::CoalescedCall.create!(coalesce_key: key, arguments: AddToBufferJob.new("a").serialize)
-    job.update!(finished_at: Time.current)
 
-    SolidQueue::CoalesceKey.release_stranded(10)
+    job.failed_with(ExpectedTestError.new("boom"))
 
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_equal 1, job.coalesced_calls.count
-    assert_equal 1, SolidQueue::Job.count
+    assert_equal :created, FailingCollectedJob.perform_later("g", 2).coalesce_status
+  end
+
+  test "a collecting job that finishes on code that stopped collecting releases its key, and new calls don't join it" do
+    FailingCollectedJob.perform_later("g", 1)
+    job = SolidQueue::Job.sole
+    rename_job_class(job, "AddToBufferJob")
+    job.update!(arguments: AddToBufferJob.new("no longer collecting").serialize)
+
+    SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
+
+    assert job.reload.finished?
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal :created, FailingCollectedJob.perform_later("g", 2).coalesce_status
   end
 end

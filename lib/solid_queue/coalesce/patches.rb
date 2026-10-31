@@ -43,20 +43,14 @@ module SolidQueue
         end
       end
 
-      # Maintenance#start runs its steps from an inline block, so this follows
-      # the only concurrency step it can reach.
-      module Maintaining
-        private
-          def expire_semaphores
-            super
-            release_stranded_coalesce_keys
-          end
-
-          def release_stranded_coalesce_keys
-            wrap_in_app_executor do
-              CoalesceKey.release_stranded(batch_size) if CoalesceKey.migrated?
-            end
-          end
+      # Before super, so the key is locked before the job, as in admission. A key
+      # always means a live job: one left on a job that finished without starting,
+      # because its class stopped coalescing, would accept calls that never run.
+      module Finishing
+        def finished!
+          release_coalesce_key
+          super
+        end
       end
 
       module RecurringValidation
@@ -80,8 +74,8 @@ module SolidQueue
         SolidQueue::Job.include SolidQueue::Job::Coalescible
         SolidQueue::Job.singleton_class.prepend Enqueuing
         SolidQueue::Job.prepend Failing
+        SolidQueue::Job.prepend Finishing
         SolidQueue::RecurringTask.include RecurringValidation
-        SolidQueue::Dispatcher::Maintenance.prepend Maintaining
       end
     end
   end

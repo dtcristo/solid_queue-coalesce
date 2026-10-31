@@ -9,21 +9,23 @@ module SolidQueue
 
       included do
         has_many :coalesced_calls
+
+        # Before anything else, so the key is locked before the job, as in admission.
+        # Left to the cascade, they'd lock in the opposite order and deadlock.
+        before_destroy :release_coalesce_key, prepend: true
       end
 
       class_methods do
-        # Every call in active_jobs has the same key. Returns the job if the first
-        # call created one, nil if the calls joined the open job.
+        # Every call in active_jobs has the same key. Returns the job if a call
+        # created one, nil if the calls joined the open job.
         def enqueue_coalesced(key, active_jobs)
-          # Serialized once and before the job exists, so the first call's payload is
-          # like every other call's, and a deadlock retry doesn't take a new snapshot
-          payloads = active_jobs.map(&:serialize) if active_jobs.first.class.coalesce_collect?
+          return collect_coalesced(key, active_jobs) if active_jobs.first.class.coalesce_collect?
 
           enqueued_job, open_job_id = raising_enqueue_errors do
-            retrying_deadlocks { transaction { admit_coalesced(key, active_jobs, payloads) } }
+            retrying_deadlocks { transaction { admit_coalesced(key, active_jobs.first) } }
           end
 
-          record_coalesced(key, active_jobs, enqueued_job, open_job_id)
+          record_coalesced(key, active_jobs, enqueued_job&.persisted?, open_job_id)
 
           enqueued_job
         end
@@ -96,11 +98,9 @@ module SolidQueue
             raise enqueue_error
           end
 
-          def admit_coalesced(key, active_jobs, payloads)
+          def admit_coalesced(key, active_job)
             coalesce_key = CoalesceKey.admit(key)
-            enqueued_job = create_for_coalesce_key(coalesce_key, active_jobs.first) if coalesce_key.job_id.nil?
-
-            coalesce_key.collect(payloads) if payloads && coalesce_key.job_id
+            enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
 
             [ enqueued_job, coalesce_key.job_id ]
           end
@@ -113,30 +113,65 @@ module SolidQueue
               else
                 coalesce_key.destroy!
               end
+            end
+          end
 
-              active_job.provider_job_id = job.id if job.persisted?
-              active_job.successfully_enqueued = job.persisted?
+          # Takes one job's worth of calls at a time, each in its own transaction.
+          # A call's outcome is set once its transaction is over, so a deadlock retry
+          # can't leave one behind. Serialized once and before any job exists, so the
+          # first call's payload is like every other call's, and a retry doesn't take
+          # a new snapshot.
+          def collect_coalesced(key, active_jobs)
+            batch_size = active_jobs.first.class.coalesce_batch_size
+            pending = active_jobs.zip(active_jobs.map(&:serialize))
+            enqueued_job = nil
+
+            until pending.empty?
+              admitted, created_job, job_id = raising_enqueue_errors do
+                retrying_deadlocks { transaction { admit_collected(key, pending, batch_size) } }
+              end
+
+              record_coalesced(key, pending.shift(admitted).map(&:first), created_job.present?, job_id)
+              enqueued_job ||= created_job
+            end
+
+            enqueued_job
+          end
+
+          # Returns how many of the pending calls went in, and where. It can be none:
+          # a smaller batch size can leave the open job over its capacity, and that
+          # only seals it.
+          def admit_collected(key, pending, batch_size)
+            coalesce_key = CoalesceKey.admit_exclusively(key)
+            calls = pending.first([ coalesce_key.capacity(batch_size), 0 ].max)
+
+            if calls.empty?
+              coalesce_key.destroy!
+              [ 0 ]
+            else
+              created_job = create!(**attributes_from_active_job(calls.first.first)) if coalesce_key.job_id.nil?
+              job_id = coalesce_key.job_id || created_job.id
+
+              CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
+              coalesce_key.fill(job_id, calls.size, batch_size)
+
+              [ calls.size, created_job, job_id ]
             end
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
           # destroys the job that was just created, nothing holds the key.
-          def record_coalesced(key, active_jobs, enqueued_job, open_job_id)
-            collect = active_jobs.first.class.coalesce_collect?
-            joined_action = collect ? :collected : :discarded
-
+          def record_coalesced(key, active_jobs, created, job_id)
             active_jobs.each_with_index do |active_job, index|
-              created = enqueued_job && index.zero?
+              collect = active_job.class.coalesce_collect?
+              created_by_this_call = created && index.zero?
 
-              unless created
-                active_job.provider_job_id = open_job_id
-                active_job.successfully_enqueued = collect
-              end
+              active_job.provider_job_id = job_id
+              active_job.successfully_enqueued = created_by_this_call || collect
+              active_job.coalesce_status = job_id && (created_by_this_call ? :created : (collect ? :collected : :discarded))
 
-              active_job.coalesce_status = open_job_id && (created ? :created : joined_action)
-
-              if open_job_id
-                SolidQueue.instrument(:coalesce, action: active_job.coalesce_status, key: key, job_id: open_job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)
+              if job_id
+                SolidQueue.instrument(:coalesce, action: active_job.coalesce_status, key: key, job_id: job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)
               end
             end
           end
@@ -146,63 +181,25 @@ module SolidQueue
         job_class.try(:coalesce_key).present?
       end
 
-      def coalesce_batch_size
-        job_class.try(:coalesce_batch_size)
-      end
-
       # The start step. Returns what the Active Job needs to know about this run,
       # which stays in memory instead of going into its serialized data.
+      #
+      # Closing commits before the calls are read, in a statement of their own. The
+      # read that finds the key in lock_for_release sets the snapshot of a MySQL
+      # REPEATABLE READ transaction, so a read in the same transaction could miss
+      # calls committed while it waited for the lock.
       def start_coalesced_run
         return unless coalesced? && CoalesceKey.migrated?
 
-        self.class.retrying_deadlocks do
-          transaction do
-            release_coalesce_key
-            { "calls" => coalesced_calls.order(:id).pluck(:id, :arguments), "concurrency_key" => concurrency_key }
-          end
-        end
-      end
+        self.class.retrying_deadlocks { transaction { release_coalesce_key } }
 
-      # The next job for the same key, picking up from the rows the job that's
-      # starting left waiting, and due when the oldest of them asked to run. Its
-      # arguments are the raw ones in that row: deserializing them here would let a
-      # deleted record break the handover.
-      def enqueue_next_coalesced(oldest)
-        due_at = Time.iso8601(oldest.arguments.fetch("scheduled_at"))
-        active_job_id = SecureRandom.uuid
-
-        self.class.create!(
-          queue_name: queue_name,
-          class_name: class_name,
-          priority: priority,
-          active_job_id: active_job_id,
-          scheduled_at: due_at,
-          concurrency_key: concurrency_key,
-          arguments: next_coalesced_arguments(active_job_id, oldest, due_at)
-        )
+        { "calls" => coalesced_calls.order(:id).pluck(:id, :arguments), "concurrency_key" => concurrency_key }
       end
 
       private
+        # A sealed job has no row, and lock_for_release won't touch a newer job's
         def release_coalesce_key
-          return unless CoalesceKey.migrated?
-
-          if job_class&.coalesce_key && !job_class.coalesce_collect?
-            CoalesceKey.lock_for_release(id)&.destroy!
-          elsif job_class.nil? || coalesced?
-            CoalesceKey.lock_for_release(id)&.release
-          end
-        end
-
-        def next_coalesced_arguments(active_job_id, oldest, due_at)
-          arguments.except("continuation", "resumptions").merge(
-            "job_id" => active_job_id,
-            "provider_job_id" => nil,
-            "arguments" => oldest.arguments.fetch("arguments"),
-            "executions" => 0,
-            "exception_executions" => {},
-            "enqueued_at" => Time.now.utc.iso8601(9),
-            "scheduled_at" => due_at.utc.iso8601(9)
-          )
+          CoalesceKey.lock_for_release(id)&.destroy! if CoalesceKey.migrated?
         end
     end
   end

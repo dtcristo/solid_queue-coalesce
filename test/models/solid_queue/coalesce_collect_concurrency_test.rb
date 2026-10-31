@@ -47,7 +47,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       assert_equal [ results.first.provider_job_id ], results.map(&:provider_job_id).uniq
       assert_equal 1, results.count { |active_job| !active_job.coalesced? }
       assert results.all?(&:successfully_enqueued?)
-      assert_equal 40, SolidQueue::CoalesceKey.find_by(job_id: results.first.provider_job_id).coalesced_calls.count
+      assert_equal 40, SolidQueue::CoalescedCall.where(job_id: results.first.provider_job_id).count
     end
 
     assert_equal 5, SolidQueue::Job.count
@@ -63,14 +63,81 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 6 * 4 * 3, SolidQueue::CoalescedCall.waiting.count
   end
 
-  test "appends racing starts lose nothing, strand nothing and claim every row once" do
+  test "concurrent calls never fill a job past its capacity, and leave at most one open" do
+    results = race(8) { |thread| 25.times.map { |i| CollectFiveJob.perform_later("g", thread, i) } }.flatten
+
+    assert_jobs_hold_their_calls_within_capacity results, total: 200
+    assert_equal 40, SolidQueue::Job.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "bulk enqueues racing over batch boundaries don't exceed capacity, and each call knows its job" do
+    results = race(4) do |thread|
+      jobs = 12.times.map { |i| CollectFiveJob.new("g", thread, i) }
+      SolidQueue::Job.enqueue_all(jobs)
+      jobs
+    end.flatten
+
+    assert_jobs_hold_their_calls_within_capacity results, total: 48
+    assert_equal (SolidQueue::CoalesceKey.first&.calls_count).to_i, SolidQueue::CoalescedCall.where(job_id: SolidQueue::CoalesceKey.first&.job_id).count
+  end
+
+  test "simultaneous fills of a nearly full job create one new open job" do
+    5.times do |round|
+      4.times { |i| CollectFiveJob.perform_later("g#{round}", :seed, i) }
+      results = race(5) { |thread| CollectFiveJob.perform_later("g#{round}", thread, 0) }
+
+      assert_equal 1, results.count { |active_job| active_job.coalesce_status == :created }
+      assert_equal 2, results.map(&:provider_job_id).uniq.size
+      assert_equal 4, SolidQueue::CoalesceKey.find_by!(key: "#{CollectFiveJob.name}/g#{round}").calls_count
+    end
+  end
+
+  test "a call waiting on the call that seals a job doesn't attach to it" do
+    skip_on_sqlite
+
+    4.times { |i| CollectFiveJob.perform_later("g", :seed, i) }
+    sealing = Concurrent::Event.new
+    sealed = nil
+
+    sealer = in_thread do
+      SolidQueue::Record.transaction do
+        sealed = SolidQueue::Job.enqueue(CollectFiveJob.new("g", :seal, 0))
+        sealing.set
+        sleep 0.3
+      end
+    end
+
+    sealing.wait(5)
+    late = in_thread { CollectFiveJob.perform_later("g", :late, 0) }.value
+    sealer.value
+
+    assert_equal :created, late.coalesce_status
+    assert_equal 5, SolidQueue::CoalescedCall.where.not(job_id: late.provider_job_id).count
+    assert_equal late.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalescedCall.where(job_id: late.provider_job_id).count
+  end
+
+  test "a sealed job's start doesn't touch a newer open job" do
+    5.times { |i| CollectFiveJob.perform_later("g", :sealed, i) }
+    sealed_job = SolidQueue::Job.sole
+    open_job = CollectFiveJob.perform_later("g", :open, 0).provider_job_id
+
+    run = SolidQueue::Job.find(sealed_job.id).start_coalesced_run
+
+    assert_equal 5, run["calls"].size
+    assert_equal open_job, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
+  end
+
+  test "appends racing starts lose nothing, strand nothing and run every row once" do
     calls = race_appends_against_workers(CollectFiveJob, appenders: 6, calls_per_appender: 40, workers: 3)
 
     assert_every_call_ran_once calls
     assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
     assert_equal 0, SolidQueue::CoalescedCall.waiting.count
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_batches_match_claimed_rows
+    assert_batches_match_their_rows
   end
 
   test "appends racing starts with several keys and a blocking concurrency limit" do
@@ -81,7 +148,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
-  test "a row appended while a start waits for the key's lock isn't deleted with the key" do
+  test "a start waiting for the key's lock during an enqueue loads that call" do
     skip_on_sqlite
 
     first = CollectFiveJob.perform_later("g", 0)
@@ -91,7 +158,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     appender = in_thread do
       SolidQueue::Record.transaction do
-        SolidQueue::CoalesceKey.admit("#{CollectFiveJob.name}/g").collect([ CollectFiveJob.new("g", 1).serialize ])
+        SolidQueue::Job.enqueue(CollectFiveJob.new("g", 1))
         appending.set
         starting.wait(5)
         sleep 0.3
@@ -107,7 +174,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     run = starter.value
     appender.value
 
-    assert_equal 2, run["calls"].size
+    assert_equal [ [ "g", 0 ], [ "g", 1 ] ], run["calls"].map { |_, payload| payload["arguments"] }
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
@@ -133,7 +200,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     assert_not second.coalesced?
     assert_not_equal job.id, second.provider_job_id
-    assert_equal 1, SolidQueue::CoalescedCall.waiting.count
+    assert_equal 1, SolidQueue::CoalescedCall.where(job_id: second.provider_job_id).count
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
   end
 
@@ -155,9 +222,26 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     # Whatever wasn't discarded is on the last open job
     if SolidQueue::CoalesceKey.any?
       assert_equal SolidQueue::CoalesceKey.sole.job_id, SolidQueue::Job.sole.id
+      assert_equal SolidQueue::CoalesceKey.sole.calls_count, SolidQueue::CoalescedCall.where(job_id: SolidQueue::Job.sole.id).count
     else
       assert_equal 0, SolidQueue::CoalescedCall.count
     end
+  end
+
+  test "calls racing discards of filling jobs never leave a key or a call without its job" do
+    race(5) do |thread|
+      30.times do |i|
+        if thread.zero?
+          SolidQueue::Job.where(class_name: CollectFiveJob.name).find_each(&:discard)
+        else
+          CollectFiveJob.perform_later("g", thread, i)
+        end
+      end
+    end
+
+    assert_equal 0, SolidQueue::CoalesceKey.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert_equal 0, SolidQueue::CoalescedCall.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert SolidQueue::Job.all.all? { |job| job.coalesced_calls.count.between?(1, 5) }
   end
 
   private
@@ -231,7 +315,22 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       assert_equal calls.sort_by(&:to_s), RACED_BATCHES.flat_map(&:last).sort_by(&:to_s)
     end
 
-    def assert_batches_match_claimed_rows
+    def assert_jobs_hold_their_calls_within_capacity(results, total:)
+      assert results.all?(&:successfully_enqueued?)
+
+      counts = SolidQueue::CoalescedCall.group(:job_id).count
+      assert_equal total, counts.values.sum
+      assert counts.values.all? { |count| count.between?(1, 5) }, counts.to_s
+      assert_operator counts.values.count { |count| count < 5 }, :<=, 1
+      assert_operator SolidQueue::CoalesceKey.count, :<=, 1
+
+      counts.each_key { |job_id| assert SolidQueue::Job.exists?(job_id) }
+      results.each do |active_job|
+        assert_includes SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }, active_job.job_id
+      end
+    end
+
+    def assert_batches_match_their_rows
       RACED_BATCHES.each do |job_id, batch|
         rows = SolidQueue::CoalescedCall.where(job_id: job_id).order(:id).map { |row| row.arguments["arguments"] }
         assert_equal rows, batch
