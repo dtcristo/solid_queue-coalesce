@@ -33,6 +33,23 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
   end
 
+  class CollectTwoPerCallLimitedJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    limits_concurrency key: ->(_group, limit_group) { limit_group }, to: 1
+
+    def perform_batch(_calls); end
+  end
+
+  class DiscardPerKeyJob < ApplicationJob
+    coalesce key: ->(group, *) { group }
+
+    def perform(*); end
+  end
+
+  class OrdinaryJob < ApplicationJob
+    def perform(*); end
+  end
+
   class ChangingModeJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect
   end
@@ -84,6 +101,60 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     assert_jobs_hold_their_calls_within_capacity results, total: 48
     assert_coalesce_invariants
+  end
+
+  test "mixed bulk enqueues racing through deadlock retries duplicate and lose nothing" do
+    results = deadlocking_every_second_insert_of_each_thread do
+      race(6) do |thread|
+        jobs = [
+          *2.times.map { |i| OrdinaryJob.new(thread, i) },
+          *%w[ a b ].flat_map { |group| 2.times.map { DiscardPerKeyJob.new(group) } },
+          *%w[ a b ].flat_map { |group| 12.times.map { |i| CollectFiveJob.new(group, thread, i) } }
+        ].shuffle
+
+        enqueue_all_recovering(jobs)
+        jobs
+      end.flatten
+    end
+
+    collected = results.grep(CollectFiveJob)
+    ordinary = results.grep(OrdinaryJob)
+    discarding = results.grep(DiscardPerKeyJob)
+
+    assert_equal collected.map(&:job_id).sort, SolidQueue::CoalescedCall.pluck(:arguments).map { |payload| payload["job_id"] }.sort
+    collected.each do |active_job|
+      assert_includes SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }, active_job.job_id
+    end
+    assert SolidQueue::CoalescedCall.group(:job_id).count.values.all? { |count| count.between?(1, 5) }
+
+    assert_equal ordinary.map(&:job_id).sort, SolidQueue::Job.where(class_name: OrdinaryJob.name).pluck(:active_job_id).sort
+
+    assert_equal 2, SolidQueue::Job.where(class_name: DiscardPerKeyJob.name).count
+    assert_equal 2, discarding.count { |active_job| active_job.coalesce_status == :created }
+    assert_equal 22, discarding.count { |active_job| active_job.coalesce_status == :discarded }
+  end
+
+  test "another connection can update an earlier batch's semaphore during a bulk enqueue" do
+    skip_on_sqlite
+
+    jobs = limited_batches
+    update, finished = updating_first_semaphore_at_second_batch(jobs) { SolidQueue::Job.enqueue_all(jobs) }
+
+    assert finished, "the update should go through while the enqueue runs"
+    assert_equal 1, update.value
+    assert_equal 3, jobs.map(&:provider_job_id).uniq.size
+  end
+
+  test "inside an enclosing transaction, an earlier batch's semaphore stays locked until the commit" do
+    skip_on_sqlite
+
+    jobs = limited_batches
+    update, finished = SolidQueue::Record.transaction do
+      updating_first_semaphore_at_second_batch(jobs, waiting: 0.5) { SolidQueue::Job.enqueue_all(jobs) }
+    end
+
+    assert_not finished, "the update should wait for the commit"
+    assert_equal 1, update.value
   end
 
   test "concurrent calls to a class that stopped collecting take over the key from a collecting job once" do
@@ -355,6 +426,60 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   private
     def change_mode_to(on_conflict)
       ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: on_conflict
+    end
+
+    # Four calls in two batches on one key, and a third batch on another. Each batch
+    # has its own semaphore, already there, so that holding one means locking its row.
+    def limited_batches
+      [ %w[ g s1 ], %w[ g s1 ], %w[ g s2 ], %w[ g s2 ], %w[ h s3 ] ].map { |arguments| CollectTwoPerCallLimitedJob.new(*arguments) }.tap do |jobs|
+        jobs.map(&:concurrency_key).uniq.each { |key| SolidQueue::Semaphore.create!(key: key, value: 1, expires_at: 1.hour.from_now) }
+      end
+    end
+
+    # Subscribers run on the enqueuing thread, between one batch's transaction and
+    # the next, so the update always starts at that point, and the enqueue waits for
+    # it. Returns the update's thread, with its row count as its value, and whether
+    # it finished in time. One that's still waiting finishes when the locks go away.
+    def updating_first_semaphore_at_second_batch(jobs, waiting: 5)
+      update = finished = nil
+      created = 0
+      subscriber = ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
+        if payload[:action] == :created && (created += 1) == 2
+          update = in_thread { SolidQueue::Semaphore.where(key: jobs.first.concurrency_key).update_all(value: 0) }
+          finished = update.join(waiting).present?
+        end
+      end
+
+      yield
+      [ update, finished ]
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    # InnoDB's own deadlocks can use up a call's retries here, on top of the ones
+    # this test adds, and the README's recovery has to hold up when they do.
+    def enqueue_all_recovering(jobs, attempts: 10)
+      SolidQueue::Job.enqueue_all(jobs)
+    rescue SolidQueue::Job::EnqueueError, ActiveRecord::Deadlocked
+      raise if (attempts -= 1).zero?
+
+      jobs = jobs.reject(&:provider_job_id)
+      retry
+    end
+
+    # Runs each insert before raising, so there's a real transaction to roll back,
+    # on the same attempts every time. Admission retries a deadlock up to 5 times.
+    def deadlocking_every_second_insert_of_each_thread
+      insert_all = SolidQueue::CoalescedCall.method(:insert_all)
+
+      SolidQueue::CoalescedCall.define_singleton_method(:insert_all) do |rows, **options|
+        attempt = Thread.current[:coalesce_test_insert_attempts] = Thread.current[:coalesce_test_insert_attempts].to_i + 1
+        insert_all.call(rows, **options).tap { raise ActiveRecord::Deadlocked, "boom" if attempt.even? }
+      end
+
+      yield
+    ensure
+      SolidQueue::CoalescedCall.singleton_class.remove_method(:insert_all)
     end
 
     def race_appends_against_workers(job_class, appenders:, calls_per_appender:, workers:, groups: %w[ g ])

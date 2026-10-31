@@ -14,6 +14,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Collecting calls](#collecting-calls)
 - [Batches and scheduling](#batches-and-scheduling)
 - [Enqueue outcomes](#enqueue-outcomes)
+- [Bulk enqueues](#bulk-enqueues)
 - [Transactions](#transactions)
 - [Retries](#retries)
 - [Deleted records](#deleted-records)
@@ -146,7 +147,7 @@ Batches of the same key are separate jobs, and this has consequences:
 
 Enqueues for the same key take turns, because each one holds an exclusive lock on the key's row until its transaction commits. Inside your own transaction, that lock lasts until your commit, so a key used in a 50ms transaction takes about 20 calls per second, however many connections you add. Keep those transactions short, or enqueue after them.
 
-To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up to a full batch under one lock. It keeps the order of each key's calls, and uses one transaction per batch. If it fails partway, the batches that committed stay, and the calls that didn't have no outcome. It's only all-or-nothing inside your own transaction.
+To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up to a full batch under one lock. It keeps the order of each key's calls, and uses one transaction per batch. [Bulk enqueues](#bulk-enqueues) covers what happens if it fails partway.
 
 ## Enqueue outcomes
 
@@ -161,7 +162,7 @@ To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up 
 
 Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` after `perform_later` even when the call was discarded.
 
-`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
+`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
 
 Three notifications exist:
 
@@ -174,6 +175,42 @@ Three notifications exist:
 `SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, but the key is logged, so keep secrets out of it.
 
 `coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
+
+## Bulk enqueues
+
+Native Solid Queue stores a whole `ActiveJob.perform_all_later` in one transaction, so it's all-or-nothing. With coalesced jobs in the list it isn't, unless you ask for it. Outside your own transaction, it stores ordinary jobs first, in one native transaction. Coalesced calls follow, sorted by key, with one transaction per discard admission or collecting batch. A key's lock lasts until its transaction commits, and one transaction for the whole call would hold every key's lock until the last batch was in. This way it holds one key's lock for one batch.
+
+Before it writes anything, the call works out the keys of all coalesced calls, the payloads of all `:collect` calls, and the payload of each key's first `:discard` call. If a key Proc raises or an argument can't be serialized, the call raises with nothing written. A repeated `:discard` call is never stored, so an argument on it that can't be serialized stays silently discarded, as with a single `perform_later`.
+
+After that, only a database error or a `coalesce.solid_queue` subscriber that raises can fail the call. There's one exception. A batch's concurrency key comes from its first call, and which call that is depends on the database, so a concurrency key Proc can raise on a later batch's first call. In every case, earlier work stays committed and has its outcomes, and later calls have no outcome.
+
+To recover outside a transaction, enqueue the calls that have no job ID again:
+
+```ruby
+ActiveJob.perform_all_later(jobs.reject(&:provider_job_id))
+```
+
+This stores each call once. Calls destroyed by a `limits_concurrency` conflict with `on_conflict: :discard` have no ID either, so they get retried, which is harmless.
+
+Trust outcomes only from a call that didn't raise, or for this recovery. A failed enqueue of an instance you've enqueued before can show its old outcome.
+
+A database failure on coalesced calls raises `SolidQueue::Job::EnqueueError`. One on ordinary jobs raises the raw Active Record error, as native bulk does. A single call can raise either.
+
+Only the order of each key's calls is guaranteed. Native bulk creates jobs in input order. Here, ordinary jobs come first, then coalesced calls sorted by key.
+
+Discarded calls count as not enqueued, like the ones a native concurrency conflict discards, so Active Job logs "Failed enqueuing N jobs" for them. `ActiveJob.perform_all_later` returns `nil`. `SolidQueue::Job.enqueue_all` returns the count.
+
+For all-or-nothing, wrap the call in a transaction on the queue database:
+
+```ruby
+SolidQueue::Record.transaction do
+  ActiveJob.perform_all_later(jobs)
+end
+```
+
+It has to be `SolidQueue::Record.transaction`, because an app-database transaction doesn't cover a separate queue database. After a rollback, outcomes stay set, as they do in native Solid Queue, and they mean nothing. Run the whole list again. `coalesce.solid_queue` has already fired by then too.
+
+That transaction holds every key's lock and every semaphore's lock until it commits, so other enqueues and workers wait for it. Native bulk has the same problem with ordinary concurrency-limited jobs. It dispatches them one by one inside its one transaction, and each holds a `SELECT ... FOR UPDATE` lock on its semaphore's row until the commit. Enqueue those jobs one at a time or in small slices.
 
 ## Transactions
 

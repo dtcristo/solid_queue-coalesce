@@ -18,8 +18,8 @@ module SolidQueue
       class_methods do
         # Every call in active_jobs has the same key. Returns the job if a call
         # created one, nil if the calls joined the open job.
-        def enqueue_coalesced(key, active_jobs)
-          return collect_coalesced(key, active_jobs) if active_jobs.first.class.coalesce_collect?
+        def enqueue_coalesced(key, active_jobs, payloads = nil)
+          return collect_coalesced(key, active_jobs, payloads || active_jobs.map(&:serialize)) if active_jobs.first.class.coalesce_collect?
 
           enqueued_job, open_job_id = raising_enqueue_errors do
             retrying_deadlocks { admit_discarding(key, active_jobs.first) }
@@ -30,10 +30,23 @@ module SolidQueue
           enqueued_job
         end
 
-        def enqueue_all_coalesced(active_jobs)
-          active_jobs.group_by(&:coalesce_key).sort_by(&:first).each do |key, calls|
-            enqueue_coalesced(key, calls)
+        # So a key or a payload that can't be built raises before anything is written.
+        # A repeated :discard call is never stored, so its arguments don't have to
+        # serialize, as with perform_later. The first one's only get checked here,
+        # because its job is built later, if there's no open job to find.
+        def prepare_all_coalesced(active_jobs)
+          active_jobs.group_by(&:coalesce_key).sort_by(&:first).map do |key, calls|
+            if calls.first.class.coalesce_collect?
+              [ key, calls, calls.map(&:serialize) ]
+            else
+              calls.first.serialize
+              [ key, calls ]
+            end
           end
+        end
+
+        def enqueue_all_coalesced(prepared_calls)
+          prepared_calls.each { |key, calls, payloads| enqueue_coalesced(key, calls, payloads) }
         end
 
         def ensure_coalescible(active_jobs)
@@ -139,9 +152,9 @@ module SolidQueue
           # can't leave one behind. Serialized once and before any job exists, so the
           # first call's payload is like every other call's, and a retry doesn't take
           # a new snapshot.
-          def collect_coalesced(key, active_jobs)
+          def collect_coalesced(key, active_jobs, payloads)
             batch_size = active_jobs.first.class.coalesce_batch_size
-            pending = active_jobs.zip(active_jobs.map(&:serialize))
+            pending = active_jobs.zip(payloads)
             enqueued_job = nil
 
             until pending.empty?
@@ -167,7 +180,7 @@ module SolidQueue
               coalesce_key.destroy!
               [ 0 ]
             else
-              created_job = create_collecting(calls.first.first) if coalesce_key.job_id.nil?
+              created_job = create_collecting(*calls.first) if coalesce_key.job_id.nil?
               job_id = coalesce_key.job_id || created_job.id
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
@@ -177,10 +190,19 @@ module SolidQueue
             end
           end
 
-          def create_collecting(active_job)
-            attributes = attributes_from_active_job(active_job)
-
-            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_collecting" => true))
+          # Not attributes_from_active_job, which serializes the call again, and that
+          # could raise after earlier batches committed. A coalesced call is never in
+          # a batch, so it has no batch_id to set.
+          def create_collecting(active_job, payload)
+            create!(
+              queue_name: active_job.queue_name || singleton_class::DEFAULT_QUEUE_NAME,
+              active_job_id: active_job.job_id,
+              priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
+              scheduled_at: active_job.scheduled_at,
+              class_name: active_job.class.name,
+              arguments: payload.merge("coalesce_collecting" => true),
+              concurrency_key: active_job.concurrency_key
+            )
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
@@ -193,8 +215,12 @@ module SolidQueue
               active_job.provider_job_id = job_id
               active_job.successfully_enqueued = created_by_this_call || collect
               active_job.coalesce_status = job_id && (created_by_this_call ? :created : (collect ? :collected : :discarded))
+            end
 
-              if job_id
+            # After every outcome, because a subscriber can raise. These calls are stored,
+            # so one without an outcome would look like it needs enqueuing again.
+            if job_id
+              active_jobs.each do |active_job|
                 SolidQueue.instrument(:coalesce, action: active_job.coalesce_status, key: key, job_id: job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)
               end
             end

@@ -15,8 +15,10 @@ module SolidQueue
           coalesced_jobs.each { |active_job| active_job.scheduled_at ||= Time.current }
           ensure_coalescible(coalesced_jobs)
 
+          prepared_calls = prepare_all_coalesced(coalesced_jobs)
+
           super(other_jobs) if other_jobs.any?
-          enqueue_all_coalesced(coalesced_jobs)
+          enqueue_all_coalesced(prepared_calls)
 
           active_jobs.count(&:successfully_enqueued?)
         end
