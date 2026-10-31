@@ -28,10 +28,18 @@ class LogSubscriberTest < ActiveSupport::TestCase
     assert_match_logged :warn, "Drop coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", exception_class: \"ActiveJob::DeserializationError\""
   end
 
-  test "neither event logs arguments or payloads, whatever it's given" do
+  test "calls that don't match the key's count" do
+    attach_log_subscriber
+    instrument "coalesced_calls_mismatch.solid_queue", job_id: 42, active_job_id: "abc", expected: 3, actual: 2
+
+    assert_match_logged :warn, "Coalesced calls don't match the key's count", "job_id: 42, active_job_id: \"abc\", expected: 3, actual: 2"
+  end
+
+  test "no event logs arguments or payloads, whatever it's given" do
     attach_log_subscriber
     instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :created, arguments: [ "secret" ], job_data: { "arguments" => [ "secret" ] }
     instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", exception_class: "E", arguments: [ "secret" ]
+    instrument "coalesced_calls_mismatch.solid_queue", job_id: 42, active_job_id: "abc", expected: 3, actual: 2, arguments: [ "secret" ]
 
     assert_no_match(/secret/, (@logger.logged(:debug) + @logger.logged(:warn)).join)
   end

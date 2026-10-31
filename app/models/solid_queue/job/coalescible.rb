@@ -22,7 +22,7 @@ module SolidQueue
           return collect_coalesced(key, active_jobs) if active_jobs.first.class.coalesce_collect?
 
           enqueued_job, open_job_id = raising_enqueue_errors do
-            retrying_deadlocks { transaction { admit_coalesced(key, active_jobs.first) } }
+            retrying_deadlocks { admit_discarding(key, active_jobs.first) }
           end
 
           record_coalesced(key, active_jobs, enqueued_job&.persisted?, open_job_id)
@@ -98,11 +98,29 @@ module SolidQueue
             raise enqueue_error
           end
 
-          def admit_coalesced(key, active_job)
-            coalesce_key = CoalesceKey.admit(key)
-            enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
+          # A key with calls belongs to a job from when the class collected. A call
+          # can't count on that job, which fails without running it, so it seals the
+          # job and tries again. Sealing is outside the transaction that found it: every
+          # call waiting on the key holds the same share lock, and upgrading it deadlocks
+          # with all of them. Inside the caller's own transaction it can't be outside,
+          # so that deadlock can reach the caller, as in retrying_deadlocks.
+          def admit_discarding(key, active_job)
+            loop do
+              admitted = transaction { admit_unless_collecting(key, active_job) }
+              return admitted if admitted
 
-            [ enqueued_job, coalesce_key.job_id ]
+              transaction { CoalesceKey.seal_collecting(key) }
+            end
+          end
+
+          def admit_unless_collecting(key, active_job)
+            coalesce_key = CoalesceKey.admit(key)
+
+            unless coalesce_key.collecting?
+              enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
+
+              [ enqueued_job, coalesce_key.job_id ]
+            end
           end
 
           def create_for_coalesce_key(coalesce_key, active_job)
@@ -139,8 +157,8 @@ module SolidQueue
           end
 
           # Returns how many of the pending calls went in, and where. It can be none:
-          # a smaller batch size can leave the open job over its capacity, and that
-          # only seals it.
+          # a smaller batch size can leave the open job over its capacity, and a job
+          # from when the class discarded has none, and that only seals it.
           def admit_collected(key, pending, batch_size)
             coalesce_key = CoalesceKey.admit_exclusively(key)
             calls = pending.first([ coalesce_key.capacity(batch_size), 0 ].max)
@@ -149,7 +167,7 @@ module SolidQueue
               coalesce_key.destroy!
               [ 0 ]
             else
-              created_job = create!(**attributes_from_active_job(calls.first.first)) if coalesce_key.job_id.nil?
+              created_job = create_collecting(calls.first.first) if coalesce_key.job_id.nil?
               job_id = coalesce_key.job_id || created_job.id
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
@@ -157,6 +175,12 @@ module SolidQueue
 
               [ calls.size, created_job, job_id ]
             end
+          end
+
+          def create_collecting(active_job)
+            attributes = attributes_from_active_job(active_job)
+
+            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_collecting" => true))
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
@@ -188,12 +212,20 @@ module SolidQueue
       # read that finds the key in lock_for_release sets the snapshot of a MySQL
       # REPEATABLE READ transaction, so a read in the same transaction could miss
       # calls committed while it waited for the lock.
+      #
+      # Only the first start finds a key, so only it can compare the count. Rows that
+      # went missing can't come back, so failing wouldn't help the ones left.
       def start_coalesced_run
         return unless coalesced? && CoalesceKey.migrated?
 
-        self.class.retrying_deadlocks { transaction { release_coalesce_key } }
+        released_key = self.class.retrying_deadlocks { transaction { release_coalesce_key } }
+        calls = coalesced_calls.order(:id).pluck(:id, :arguments)
 
-        { "calls" => coalesced_calls.order(:id).pluck(:id, :arguments), "concurrency_key" => concurrency_key }
+        if released_key && released_key.calls_count != calls.size
+          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, active_job_id: active_job_id, expected: released_key.calls_count, actual: calls.size)
+        end
+
+        { "calls" => calls, "concurrency_key" => concurrency_key }
       end
 
       private

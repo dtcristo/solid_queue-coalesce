@@ -33,6 +33,10 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
   end
 
+  class ChangingModeJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect
+  end
+
   RACED_BATCHES = Concurrent::Array.new
 
   setup do
@@ -79,7 +83,60 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end.flatten
 
     assert_jobs_hold_their_calls_within_capacity results, total: 48
-    assert_equal (SolidQueue::CoalesceKey.first&.calls_count).to_i, SolidQueue::CoalescedCall.where(job_id: SolidQueue::CoalesceKey.first&.job_id).count
+    assert_coalesce_invariants
+  end
+
+  test "concurrent calls to a class that stopped collecting take over the key from a collecting job once" do
+    3.times do |round|
+      change_mode_to :collect
+      collecting_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
+      change_mode_to :discard
+
+      results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
+
+      assert_equal 1, results.count { |active_job| active_job.coalesce_status == :created }
+      assert_not_includes results.map(&:provider_job_id), collecting_job
+      assert_coalesce_invariants
+    end
+  ensure
+    change_mode_to :collect
+  end
+
+  test "a discard call whose transaction started before the collecting key existed takes it over" do
+    skip_on_sqlite
+
+    change_mode_to :collect
+    call = nil
+
+    SolidQueue::Job.transaction do
+      SolidQueue::Job.count
+      Thread.new { ChangingModeJob.perform_later("g", :seed) }.join
+      change_mode_to :discard
+
+      call = Timeout.timeout(10) { ChangingModeJob.perform_later("g", :call) }
+    end
+
+    assert_equal :created, call.coalesce_status
+    assert_equal call.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+  ensure
+    change_mode_to :collect
+  end
+
+  test "concurrent calls to a class that started collecting never join a discarding job" do
+    3.times do |round|
+      change_mode_to :discard
+      discarding_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
+      change_mode_to :collect
+
+      results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
+
+      assert_equal 1, results.map(&:provider_job_id).uniq.size
+      assert_not_includes results.map(&:provider_job_id), discarding_job
+      assert_equal 0, SolidQueue::CoalescedCall.where(job_id: discarding_job).count
+      assert_coalesce_invariants
+    end
+  ensure
+    change_mode_to :collect
   end
 
   test "simultaneous fills of a nearly full job create one new open job" do
@@ -296,6 +353,10 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   end
 
   private
+    def change_mode_to(on_conflict)
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: on_conflict
+    end
+
     def race_appends_against_workers(job_class, appenders:, calls_per_appender:, workers:, groups: %w[ g ])
       done = Concurrent::AtomicBoolean.new(false)
       worker_threads = workers.times.map { Thread.new { work_until(done) } }
