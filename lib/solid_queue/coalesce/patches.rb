@@ -54,6 +54,16 @@ module SolidQueue
         end
       end
 
+      # A class can start discarding conflicts after it stopped collecting, and a
+      # conflict destroys the job. A collecting job blocks instead, whatever its class
+      # says now, so it reaches a worker and fails with its calls.
+      module ConcurrencyConflicts
+        private
+          def handle_concurrency_conflict
+            arguments["coalesce_collecting"] ? block : super
+          end
+      end
+
       # Prepended to each execution class that can be discarded, rather than to their
       # parent, because ReadyExecution signals semaphores in its own discard_jobs.
       # Admission locks the key, then the job and its semaphore, so this has to lock
@@ -98,6 +108,7 @@ module SolidQueue
         SolidQueue::Job.singleton_class.prepend Enqueuing
         SolidQueue::Job.prepend Failing
         SolidQueue::Job.prepend Finishing
+        SolidQueue::Job.prepend ConcurrencyConflicts
         [ ReadyExecution, ScheduledExecution, BlockedExecution, FailedExecution ].each { |execution| execution.singleton_class.prepend BulkDiscarding }
         SolidQueue::RecurringTask.include RecurringValidation
       end
@@ -111,7 +122,7 @@ class SolidQueue::LogSubscriber
   end
 
   def coalesced_calls_mismatch(event)
-    warn formatted_event(event, action: "Coalesced calls don't match the key's count", **event.payload.slice(:job_id, :expected, :actual))
+    warn formatted_event(event, action: "Coalesced calls don't match the key's count", **event.payload.slice(:job_id, :active_job_id, :expected, :actual))
   end
 
   def drop_coalesced_call(event)

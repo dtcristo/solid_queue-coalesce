@@ -50,6 +50,13 @@ module SolidQueue
         end
       end
 
+      # Lets go of a job from when the key's class collected. Checks again under the
+      # lock, because another call may have got here first.
+      def seal_collecting(key)
+        coalesce_key = lock_if_present(key)
+        coalesce_key.destroy! if coalesce_key&.collecting?
+      end
+
       # For jobs deleted in bulk, which skips their destroy callback. In the order of
       # the keys, so that two of these can't deadlock with each other.
       def release_all(job_ids)

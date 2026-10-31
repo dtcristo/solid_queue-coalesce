@@ -22,7 +22,7 @@ module SolidQueue
           return collect_coalesced(key, active_jobs) if active_jobs.first.class.coalesce_collect?
 
           enqueued_job, open_job_id = raising_enqueue_errors do
-            retrying_deadlocks { transaction { admit_coalesced(key, active_jobs.first) } }
+            retrying_deadlocks { admit_discarding(key, active_jobs.first) }
           end
 
           record_coalesced(key, active_jobs, enqueued_job&.persisted?, open_job_id)
@@ -100,18 +100,26 @@ module SolidQueue
 
           # A key with calls belongs to a job from when the class collected. A call
           # can't count on that job, which fails without running it, so it seals the
-          # job and takes the key. A deadlock from upgrading the lock gets retried.
+          # job and tries again. Sealing is outside the transaction that found it: every
+          # call waiting on the key holds the same share lock, and upgrading it deadlocks
+          # with all of them.
+          def admit_discarding(key, active_job)
+            loop do
+              admitted = transaction { admit_coalesced(key, active_job) }
+              return admitted if admitted
+
+              transaction { CoalesceKey.seal_collecting(key) }
+            end
+          end
+
           def admit_coalesced(key, active_job)
             coalesce_key = CoalesceKey.admit(key)
 
-            if coalesce_key.collecting?
-              coalesce_key.destroy!
-              coalesce_key = CoalesceKey.admit(key)
+            unless coalesce_key.collecting?
+              enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
+
+              [ enqueued_job, coalesce_key.job_id ]
             end
-
-            enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
-
-            [ enqueued_job, coalesce_key.job_id ]
           end
 
           def create_for_coalesce_key(coalesce_key, active_job)
@@ -169,8 +177,9 @@ module SolidQueue
           end
 
           def create_collecting(active_job)
-            active_job.coalesce_collecting = true
-            create!(**attributes_from_active_job(active_job))
+            attributes = attributes_from_active_job(active_job)
+
+            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_collecting" => true))
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
@@ -212,7 +221,7 @@ module SolidQueue
         calls = coalesced_calls.order(:id).pluck(:id, :arguments)
 
         if released_key && released_key.calls_count != calls.size
-          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, expected: released_key.calls_count, actual: calls.size)
+          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, active_job_id: active_job_id, expected: released_key.calls_count, actual: calls.size)
         end
 
         { "calls" => calls, "concurrency_key" => concurrency_key }

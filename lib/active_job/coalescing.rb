@@ -44,7 +44,6 @@ module ActiveJob
 
       attr_accessor :coalesce_status
       attr_reader :coalesced_calls
-      attr_writer :coalesce_collecting
     end
 
     class_methods do
@@ -100,8 +99,8 @@ module ActiveJob
     end
 
     # Whether the job was created collecting is stored with the job, so it survives
-    # retries and outlives the class's declaration. Only the job has this, not the
-    # calls it collects, because admit_collected sets it after they're serialized.
+    # retries and outlives the class's declaration. Only the job's row starts with
+    # this, in create_collecting, so an instance only has it if it was read from one.
     def serialize
       @coalesce_collecting ? super.merge("coalesce_collecting" => true) : super
     end
@@ -160,15 +159,15 @@ module ActiveJob
       def start_coalesced_run
         ensure_still_collecting if @coalesce_collecting
 
-        if self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue"
+        if @coalesce_collecting || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")
           @coalesced_run = SolidQueue::Job.joins(:claimed_execution).find_by(id: provider_job_id)&.start_coalesced_run
-          ensure_calls_present if @coalesce_collecting && @coalesced_run
+          ensure_calls_present if @coalesce_collecting
         end
       end
 
       def ensure_calls_present
         if worker_coalesced_rows.empty?
-          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but its calls are gone. Solid Queue only deletes them with their job, so something else did. Its own arguments are only a copy of its first call, so it won't run them: discard this failed job."
+          raise CollectedJobMismatch, "#{self.class.name} (#{job_id}) was enqueued with `coalesce on_conflict: :collect`, but it has no calls to run: either something other than Solid Queue deleted them, or this worker no longer has the job's claim. Its own arguments are only a copy of its first call, so it won't run them. If its calls are gone, discard this failed job."
         end
       end
 
@@ -215,8 +214,8 @@ module ActiveJob
       # Anything but a deleted record raises on the way, before any row has been
       # dropped, and fails the run with its rows. When every record is gone the rows
       # stay until the job is destroyed: if this run crashes before finishing, the
-      # re-run needs them to tell it has nothing to do, because a job without rows
-      # runs its own arguments.
+      # re-run needs them to tell it has nothing to do, because a collecting job
+      # without rows fails with CollectedJobMismatch.
       def calls_from_coalesced_rows
         missing = {}
 

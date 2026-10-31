@@ -35,10 +35,6 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
   class ChangingModeJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect
-
-    def perform_batch(calls)
-      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
-    end
   end
 
   RACED_BATCHES = Concurrent::Array.new
@@ -92,9 +88,9 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
   test "concurrent calls to a class that stopped collecting take over the key from a collecting job once" do
     3.times do |round|
-      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+      change_mode_to :collect
       collecting_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
-      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :discard
+      change_mode_to :discard
 
       results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
 
@@ -103,14 +99,14 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       assert_coalesce_invariants
     end
   ensure
-    ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+    change_mode_to :collect
   end
 
   test "concurrent calls to a class that started collecting never join a discarding job" do
     3.times do |round|
-      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :discard
+      change_mode_to :discard
       discarding_job = ChangingModeJob.perform_later("g#{round}", :seed).provider_job_id
-      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+      change_mode_to :collect
 
       results = race(6) { |thread| ChangingModeJob.perform_later("g#{round}", thread) }
 
@@ -120,7 +116,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       assert_coalesce_invariants
     end
   ensure
-    ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: :collect
+    change_mode_to :collect
   end
 
   test "simultaneous fills of a nearly full job create one new open job" do
@@ -337,6 +333,10 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   end
 
   private
+    def change_mode_to(on_conflict)
+      ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: on_conflict
+    end
+
     def race_appends_against_workers(job_class, appenders:, calls_per_appender:, workers:, groups: %w[ g ])
       done = Concurrent::AtomicBoolean.new(false)
       worker_threads = workers.times.map { Thread.new { work_until(done) } }

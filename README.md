@@ -163,15 +163,15 @@ Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` 
 
 `after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
 
-Two notifications exist:
+Three notifications exist:
 
 | Event | When | Payload |
 | --- | --- | --- |
 | `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
 | `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `exception_class` |
-| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `expected`, `actual` |
+| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `expected`, `actual` |
 
-`SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, but the key is logged, so keep secrets out of it.
+`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, but the key is logged, so keep secrets out of it.
 
 `coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
 
@@ -285,7 +285,8 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Remove `:collect` or `coalesce` | The job fails with its calls, as above |
 | Switch `:collect` to `:discard` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
 | Switch `:discard` to `:collect` | The next call doesn't join the discarding job, and creates a new one. The old job runs a batch of one from its own arguments |
-| Remove `perform_batch` | The run raises `NotImplementedError`, and the job fails with its calls |
+| Add `limits_concurrency` with `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
+| Remove `perform_batch` | The run raises `NotImplementedError`, and the job fails with its calls, unless a handler such as `discard_on Exception` takes it |
 | Rename or remove the class | The job fails with its calls |
 | Change `batch_size` | Waiting calls aren't touched. An open job that's now over the new size gets sealed by the next call |
 | Change the key | Waiting jobs still run their calls. New calls open a job under the new key |

@@ -7,6 +7,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
   class ChangingJob < ApplicationJob
     retry_on StandardError, wait: 0.seconds, attempts: 3
+    discard_on ActiveJob::Coalescing::CollectedJobMismatch
 
     def perform(*arguments)
       JobBuffer.add([ :perform, arguments ])
@@ -28,8 +29,21 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     coalesce key: "no-batch", on_conflict: :collect
   end
 
+  class LimitedJob < ApplicationJob
+    coalesce key: "limited", on_conflict: :collect
+    limits_concurrency key: "limited", to: 1, on_conflict: :block
+
+    def perform_batch(calls)
+      JobBuffer.add([ :perform_batch, calls.map(&:arguments) ])
+    end
+  end
+
   setup { collect }
-  teardown { collect }
+
+  teardown do
+    collect
+    ChangingJob.fail_next_batch = false
+  end
 
   test "a collecting job whose class stopped coalescing fails and keeps its calls" do
     job = enqueue_calls
@@ -109,6 +123,63 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
   end
 
+  test "a concurrency conflict doesn't destroy a collecting job whose class now discards conflicts" do
+    job = limited_job_whose_class_stopped_collecting
+
+    assert job.reload.blocked?
+    assert_equal 2, job.coalesced_calls.count
+  ensure
+    restore_limited_job
+  end
+
+  test "retrying a failed collecting job through a conflict doesn't destroy it either" do
+    job = limited_job
+
+    LimitedJob.coalesce_key = LimitedJob.coalesce_on_conflict = LimitedJob.coalesce_batch_size = nil
+    LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :discard
+    SolidQueue::ReadyExecution.delete_all
+    job.failed_with(ExpectedTestError.new("boom"))
+    SolidQueue::Semaphore.wait(job)
+
+    SolidQueue::Job.find(job.id).retry
+
+    assert job.reload.blocked?
+    assert_equal 2, job.coalesced_calls.count
+  ensure
+    restore_limited_job
+  end
+
+  test "a collecting job drained after its class changed adapter still runs all of its calls" do
+    job = enqueue_calls
+    ChangingJob.queue_adapter = :test
+
+    perform_ready_jobs
+
+    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
+    assert job.reload.finished?
+  ensure
+    ChangingJob.queue_adapter = :solid_queue
+  end
+
+  test "a collecting job that lost its claim doesn't run its own arguments" do
+    job = enqueue_calls
+    SolidQueue::CoalescedCall.where(job_id: job.id).delete_all
+    active_job = ActiveJob::Base.deserialize(job.arguments.merge("provider_job_id" => job.id))
+
+    assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { active_job.perform_now }
+
+    assert_empty JobBuffer.values
+  end
+
+  test "enqueueing the same instance twice doesn't mark its call" do
+    active_job = ChangingJob.new(1)
+    active_job.enqueue
+    active_job.enqueue
+
+    assert_not SolidQueue::CoalescedCall.pluck(:arguments).any? { |payload| payload.key?("coalesce_collecting") }
+    assert SolidQueue::Job.sole.arguments["coalesce_collecting"]
+  end
+
   test "a collecting job that lost all of its calls fails instead of running its own arguments" do
     job = enqueue_calls
     SolidQueue::CoalescedCall.where(job_id: job.id).delete_all
@@ -129,7 +200,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     end
 
     assert_equal [ [ :perform_batch, [ [ 2 ] ] ] ], JobBuffer.values
-    assert_equal [ { job_id: job.id, expected: 2, actual: 1 } ], events.map { |event| event.slice(:job_id, :expected, :actual) }
+    assert_equal [ { job_id: job.id, active_job_id: job.active_job_id, expected: 2, actual: 1 } ], events.map { |event| event.slice(:job_id, :active_job_id, :expected, :actual) }
   end
 
   test "a call to a class switched to collecting doesn't join a discarding job, and both calls run" do
@@ -189,12 +260,14 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     AddToBufferJob.perform_later("plain")
     queries = []
 
-    ActiveSupport::Notifications.subscribed(->(event) { queries << event.payload[:sql] }, "sql.active_record") do
+    ActiveSupport::Notifications.subscribed(->(event) { queries << event.payload[:sql] unless event.payload[:name] == "SCHEMA" }, "sql.active_record") do
       perform_ready_jobs
     end
 
     assert_equal [ "plain" ], JobBuffer.values
     assert_not queries.any? { |sql| sql.include?(SolidQueue::CoalescedCall.table_name) }
+    assert_equal 1, queries.count { |sql| sql.include?(SolidQueue::CoalesceKey.table_name) }, "only the read documented in the README"
+    assert_not queries.any? { |sql| sql.match?(/JOIN.*#{SolidQueue::ClaimedExecution.table_name}/) }
   end
 
   test "the key, the job and the calls stay consistent through a job's life" do
@@ -237,6 +310,23 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_coalesce_invariants
   end
 
+  test "a job that finishes, preserved or not, leaves its key and calls consistent" do
+    preserved = enqueue_calls
+    perform_ready_jobs
+    assert preserved.reload.finished?
+    assert_equal 2, preserved.coalesced_calls.count
+    assert_coalesce_invariants
+
+    SolidQueue.with(preserve_finished_jobs: false) do
+      ChangingJob.perform_later(3)
+      perform_ready_jobs
+    end
+
+    assert_equal 2, SolidQueue::CoalescedCall.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_coalesce_invariants
+  end
+
   test "a job that fails with an open key, then is discarded, leaves nothing behind" do
     job = enqueue_calls
     job.failed_with(ExpectedTestError.new("boom"))
@@ -274,6 +364,27 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
       ChangingJob.coalesce_key = nil
       ChangingJob.coalesce_on_conflict = nil
       ChangingJob.coalesce_batch_size = nil
+    end
+
+    def limited_job
+      LimitedJob.perform_later(1)
+      LimitedJob.perform_later(2)
+      SolidQueue::Job.where(class_name: LimitedJob.name).sole
+    end
+
+    def limited_job_whose_class_stopped_collecting
+      job = limited_job
+      LimitedJob.coalesce_key = LimitedJob.coalesce_on_conflict = LimitedJob.coalesce_batch_size = nil
+      LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :discard
+      SolidQueue::ReadyExecution.delete_all
+      SolidQueue::Semaphore.wait(job)
+      job.dispatch
+      job
+    end
+
+    def restore_limited_job
+      LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :block
+      LimitedJob.coalesce key: "limited", on_conflict: :collect
     end
 
     def enqueue_calls
