@@ -132,7 +132,7 @@ call.job_data  # The call's whole serialized Active Job payload
 
 A key has at most one open job, and any number of sealed ones. A call joins the open job, or opens a new one if there isn't one. The call that brings a job to `batch_size` seals it, and the next call opens a new job. With `batch_size: 100`, 250 calls make 3 jobs: 2 sealed with 100 calls each, and 1 open with 50. An open job also closes when it starts, so a call that arrives during the run opens a new job.
 
-Sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `batch_size` is the most calls one run takes, not a limit on how many can wait.
+Sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `batch_size` is the most calls one run takes, not a limit on how many can wait. The one exception comes from lowering it: a job already over the new size gets sealed as it is, and its run takes all its calls.
 
 Each job takes its schedule, queue, priority, concurrency key and own arguments from its first call. Calls that join don't move it, even if they asked for a later time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
 
@@ -246,6 +246,7 @@ A job that fails before starting, for example because its worker died or because
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
 - Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it. Each pending job would run once with its first call's arguments, and its other calls wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
+- Each time any job finishes, fails or gets destroyed, coalescing or not, Solid Queue does one extra indexed read of the keys table.
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, delete jobs without going through the key's lock first. On a key taking calls at that moment, the database can pick the discard as a deadlock victim, and it raises.
 
 ## Monitoring
