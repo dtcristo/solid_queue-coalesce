@@ -98,16 +98,16 @@ module ActiveJob
       super
     end
 
-    # Whether the job was created collecting is stored with the job, so it survives
-    # retries and outlives the class's declaration. Only the job's row starts with
-    # this, in create_collecting, so an instance only has it if it was read from one.
+    # How the job was created is stored with the job, so it survives retries and
+    # outlives the class's declaration. Only the job's row starts with this, when it
+    # gets its key, so an instance only has it if it was read from one.
     def serialize
-      @coalesce_collecting ? super.merge("coalesce_collecting" => true) : super
+      @coalesce_on_conflict ? super.merge("coalesce_on_conflict" => @coalesce_on_conflict) : super
     end
 
     def deserialize(job_data)
       super
-      @coalesce_collecting = job_data["coalesce_collecting"]
+      @coalesce_on_conflict = job_data["coalesce_on_conflict"]
     end
 
     # Scoped to the job class name, and built like concurrency_key
@@ -155,12 +155,16 @@ module ActiveJob
       # went through perform_later also has a provider_job_id. A collecting job always
       # looks for its run, because the marker outlives the class's key and adapter.
       def start_coalesced_run
-        ensure_still_collecting if @coalesce_collecting
+        ensure_still_collecting if created_collecting?
 
-        if @coalesce_collecting || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")
+        if created_collecting? || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")
           @coalesced_run = SolidQueue::Job.joins(:claimed_execution).find_by(id: provider_job_id)&.start_coalesced_run
-          ensure_calls_present if @coalesce_collecting
+          ensure_calls_present if created_collecting?
         end
+      end
+
+      def created_collecting?
+        @coalesce_on_conflict == "collect"
       end
 
       # Only Solid Queue moves the calls to the retry. On another adapter the retry

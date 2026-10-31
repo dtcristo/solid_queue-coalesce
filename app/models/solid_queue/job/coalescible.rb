@@ -137,7 +137,9 @@ module SolidQueue
           end
 
           def create_for_coalesce_key(coalesce_key, active_job)
-            create!(**attributes_from_active_job(active_job)).tap do |job|
+            attributes = attributes_from_active_job(active_job)
+
+            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_on_conflict" => "discard")).tap do |job|
               # limits_concurrency with on_conflict: :discard destroys the job right away
               if job.persisted?
                 coalesce_key.update_columns(job_id: job.id)
@@ -200,7 +202,7 @@ module SolidQueue
               priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
               scheduled_at: active_job.scheduled_at,
               class_name: active_job.class.name,
-              arguments: payload.merge("coalesce_collecting" => true),
+              arguments: payload.merge("coalesce_on_conflict" => "collect"),
               concurrency_key: active_job.concurrency_key
             )
           end

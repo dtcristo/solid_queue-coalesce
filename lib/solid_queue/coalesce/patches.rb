@@ -62,7 +62,7 @@ module SolidQueue
       module ConcurrencyConflicts
         private
           def handle_concurrency_conflict
-            arguments["coalesce_collecting"] ? block : super
+            arguments["coalesce_on_conflict"] == "collect" ? block : super
           end
       end
 
