@@ -121,11 +121,12 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   test "a sealed job's start doesn't touch a newer open job" do
     5.times { |i| CollectFiveJob.perform_later("g", :sealed, i) }
     sealed_job = SolidQueue::Job.sole
-    open_job = CollectFiveJob.perform_later("g", :open, 0).provider_job_id
+    open_job = CollectFiveJob.set(wait: 1.hour).perform_later("g", :open, 0).provider_job_id
 
-    run = SolidQueue::Job.find(sealed_job.id).start_coalesced_run
+    perform_ready_jobs
 
-    assert_equal 5, run["calls"].size
+    assert_equal [ sealed_job.id ], RACED_BATCHES.map(&:first)
+    assert_equal 5, RACED_BATCHES.sole.last.size
     assert_equal open_job, SolidQueue::CoalesceKey.sole.job_id
     assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
   end

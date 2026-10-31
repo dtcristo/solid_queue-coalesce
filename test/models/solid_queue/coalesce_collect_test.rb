@@ -55,6 +55,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
+  class CountingSerializesJob < BatchOfTwoJob
+    def serialize
+      super.merge("serialize_count" => (@serialize_count = @serialize_count.to_i + 1))
+    end
+  end
+
   class OneAtATimeJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 1
 
@@ -194,10 +200,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal({ action: :collected, key: "CollectedCallsJob/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: "CollectedCallsJob" }, events.sole.payload)
   end
 
-  test "the calls table has only the columns it needs" do
+  test "the calls table has only the columns it needs, and the keys table counts from 0" do
     assert_equal %w[ arguments created_at id job_id ], SolidQueue::CoalescedCall.column_names.sort
     assert_not SolidQueue::CoalescedCall.columns_hash["job_id"].null
-    assert_equal 0, SolidQueue::CoalesceKey.columns_hash["calls_count"].default.to_i
+    assert_equal "0", SolidQueue::CoalesceKey.columns_hash["calls_count"].default.to_s
     assert_not SolidQueue::CoalesceKey.columns_hash["calls_count"].null
   end
 
@@ -575,9 +581,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     ready = BatchOfTwoJob.perform_later("ready", 0)
     SolidQueue::ReadyExecution.where.not(job_id: ready.provider_job_id).update_all(priority: 1)
     waiting = -> { SolidQueue::CoalescedCall.waiting.distinct.pluck(:job_id).sort }
-    running_id = SolidQueue::Job.find_by!(class_name: LimitedCollectedJob.name, concurrency_key: "#{LimitedCollectedJob.name}/shared").id
+    semaphore_holder_id = SolidQueue::Job.find_by!(class_name: LimitedCollectedJob.name, concurrency_key: "#{LimitedCollectedJob.name}/shared").id
 
-    assert_equal [ running_id, blocked.provider_job_id, delayed.provider_job_id, ready.provider_job_id ].sort, waiting.call
+    assert_equal [ semaphore_holder_id, blocked.provider_job_id, delayed.provider_job_id, ready.provider_job_id ].sort, waiting.call
 
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "waiting-worker")
     claimed = SolidQueue::ReadyExecution.claim("*", 1, process.id).sole
@@ -628,7 +634,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ :collected, :created, :collected, :created, :collected, :created ], jobs.map(&:coalesce_status)
     assert_equal open_job, jobs.first.provider_job_id
     jobs.each do |active_job|
-      assert_equal active_job.job_id, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }.find { |id| id == active_job.job_id }
+      assert_includes SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }, active_job.job_id
     end
     assert_equal [ jobs[1], jobs[3], jobs[5] ].map(&:job_id), SolidQueue::Job.where.not(id: open_job).order(:id).pluck(:active_job_id)
     assert_equal jobs.map(&:coalesce_status), events.map { |event| event.payload[:action] }
@@ -649,22 +655,11 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "a deadlock retry in a bulk enqueue leaves correct outcomes, and no job from the attempt that failed" do
-    open_job = BatchOfTwoJob.perform_later("g", 0).provider_job_id
-    jobs = 3.times.map { |i| BatchOfTwoJob.new("g", i + 1) }
-    snapshots = []
-    insert_all = SolidQueue::CoalescedCall.method(:insert_all)
-    attempts = 0
+    open_job = CountingSerializesJob.perform_later("g", 0).provider_job_id
+    jobs = 3.times.map { |i| CountingSerializesJob.new("g", i + 1) }
 
-    SolidQueue::CoalescedCall.define_singleton_method(:insert_all) do |rows, **options|
-      snapshots << rows.map { |row| row[:arguments] }
-      raise ActiveRecord::Deadlocked if (attempts += 1) == 2
-      insert_all.call(rows, **options)
-    end
-
-    begin
+    failing_insert_all(on_attempt: 2, error: ActiveRecord::Deadlocked) do
       assert_equal 3, SolidQueue::Job.enqueue_all(jobs)
-    ensure
-      SolidQueue::CoalescedCall.singleton_class.remove_method(:insert_all)
     end
 
     assert_equal [ :collected, :created, :collected ], jobs.map(&:coalesce_status)
@@ -673,8 +668,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal jobs.second.job_id, created.active_job_id
     assert_nil created.arguments["provider_job_id"], "the failed attempt's job id can't leak into the new job"
 
-    assert_same snapshots[1].first, snapshots[2].first, "a retry reuses the payload it took the first time"
-    assert_equal [ jobs.second.job_id, jobs.third.job_id ], SolidQueue::CoalescedCall.where(job_id: created.id).order(:id).map { |row| row.arguments["job_id"] }
+    stored = SolidQueue::CoalescedCall.where(job_id: created.id).order(:id).map(&:arguments)
+    assert_equal [ jobs.second.job_id, jobs.third.job_id ], stored.map { |payload| payload["job_id"] }
+    assert_equal [ 1, 1 ], stored.map { |payload| payload["serialize_count"] }, "a retry reuses the payload it took the first time"
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
@@ -688,9 +684,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
   test "a failed join leaves the open job's count and rows alone" do
     BatchOfTwoJob.perform_later("g", 0)
-    SolidQueue::CoalesceKey.any_instance.stubs(:fill).raises(ActiveRecord::StatementInvalid, "boom")
 
-    assert_raises(SolidQueue::Job::EnqueueError) { BatchOfTwoJob.perform_later("g", 1) }
+    failing_insert_all(on_attempt: 1, error: ActiveRecord::StatementInvalid) do
+      assert_raises(SolidQueue::Job::EnqueueError) { BatchOfTwoJob.perform_later("g", 1) }
+    end
 
     assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
     assert_equal 1, SolidQueue::CoalescedCall.count
@@ -698,18 +695,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
   test "a failed bulk enqueue keeps the batches that committed, and only those report an outcome" do
     jobs = 5.times.map { |i| BatchOfTwoJob.new("g", i) }
-    insert_all = SolidQueue::CoalescedCall.method(:insert_all)
-    attempts = 0
 
-    SolidQueue::CoalescedCall.define_singleton_method(:insert_all) do |rows, **options|
-      raise ActiveRecord::StatementInvalid, "boom" if (attempts += 1) == 2
-      insert_all.call(rows, **options)
-    end
-
-    begin
+    failing_insert_all(on_attempt: 2, error: ActiveRecord::StatementInvalid) do
       assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
-    ensure
-      SolidQueue::CoalescedCall.singleton_class.remove_method(:insert_all)
     end
 
     assert_equal [ :created, :collected, nil, nil, nil ], jobs.map(&:coalesce_status)
@@ -922,6 +910,20 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       events
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    # The rows go in before the error, so what's checked afterwards is the rollback.
+    def failing_insert_all(on_attempt:, error:)
+      insert_all = SolidQueue::CoalescedCall.method(:insert_all)
+      attempts = 0
+
+      SolidQueue::CoalescedCall.define_singleton_method(:insert_all) do |rows, **options|
+        insert_all.call(rows, **options).tap { raise error, "boom" if (attempts += 1) == on_attempt }
+      end
+
+      yield
+    ensure
+      SolidQueue::CoalescedCall.singleton_class.remove_method(:insert_all)
     end
 end
 
