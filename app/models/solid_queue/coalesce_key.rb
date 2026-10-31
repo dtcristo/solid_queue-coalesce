@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 module SolidQueue
-  # A row means "this job is the open job for this key": it exists only while
-  # its job exists and hasn't started. job_id is null only between the insert and
-  # the end of the admission that inserted it, so it's never visible to others.
+  # A row means "this job is the open job for this key": it exists only while its
+  # job exists, hasn't started and has room. job_id is null only between the insert
+  # and the end of the admission that inserted it, so it's never visible to others.
   class CoalesceKey < Record
     class PendingMigrations < StandardError
       def initialize(message = "The coalescing schema hasn't been installed yet. Run `bin/rails generate solid_queue:coalesce:install` to copy the migration to your application, and then `bin/rails db:migrate` to run it")
@@ -31,9 +31,10 @@ module SolidQueue
         end
       end
 
-      # Admission for a collecting job, which goes on to change the row. It tries
-      # the lock first, because on MySQL an insert that hits a duplicate takes a shared
-      # lock, and two of those waiting to become exclusive deadlock on every call.
+      # Admission for a collecting job, which goes on to change the row. Nearly every
+      # call finds a row, so it tries the lock first. On MySQL, an insert that hits a
+      # duplicate locks the row and the gap next to it, and the calls queued on a row
+      # that gets sealed deadlock on those locks.
       def admit_exclusively(key)
         lock_if_present(key) || admit(key, true)
       end

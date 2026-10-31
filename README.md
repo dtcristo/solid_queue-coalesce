@@ -12,7 +12,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Usage](#usage)
 - [Keys](#keys)
 - [Collecting calls](#collecting-calls)
-- [Scheduling and overflow](#scheduling-and-overflow)
+- [Batches and scheduling](#batches-and-scheduling)
 - [Enqueue outcomes](#enqueue-outcomes)
 - [Retries](#retries)
 - [Deleted records](#deleted-records)
@@ -44,8 +44,6 @@ If Solid Queue doesn't use a database called `queue`, pass the right one with `-
 Until the migration has run, everything else works as before, and enqueuing a job that uses `coalesce` raises `SolidQueue::CoalesceKey::PendingMigrations`.
 
 The gem requires Solid Queue 1.7. It relies on private Solid Queue methods, so its gemspec allows one minor version at a time.
-
-A dispatcher with `concurrency_maintenance` on, which is the default, is what releases a coalesce key left on a job that finished or failed. If you run several dispatchers, at least one needs it.
 
 ## Usage
 
@@ -88,7 +86,7 @@ The key column is declared like the one on Solid Queue's semaphores, with the da
 
 ## Collecting calls
 
-With `on_conflict: :collect`, no call is suppressed. Every accepted call is stored, including the first, and the job runs `perform_batch` with them:
+With `on_conflict: :collect`, no call is suppressed. Every accepted call is stored, including the first, and belongs to one job from the moment it's enqueued. That job runs `perform_batch` with its calls:
 
 ```ruby
 class BulkReindexProductsJob < ApplicationJob
@@ -128,30 +126,40 @@ call.job_data  # The call's whole serialized Active Job payload
 
 `job_data` is the raw snapshot taken when the call was enqueued: `job_id`, `queue_name`, `priority`, `locale`, `timezone`, `enqueued_at`, `scheduled_at`, and whatever your `serialize` adds. It's frozen at the top level. It describes the request, not this run, and nothing restores that call's locale or timezone for you.
 
-`coalesced_calls` holds the same array, and perform callbacks can read it. `arguments` on the job itself keeps holding the arguments of the call that created the job, which is what the `limits_concurrency` key sees.
+`coalesced_calls` holds the same array, and perform callbacks can read it. `arguments` on the job itself keeps holding the arguments of the batch's first call, which is what the `limits_concurrency` key sees.
 
-## Scheduling and overflow
+## Batches and scheduling
 
-The first pending call's schedule wins. Later calls don't move it, and reaching `batch_size` doesn't dispatch anything early. `batch_size` is the most calls one run takes, not a limit on how many can wait.
+A key has at most one open job, and any number of sealed ones. A call joins the open job, or opens a new one if there isn't one. The call that brings a job to `batch_size` seals it, and the next call opens a new job. With `batch_size: 100`, 250 calls make 3 jobs: 2 sealed with 100 calls each, and 1 open with 50. An open job also closes when it starts, so a call that arrives during the run opens a new job.
 
-When a job starts it claims up to `batch_size` calls, oldest first, in one transaction. If more are waiting, a follow-up job takes over the key, in the same queue and with the same priority and concurrency key. It's due when the oldest waiting call asked to run, read from that call's `job_data["scheduled_at"]`, so it runs right away if that time has passed. A backlog that's already due drains one batch after another, and calls dated in the future wait for their time.
+Sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `batch_size` is the most calls one run takes, not a limit on how many can wait.
 
-A call that joins a pending job doesn't get its own schedule, even if it asked for a later time. It runs with that job, or in a follow-up if the batch is full. A call that arrives after the last batch started opens a new job for its own time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
+Each job takes its schedule, queue, priority, concurrency key and own arguments from its first call. Calls that join don't move it, even if they asked for a later time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
+
+Batches of the same key are separate jobs, and this has consequences:
+
+- They can start out of order. A later batch with no wait can overtake an earlier delayed one.
+- They can overlap. Use `limits_concurrency` if they shouldn't.
+- Their concurrency keys, queues and priorities can differ, because each comes from that batch's first call.
+
+Enqueues for the same key take turns, because each one holds an exclusive lock on the key's row until its transaction commits. Inside your own transaction, that lock lasts until your commit, so a key used in a 50ms transaction takes about 20 calls per second, however many connections you add. Keep those transactions short, or enqueue after them.
+
+To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up to a full batch under one lock. It keeps the order of each key's calls, and uses one transaction per batch. If it fails partway, the batches that committed stay, and the calls that didn't have no outcome. It's only all-or-nothing inside your own transaction.
 
 ## Enqueue outcomes
 
 `coalesce_status` on the Active Job instance says what happened to the call:
 
-- `:created` means it created the pending job, including the first collected call.
+- `:created` means it created a pending job. With `:collect`, that's the first call of each batch.
 - `:discarded` means a pending job already held the key, and the call was suppressed.
 - `:collected` means it was stored for the pending job.
 - `nil` means there's no outcome: before an enqueue, with `perform_now`, on another adapter, or when `limits_concurrency` with `on_conflict: :discard` destroyed the new job.
 
-`coalesced?` is true for `:discarded` and `:collected`. `provider_job_id` is the pending job's ID for any admitted call.
+`coalesced?` is true for `:discarded` and `:collected`. For any admitted call, `provider_job_id` is the pending job's ID. With `:collect`, that's the job that will run the call.
 
 Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` after `perform_later` even when the call was discarded.
 
-`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` on each job, and subscribers to the event below see every outcome.
+`after_enqueue` can read `coalesce_status` for a single enqueue. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does, and counts discarded calls as not enqueued. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
 
 Two notifications exist:
 
@@ -162,11 +170,11 @@ Two notifications exist:
 
 `SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, but the key is logged, so keep secrets out of it.
 
-`coalesce.solid_queue` fires right after the admission. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
+`coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
 
 ## Retries
 
-A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps the calls it claimed through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
+A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps its calls through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
 
 Delivery is at-least-once. There's no per-call acknowledgement or per-call continuation, so a retry runs the whole batch again and `perform_batch` has to be idempotent.
 
@@ -227,9 +235,9 @@ The concurrency key of a coalesced job is the one computed for the call that cre
 
 ## Discarding and retention
 
-Calls belong to their job, and are deleted with it. Discarding a pending job deletes it, its key and every call waiting on it. If `preserve_finished_jobs` is on, a job's calls stay until the job is cleared, along with the finished job itself.
+Calls belong to their job, and are deleted with it. Discarding a pending job deletes it and its calls, and frees the key if the job was open. Other batches for the key aren't affected. If `preserve_finished_jobs` is on, a job's calls stay until the job is cleared, along with the finished job itself.
 
-A job that fails before starting, for example because its worker died or because its class no longer exists, takes care of its calls in the same way as if it had started. If the class is gone, there's no way to know the batch size, so the failed job takes all the waiting calls. When you bring the class back and retry the job, it will run them all, even if that's more than `batch_size`.
+A job that fails before starting, for example because its worker died or because its class no longer exists, keeps its calls as if it had started. When you bring the class back and retry the job, it runs those same calls.
 
 ## Rules and limitations
 
@@ -237,16 +245,19 @@ A job that fails before starting, for example because its worker died or because
 - Calling `perform_later` inside a transaction on the same database as Solid Queue is safe: a call for a pending job doesn't abort the transaction. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
-- Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it: they wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
+- Removing `:collect` from a job, or `coalesce` altogether, isn't safe while calls are waiting for it. Each pending job would run once with its first call's arguments, and its other calls wouldn't be processed. Drain them first: stop enqueuing and wait for `SolidQueue::CoalescedCall.waiting` to be empty before you deploy the change.
+- Solid Queue's bulk discards, such as `discard_all_in_batches`, delete jobs without going through the key's lock first. On a key taking calls at that moment, the database can pick the discard as a deadlock victim, and it raises.
 
 ## Monitoring
 
-Queue depth hides the backlog, because any number of waiting calls may be a single job. To see it, look at the calls instead:
+Queue depth counts batches, not calls, because a job can hold up to `batch_size` of them. To see the backlog, look at the calls instead:
 
 ```ruby
 SolidQueue::CoalescedCall.waiting.count
 SolidQueue::CoalescedCall.waiting.minimum(:created_at) # nil when nothing is waiting
 ```
+
+`waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed. A job that's waiting to retry counts again, with all of its calls.
 
 If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes.
 

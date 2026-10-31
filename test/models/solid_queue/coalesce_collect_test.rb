@@ -196,6 +196,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
   test "the calls table has only the columns it needs" do
     assert_equal %w[ arguments created_at id job_id ], SolidQueue::CoalescedCall.column_names.sort
+    assert_not SolidQueue::CoalescedCall.columns_hash["job_id"].null
+    assert_equal 0, SolidQueue::CoalesceKey.columns_hash["calls_count"].default.to_i
+    assert_not SolidQueue::CoalesceKey.columns_hash["calls_count"].null
   end
 
   test "job_data is the raw payload of each call, custom fields included, and read-only" do
