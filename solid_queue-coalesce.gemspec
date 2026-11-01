@@ -12,9 +12,10 @@ Gem::Specification.new do |spec|
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/dtcristo/solid_queue-coalesce"
+  spec.metadata["changelog_uri"] = "https://github.com/dtcristo/solid_queue-coalesce/blob/main/CHANGELOG.md"
 
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
-    Dir["{app,lib}/**/*", "MIT-LICENSE", "README.md"]
+    Dir["{app,lib}/**/*", "MIT-LICENSE", "README.md", "CHANGELOG.md", "UPGRADING.md"]
   end
 
   spec.required_ruby_version = ">= 3.2"
