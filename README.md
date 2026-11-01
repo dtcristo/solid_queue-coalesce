@@ -8,6 +8,8 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 
 ## Table of contents
 
+- [Quick start](#quick-start)
+- [Compatibility](#compatibility)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Keys](#keys)
@@ -25,6 +27,78 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Monitoring](#monitoring)
 - [Testing](#testing)
 - [License](#license)
+
+## Quick start
+
+Suppress calls while a job is pending. This is the default, `on_conflict: :discard`:
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+```
+
+Keep every call, and process them together with `on_conflict: :collect`:
+
+```ruby
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect
+
+  def perform_batch(calls)
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+    SearchIndex.bulk_index(Product.where(id: product_ids))
+  end
+end
+
+BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
+```
+
+Allow one run at a time, with one pending follow-up, by combining `coalesce` with `limits_concurrency`:
+
+```ruby
+class SyncInventoryJob < ApplicationJob
+  coalesce key: :global
+  limits_concurrency to: 1, key: :global, on_conflict: :block, duration: 30.minutes
+
+  def perform
+    InventorySynchronizer.sync!
+  end
+end
+```
+
+Before you rely on these, know that:
+
+- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. See [Batches and scheduling](#batches-and-scheduling).
+- With `:collect`, a full batch is sealed but still waits for its time, and the next call opens a new job. See [Batches and scheduling](#batches-and-scheduling).
+- Coalesced jobs can overlap, because the key is free as soon as a job starts. Use `limits_concurrency` to prevent that. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+- `ActiveJob.perform_all_later` can admit some calls and then raise, unless you wrap it in a queue-database transaction. See [Bulk enqueues](#bulk-enqueues).
+- `successfully_enqueued?` doesn't tell you what happened to a call, and `ActiveJob.perform_all_later` skips enqueue callbacks. Read `coalesce_status`. See [Enqueue outcomes](#enqueue-outcomes).
+- A transaction on your app's database doesn't cover an enqueue to a separate queue database. See [Transactions](#transactions).
+
+## Compatibility
+
+| Dependency | Supported |
+| --- | --- |
+| Ruby | 3.2 and newer |
+| Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main, except on Ruby 3.2 |
+| Solid Queue | 1.7 |
+| Database | MySQL, PostgreSQL and SQLite |
+
+CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
+
+| Feature | Behaviour |
+| --- | --- |
+| `perform_later` | Coalesces, and stores the call with `:collect` |
+| `perform_all_later` | Coalesces in sorted key order, with one transaction per discard admission or collecting batch. See [Bulk enqueues](#bulk-enqueues) |
+| `perform_now` | Runs the call on its own. `perform_batch` receives a batch of one |
+| `SolidQueue::Batch` | Raises `SolidQueue::Job::CoalescedInBatchError` |
+| Recurring tasks | `:discard` works. `:collect` makes the task's configuration invalid |
+| Retries | Keep the job's calls, and never coalesce. See [Retries](#retries) |
+| Other adapters | Ignore `coalesce`. Each call runs on its own. See [Testing](#testing) |
 
 ## Installation
 
@@ -44,9 +118,19 @@ bin/rails db:migrate
 
 If Solid Queue doesn't use a database called `queue`, pass the right one with `--database`. For example, `bin/rails generate solid_queue:coalesce:install --database primary`.
 
+The generator looks up that database in the current environment's `config/database.yml`. If it isn't there, the generator writes to `db/migrate` without warning, and the migration runs against your primary database. A new Rails app only defines `queue` under `production`, so generate the migration for that environment instead, and let `bin/rails db:prepare` run it when you deploy:
+
+```bash
+RAILS_ENV=production SECRET_KEY_BASE_DUMMY=1 bin/rails generate solid_queue:coalesce:install
+```
+
+The migration should land in `db/queue_migrate`. `db/queue_schema.rb` doesn't pick up the new tables from a production migration. That's fine, because `db:prepare` loads that schema into an empty database and then runs the migration.
+
 Until the migration has run, everything else works as before, and enqueuing a job that uses `coalesce` raises `SolidQueue::CoalesceKey::PendingMigrations`.
 
 The gem requires Solid Queue 1.7. It relies on private Solid Queue methods, so its gemspec allows one minor version at a time.
+
+To upgrade from an earlier version, follow [UPGRADING.md](UPGRADING.md). [CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
 ## Usage
 
@@ -212,40 +296,7 @@ Don't read outcomes from `successfully_enqueued?`. Active Job sets it to `true` 
 
 `provider_job_id` is the job that held the key at admission. It's a snapshot. A retry moves collected calls to a new job with a new ID, and their call IDs stay the same, so the ID you read at enqueue can stop being the job that will run the call. A call that joined also has its own `job_id`, which differs from the `active_job_id` of the job that owns it. That job has the `active_job_id` of its first call.
 
-`after_enqueue` can read `coalesce_status` for a single enqueue, including `:collected`. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to the event below see every outcome.
-
-Three notifications exist:
-
-| Event | When | Payload |
-| --- | --- | --- |
-| `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
-| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class`, `call_deleted` |
-| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `class_name`, `expected`, `actual` |
-
-`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, and none logs the key, which your app defines. The key is only in the event's payload.
-
-`coalesce.solid_queue` fires right after the admission of a call's batch. Outside a transaction on the queue database, that's after the commit, and the outcome is final. Inside one, it's before the commit, so the outcome is provisional: a rollback can undo what it reported, and the event stays fired. No event fires for a retry, for a worker starting a job, or for a call that a `limits_concurrency` conflict destroyed.
-
-To count only what committed, register the count on the queue database's transaction. It runs at the outermost commit, straight away if there's no transaction, and never after a rollback, including a rolled-back savepoint. A transaction on your app's own database doesn't affect it, because the queue's write doesn't depend on that one.
-
-A job that [waits for your commit](#transactions) has no admission until then, so a rollback drops the call and no event fires.
-
-```ruby
-ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
-  SolidQueue::Record.current_transaction.after_commit do
-    Metrics.increment("solid_queue.coalesce", tags: payload.slice(:class_name, :action))
-  end
-end
-```
-
-`current_transaction` needs Rails 7.2. On Rails 7.1 this subscriber raises `NoMethodError`, which fails the enqueue, so count from the event directly there.
-
-The payloads' IDs last for different lengths of time:
-
-- `class_name` and `action` don't change, and have few values. They're the only ones to use as metric labels.
-- `active_job_id` is the call's own on `coalesce.solid_queue`, and the owning job's on the other two events. The owning job has the `active_job_id` of its first call, across retries.
-- `job_id` is the job at that moment. A retry moves collected calls to a job with a new ID.
-- `call_id` exists only once a worker reads the calls, because admission inserts them in bulk. A `coalesce.solid_queue` event can't be matched to a later `call_id`.
+`after_enqueue` can read `coalesce_status` for a single enqueue, including `:collected`. `ActiveJob.perform_all_later` skips enqueue callbacks, as it always does. It sets `coalesce_status` and `provider_job_id` on each job after that call's batch commits, and subscribers to [`coalesce.solid_queue`](#notifications) see every outcome.
 
 ## Bulk enqueues
 
@@ -402,7 +453,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 
 Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
 
-Jobs enqueued by version 0.1 don't have this record. Jobs enqueued by unreleased versions from `main` may have the older `"coalesce_collecting": true` instead, which nothing reads any more. Neither is protected, so drain them before you upgrade. If one of them outlives the upgrade and its class stops coalescing, it keeps its key until it's retried, discarded or cleared, and a call can join it and never run.
+Jobs enqueued by version 0.1 don't have this record, so drain them before you upgrade. See [UPGRADING.md](UPGRADING.md).
 
 ## Rules and limitations
 
@@ -411,7 +462,8 @@ Jobs enqueued by version 0.1 don't have this record. Jobs enqueued by unreleased
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
-- A job that isn't coalesced doesn't read the keys table when it finishes, fails or gets destroyed. It only parses its own payload to find that out. A job with the marker, or whose class coalesces, does one indexed read each time, even if it has no key left. Solid Queue's bulk discards do one read per batch, whatever the jobs are.
+
+The invariants behind these rules, and the costs they add, are in [the design notes](docs/design.md).
 
 ## Monitoring
 
@@ -432,6 +484,43 @@ Failed collected jobs and the calls they hold are separate numbers. A failed job
 SolidQueue::FailedExecution.where(job_id: SolidQueue::CoalescedCall.select(:job_id)).count
 SolidQueue::CoalescedCall.where(job_id: SolidQueue::FailedExecution.select(:job_id)).count
 ```
+
+### Notifications
+
+Three notifications exist:
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
+| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class`, `call_deleted` |
+| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `class_name`, `expected`, `actual` |
+
+`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, and none logs the key, which your app defines. The key is only in the event's payload.
+
+`coalesce.solid_queue` fires right after the admission of a call's batch. Outside a transaction on the queue database, that's after the commit, and the outcome is final. Inside one, it's before the commit, so the outcome is provisional: a rollback can undo what it reported, and the event stays fired. No event fires for a retry, for a worker starting a job, or for a call that a `limits_concurrency` conflict destroyed.
+
+To count only what committed, register the count on the queue database's transaction. It runs at the outermost commit, straight away if there's no transaction, and never after a rollback, including a rolled-back savepoint. A transaction on your app's own database doesn't affect it, because the queue's write doesn't depend on that one.
+
+A job that [waits for your commit](#transactions) has no admission until then, so a rollback drops the call and no event fires.
+
+```ruby
+ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
+  SolidQueue::Record.current_transaction.after_commit do
+    Metrics.increment("solid_queue.coalesce", tags: payload.slice(:class_name, :action))
+  end
+end
+```
+
+`current_transaction` needs Rails 7.2. On Rails 7.1 this subscriber raises `NoMethodError`, which fails the enqueue, so count from the event directly there.
+
+The payloads' IDs last for different lengths of time:
+
+- `class_name` and `action` don't change, and have few values. They're the only ones to use as metric labels.
+- `active_job_id` is the call's own on `coalesce.solid_queue`, and the owning job's on the other two events. The owning job has the `active_job_id` of its first call, across retries.
+- `job_id` is the job at that moment. A retry moves collected calls to a job with a new ID.
+- `call_id` exists only once a worker reads the calls, because admission inserts them in bulk. A `coalesce.solid_queue` event can't be matched to a later `call_id`.
+
+### Metrics
 
 Batch sizes come from Active Job's own event. `coalesced_calls` is already loaded by then, so reading it adds no query. It's `nil` for a job that doesn't collect, and empty when every record is gone. Each attempt reports its batch, so a retry counts again. A batch whose size reaches `coalesce_batch_size` filled up. No event marks a batch being sealed, and one sealed because a configuration changed looks like any smaller batch.
 
@@ -464,7 +553,7 @@ Metrics.gauge("solid_queue.coalesce.failed_jobs", SolidQueue::FailedExecution.wh
 Metrics.gauge("solid_queue.coalesce.failed_calls", SolidQueue::CoalescedCall.where(job_id: SolidQueue::FailedExecution.select(:job_id)).count)
 ```
 
-The first subscriber counts provisional outcomes too. Use the one in [Enqueue outcomes](#enqueue-outcomes) if your app enqueues inside queue-database transactions.
+The first subscriber counts provisional outcomes too. Use the one in [Notifications](#notifications) if your app enqueues inside queue-database transactions.
 
 ## Testing
 
