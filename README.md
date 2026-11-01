@@ -363,7 +363,7 @@ A job that fails before starting, for example because its worker died or because
 
 ## Changing a job's configuration
 
-A collecting job records that it collects in its own payload, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
+A job that gets a key records how it was created in its own payload, as `"coalesce_on_conflict": "collect"` or `"discard"`, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
 
 That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce` without failures, stop enqueuing, wait for `SolidQueue::CoalescedCall.waiting` to be empty, and only then deploy the change. Workers on the old and new code can overlap in a rolling deploy, so a job can fail on one of them and need the same recovery.
 
@@ -381,7 +381,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 
 Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
 
-Jobs enqueued by version 0.1 don't have the record, so this doesn't protect them. Drain them before you upgrade.
+Jobs enqueued by version 0.1 don't have this record. Jobs enqueued by unreleased versions from `main` may have the older `"coalesce_collecting": true` instead, which nothing reads any more. Neither is protected, so drain them before you upgrade. If one of them outlives the upgrade and its class stops coalescing, it keeps its key until it's retried, discarded or cleared, and a call can join it and never run.
 
 ## Rules and limitations
 
@@ -390,7 +390,7 @@ Jobs enqueued by version 0.1 don't have the record, so this doesn't protect them
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
 - Keys longer than 255 characters fail on MySQL.
-- Each time any job finishes, fails or gets destroyed, coalescing or not, Solid Queue does one extra indexed read of the keys table.
+- A job that isn't coalesced doesn't read the keys table when it finishes, fails or gets destroyed. It only parses its own payload to find that out. A job with the marker, or whose class coalesces, does one indexed read each time, even if it has no key left. Solid Queue's bulk discards do one read per batch, whatever the jobs are.
 
 ## Monitoring
 
