@@ -433,7 +433,8 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     done = Concurrent::AtomicBoolean.new
     failing = in_thread { fail_claimed until done.true? }
 
-    results = race(4) { |thread| 30.times.map { |i| CollectFiveJob.perform_later("g", thread, i) } }.flatten
+    # 31 each, so the last job isn't full and has a key left to release
+    results = race(4) { |thread| 31.times.map { |i| CollectFiveJob.perform_later("g", thread, i) } }.flatten
     done.make_true
     failing.value
     fail_claimed
