@@ -258,9 +258,18 @@ module SolidQueue
           job_class.try(:coalesce_key).present?
         end
 
+        # Admission marks a job before giving it a key, and the class covers jobs from
+        # before the marker. Anything that can't answer gets the read, so that failing
+        # or discarding a job still works when its payload or its class can't be loaded.
+        def may_hold_coalesce_key?
+          !arguments.is_a?(Hash) || arguments.key?("coalesce_on_conflict") || coalesced?
+        rescue StandardError, ScriptError
+          true
+        end
+
         # A sealed job has no row, and lock_for_release won't touch a newer job's
         def release_coalesce_key
-          CoalesceKey.lock_for_release(id)&.destroy! if CoalesceKey.migrated?
+          CoalesceKey.lock_for_release(id)&.destroy! if may_hold_coalesce_key? && CoalesceKey.migrated?
         end
     end
   end

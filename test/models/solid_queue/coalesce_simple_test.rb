@@ -30,6 +30,18 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class OrdinaryFailingJob < ApplicationJob
+    def perform
+      raise ExpectedTestError
+    end
+  end
+
+  class StoppedRefreshJob < ApplicationJob
+    def perform(name)
+      JobBuffer.add(name)
+    end
+  end
+
   class RetriedRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }
     retry_on ExpectedTestError, wait: 0.seconds
@@ -447,23 +459,44 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal SolidQueue::Job::EnqueueError.name, job.failed_execution.exception_class
   end
 
-  test "a job that isn't coalesced only reads the coalescing tables, once per job, when it finishes" do
+  test "an ordinary job never touches the coalescing tables when it finishes, fails or gets discarded" do
     [ true, false ].each do |preserve|
       SolidQueue.with(preserve_finished_jobs: preserve) do
-        queries = []
-        callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce") && payload[:name] != "SCHEMA" }
-
-        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
-          AddToBufferJob.perform_later("a")
-        end
-        assert_empty queries
-
-        ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { perform_ready_jobs }
-
-        assert_equal 1, queries.size, "preserve_finished_jobs: #{preserve}"
-        assert queries.all? { |sql| sql.start_with?("SELECT") && !sql.include?("FOR UPDATE") }, queries.to_s
+        assert_no_coalescing_queries("enqueue") { AddToBufferJob.perform_later("a") }
+        assert_no_coalescing_queries("finish, preserve_finished_jobs: #{preserve}") { perform_ready_jobs }
       end
     end
+
+    assert_equal [ "a", "a" ], JobBuffer.values
+
+    OrdinaryFailingJob.perform_later
+    assert_no_coalescing_queries("fail") { assert_raises(ExpectedTestError) { perform_ready_jobs } }
+    failed = SolidQueue::Job.failed.sole
+    assert_no_coalescing_queries("discard a failed job") { failed.discard }
+
+    AddToBufferJob.perform_later("ready")
+    assert_no_coalescing_queries("discard a ready job") { SolidQueue::Job.last.discard }
+
+    AddToBufferJob.set(wait: 1.hour).perform_later("scheduled")
+    assert_no_coalescing_queries("discard a scheduled job") { SolidQueue::Job.last.discard }
+    assert_equal 0, SolidQueue::ScheduledExecution.count
+  end
+
+  test "failing an ordinary job opens only Solid Queue's own savepoint" do
+    OrdinaryFailingJob.perform_later
+
+    queries = capture_queries { assert_raises(ExpectedTestError) { perform_ready_jobs } }
+
+    assert_equal 1, queries.count { |sql| sql.match?(/\ASAVEPOINT/i) }, queries.to_s
+  end
+
+  test "bulk discards read the keys table once per batch, however many jobs are in it" do
+    AddToBufferJob.perform_later("a")
+    AddToBufferJob.perform_later("b")
+
+    reads = capture_key_queries { SolidQueue::ReadyExecution.discard_all_in_batches }
+
+    assert_equal 1, reads.size, reads.to_s
   end
 
   test "admission locks the key exclusively to collect, and shares it to discard" do
@@ -581,21 +614,42 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
   end
 
-  test "a key left on a job that finishes without starting is released, so calls can't join a job that won't run them" do
+  test "a marked job whose class stopped coalescing releases its key when it finishes, so calls can't join a job that won't run them" do
     [ true, false ].each do |preserve|
       SolidQueue.with(preserve_finished_jobs: preserve) do
-        job = SolidQueue::Job.find_by!(active_job_id: AddToBufferJob.perform_later("no longer coalesced").job_id)
-        SolidQueue::CoalesceKey.create!(key: "#{CoalescedRefreshJob.name}/a", job: job)
+        StoppedRefreshJob.coalesce key: ->(name) { name }
+        StoppedRefreshJob.perform_later("a")
+        stop_coalescing(StoppedRefreshJob)
 
         perform_ready_jobs
+        assert_equal 0, SolidQueue::CoalesceKey.count, "preserve_finished_jobs: #{preserve}"
 
-        assert_equal 0, SolidQueue::CoalesceKey.count
-        assert_equal :created, CoalescedRefreshJob.perform_later("a").coalesce_status
+        StoppedRefreshJob.coalesce key: ->(name) { name }
+        assert_equal :created, StoppedRefreshJob.perform_later("a").coalesce_status
         perform_ready_jobs
       end
     end
 
-    assert_equal [ "no longer coalesced", "a", "no longer coalesced", "a" ], JobBuffer.values
+    assert_equal [ "a", "a", "a", "a" ], JobBuffer.values
+  ensure
+    stop_coalescing(StoppedRefreshJob)
+  end
+
+  test "a job that lost its marker still releases its key while its class coalesces" do
+    discard = enqueue_unmarked("discard")
+    discard.discard
+    assert_equal 0, SolidQueue::CoalesceKey.count
+
+    failed = enqueue_unmarked("fail")
+    SolidQueue::ReadyExecution.where(job_id: failed.id).delete_all
+    failed.failed_with(ExpectedTestError.new("boom"))
+    assert failed.reload.failed?
+    assert_equal 0, SolidQueue::CoalesceKey.count
+
+    enqueue_unmarked("finish")
+    perform_ready_jobs
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal [ "finish" ], JobBuffer.values
   end
 
   test "finishing a job that was never coalesced leaves other keys alone" do
@@ -673,6 +727,24 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   end
 
   private
+    def enqueue_unmarked(name)
+      job = SolidQueue::Job.find(CoalescedRefreshJob.perform_later(name).provider_job_id)
+      job.update!(arguments: job.arguments.except("coalesce_on_conflict"))
+      SolidQueue::Job.find(job.id)
+    end
+
+    def assert_no_coalescing_queries(message, &block)
+      queries = capture_queries(&block).grep(/solid_queue_coalesce/)
+      assert_empty queries, message
+    end
+
+    def capture_queries(&block)
+      queries = []
+      callback = ->(*, payload) { queries << payload[:sql] unless payload[:name] == "SCHEMA" }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+      queries
+    end
+
     def capture_key_queries(&block)
       queries = []
       callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].include?("solid_queue_coalesce_keys") && payload[:name] != "SCHEMA" }

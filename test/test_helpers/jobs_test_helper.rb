@@ -18,12 +18,13 @@ module JobsTestHelper
   end
 
   # What has to hold whenever nothing is in the middle of a transaction: a key's job
-  # is live and hasn't started, and its count is the number of calls that job has.
+  # is marked, live and hasn't started, and its count is the number of calls that job has.
   def assert_coalesce_invariants
     SolidQueue::CoalesceKey.find_each do |coalesce_key|
       job = coalesce_key.job
 
       assert job, "#{coalesce_key.key} has no job"
+      assert job.arguments.key?("coalesce_on_conflict"), "#{coalesce_key.key} is held by an unmarked job"
       assert_not job.finished?, "#{coalesce_key.key} is held by a finished job"
       assert_nil job.claimed_execution, "#{coalesce_key.key} is held by a job that started"
       assert_nil job.failed_execution, "#{coalesce_key.key} is held by a failed job"

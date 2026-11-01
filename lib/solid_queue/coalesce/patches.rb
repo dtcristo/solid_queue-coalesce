@@ -38,6 +38,8 @@ module SolidQueue
 
       module Failing
         def failed_with(exception)
+          return super unless may_hold_coalesce_key?
+
           FailedExecution.transaction(requires_new: true) do
             release_coalesce_key
             super

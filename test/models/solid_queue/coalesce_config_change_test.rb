@@ -302,20 +302,6 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
-  test "running an ordinary job costs only the documented key read" do
-    AddToBufferJob.perform_later("plain")
-    queries = []
-
-    ActiveSupport::Notifications.subscribed(->(event) { queries << event.payload[:sql] unless event.payload[:name] == "SCHEMA" }, "sql.active_record") do
-      perform_ready_jobs
-    end
-
-    assert_equal [ "plain" ], JobBuffer.values
-    assert_not queries.any? { |sql| sql.include?(SolidQueue::CoalescedCall.table_name) }
-    assert_equal 1, queries.count { |sql| sql.include?(SolidQueue::CoalesceKey.table_name) }, "only the read documented in the README"
-    assert_not queries.any? { |sql| sql.match?(/JOIN.*#{SolidQueue::ClaimedExecution.table_name}/) }
-  end
-
   test "the key, the job and the calls stay consistent through a job's life" do
     job = enqueue_calls
     assert_coalesce_invariants
