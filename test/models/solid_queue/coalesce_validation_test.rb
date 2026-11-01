@@ -53,6 +53,25 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_equal 100, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_batch_size
   end
 
+  test "on_full needs on_conflict collect" do
+    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_full: :dispatch } }
+    assert_match(/on_conflict: :collect/, error.message)
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :discard, on_full: :wait } }
+  end
+
+  test "on_full is wait or dispatch, and anything else raises" do
+    assert_equal :wait, new_job_class { coalesce key: "a", on_conflict: :collect, on_full: :wait }.coalesce_on_full
+    assert_equal :dispatch, new_job_class { coalesce key: "a", on_conflict: :collect, on_full: :dispatch }.coalesce_on_full
+
+    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :collect, on_full: :later } }
+    assert_match(/:wait or :dispatch/, error.message)
+  end
+
+  test "on_full defaults to wait when collecting" do
+    assert_equal :wait, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_on_full
+    assert_nil new_job_class { coalesce key: "a" }.coalesce_on_full
+  end
+
   test "the options from before don't exist" do
     assert_raises(ArgumentError) { new_job_class { coalesce key: "a", collect: true } }
     assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :collect, limit: 5 } }

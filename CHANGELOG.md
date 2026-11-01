@@ -9,7 +9,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 - `coalesce` takes `on_conflict: :discard` or `:collect`, and `batch_size:`. These replace `collect:`, `limit:` and `flush_when_full:`.
 - Collecting jobs run `perform_batch(calls)`, which receives `ActiveJob::Coalescing::Call` objects. It replaces `perform(array)`.
 - Each call stores its whole Active Job payload, and belongs to one job from the moment it's enqueued.
-- Reaching `batch_size` seals a job instead of dispatching it early. A sealed job waits for its time, and each batch takes its schedule from its first call.
+- Reaching `batch_size` seals a job, and by default doesn't dispatch it early. A sealed job waits for its time unless `on_full: :dispatch` is set, and each batch takes its schedule from its first call.
 - `coalesce_status` replaces `coalesced?`. The `:dropped` outcome is now `:discarded`.
 - `drop_coalesced_argument.solid_queue` is now `drop_coalesced_call.solid_queue`, and its `argument_id` is now `call_id`.
 - `SolidQueue::CoalescedArgument` and its table are now `SolidQueue::CoalescedCall` and `solid_queue_coalesced_calls`.
@@ -18,6 +18,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 
 ### Added
 
+- `on_full: :dispatch` for `coalesce`, which dispatches a delayed collecting job as soon as it fills.
 - The `coalesced_calls_mismatch.solid_queue` notification.
 - `class_name` in the `coalesce.solid_queue` and `drop_coalesced_call.solid_queue` payloads.
 - `ActiveJob::Coalescing::CollectedJobMismatch`. A collecting job whose configuration changed fails with its calls, and you can recover by restoring the declaration and retrying it.

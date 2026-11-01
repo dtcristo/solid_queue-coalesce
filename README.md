@@ -149,12 +149,13 @@ The default is `on_conflict: :discard`. A call that finds a pending job for its 
 The options are:
 
 ```ruby
-coalesce key:, on_conflict: :discard, batch_size: nil
+coalesce key:, on_conflict: :discard, batch_size: nil, on_full: nil
 ```
 
 - `key` is required. See [Keys](#keys).
 - `on_conflict` is `:discard` or `:collect`. Anything else raises `ArgumentError`.
 - `batch_size` is only allowed with `:collect`. It's a positive integer, 100 by default.
+- `on_full` is only allowed with `:collect`. It's `:wait`, the default, or `:dispatch`. See [Batches and scheduling](#batches-and-scheduling).
 
 ## Keys
 
@@ -231,7 +232,30 @@ end
 
 A key has at most one open job, and any number of sealed ones. A call joins the open job, or opens a new one if there isn't one. The call that brings a job to `batch_size` seals it, and the next call opens a new job. With `batch_size: 100`, 250 calls make 3 jobs: 2 sealed with 100 calls each, and 1 open with 50. An open job also closes when it starts, so a call that arrives during the run opens a new job.
 
-Sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `batch_size` is the most calls one run takes, not a limit on how many can wait. The one exception comes from lowering it: a job already over the new size gets sealed as it is, and its run takes all its calls.
+By default, sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `batch_size` is the most calls one run takes, not a limit on how many can wait. The one exception comes from lowering it: a job already over the new size gets sealed as it is, and its run takes all its calls.
+
+With `on_full: :dispatch`, a job that fills doesn't wait for the rest of its delay:
+
+```ruby
+class BulkIndexJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id },
+           on_conflict: :collect,
+           batch_size: 100,
+           on_full: :dispatch
+
+  def perform_batch(calls)
+    # ...
+  end
+end
+
+BulkIndexJob.set(wait: 30.seconds).perform_later(account_id, document_id)
+```
+
+A batch that fills in 5 seconds becomes ready as the call that filled it commits, and one that doesn't fill runs at 30 seconds. The job's `scheduled_at` moves to that moment. Workers still have to be free, and if `limits_concurrency` has no room the job blocks until it does. This only matters for a delayed job, because any other job isn't waiting for its time.
+
+Treat it as best effort. A full job keeps its original time if a discard is holding its scheduled execution when it fills, and then rolls back. On MySQL it also keeps it if the call runs in a transaction whose snapshot is older than the job. A job sealed without a new call, after lowering `batch_size`, keeps its time too.
+
+`:dispatch` adds a lock on the scheduled execution to the call that fills a job. With `use_skip_locked` off, that call can deadlock with a discard of the same job. The call retries unless it's inside your own transaction, and a discard raises the error to its caller.
 
 Each job takes its schedule, queue, priority, concurrency key and own arguments from its first call. Calls that join don't move it, even if they asked for a later time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
 
@@ -449,6 +473,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Remove `perform_batch` | The run raises `NotImplementedError`, and the job fails with its calls, unless a handler such as `discard_on Exception` takes it |
 | Rename or remove the class | The job fails with its calls |
 | Change `batch_size` | Waiting calls aren't touched. An open job that's now over the new size gets sealed by the next call |
+| Change `on_full` | The class that enqueues the call that fills a job decides, so there's nothing to drain. Jobs already sealed keep their time |
 | Change the key | Waiting jobs still run their calls. New calls open a job under the new key |
 
 Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
