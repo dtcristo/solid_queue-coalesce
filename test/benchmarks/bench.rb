@@ -125,6 +125,9 @@ class BenchApplication < Rails::Application
   config.root = File.join(ROOT, "tmp")
   config.load_defaults Rails::VERSION::STRING.to_f
   config.eager_load = false
+  # As in production. Left on, every job checks the watched files for changes, and
+  # this gem's engine adds to them, which swamps everything being compared here.
+  config.enable_reloading = false
   config.logger = Logger.new(nil)
   config.log_level = :fatal
   config.secret_key_base = "bench"
