@@ -200,16 +200,11 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     @a.destroy!
 
     # Something else deletes the row after the worker read it
-    where = SolidQueue::CoalescedCall.method(:where)
-    SolidQueue::CoalescedCall.define_singleton_method(:where) do |*args, **options|
-      where.call(*args, **options).tap { |calls| calls.delete_all if options == { id: dropped_id } }
+    events = capture_events("drop_coalesced_call.solid_queue") do
+      perform_ready_jobs_with_callback { SolidQueue::CoalescedCall.where(id: dropped_id).delete_all }
     end
 
-    payload = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }.sole.payload
-
-    assert_equal false, payload[:call_deleted]
-  ensure
-    SolidQueue::CoalescedCall.singleton_class.remove_method(:where)
+    assert_equal false, events.sole.payload[:call_deleted]
   end
 
   test "a call that can't be deleted reports the error and isn't reported as deleted" do
