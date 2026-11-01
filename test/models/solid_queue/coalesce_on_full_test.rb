@@ -168,7 +168,7 @@ class SolidQueue::CoalesceOnFullTest < ActiveSupport::TestCase
     DispatchedJob.set(wait: 1.hour).perform_later("g", 1)
 
     SolidQueue::Record.transaction do
-      DispatchedJob.set(wait: 1.hour).perform_later("g", 2)
+      SolidQueue::Job.enqueue(DispatchedJob.new("g", 2), scheduled_at: 1.hour.from_now)
       assert SolidQueue::Job.sole.ready?
       raise ActiveRecord::Rollback
     end

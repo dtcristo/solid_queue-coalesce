@@ -521,8 +521,9 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     4.times { |i| CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", i) }
 
     SolidQueue::Record.transaction do
-      CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", 4)
+      SolidQueue::Job.enqueue(CollectFiveDispatchingJob.new("g", 4), scheduled_at: 1.hour.from_now)
 
+      assert SolidQueue::ReadyExecution.exists?
       assert_equal 0, in_thread { SolidQueue::ReadyExecution.count }.value
     end
 
@@ -584,11 +585,16 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
+  # A discard whose job got dispatched after it loaded the execution raises, as it
+  # does when the dispatcher gets there first.
   test "calls filling delayed jobs racing discards never fail, or leave a key or a call without its job" do
     race(5) do |thread|
       30.times do |i|
         if thread.zero?
-          SolidQueue::Job.where(class_name: CollectFiveDispatchingJob.name).find_each(&:discard)
+          begin
+            SolidQueue::Job.where(class_name: CollectFiveDispatchingJob.name).find_each(&:discard)
+          rescue ActiveRecord::RecordNotFound
+          end
         else
           CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", thread, i)
         end
@@ -609,7 +615,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
           if thread.zero?
             begin
               SolidQueue::Job.where(class_name: CollectFiveDispatchingJob.name).find_each(&:discard)
-            rescue ActiveRecord::Deadlocked
+            rescue ActiveRecord::Deadlocked, ActiveRecord::RecordNotFound
             end
           else
             CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", thread, i)

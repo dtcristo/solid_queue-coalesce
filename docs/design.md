@@ -44,6 +44,8 @@ Admission locks the key, then the job and its semaphore. Everything else has to 
 
 With `use_skip_locked` off, `non_blocking_lock` waits, and the fill and a discard of the same job can deadlock. Admission retries unless it's nested, and a single discard has no retry. That takes a non-default setting and a discard racing a fill, so we accept it.
 
+A `Job#discard` that loaded the scheduled execution before the fill dispatched the job raises `ActiveRecord::RecordNotFound` when it locks the row. The same happens when the dispatcher gets there first.
+
 ## Deadlock retries
 
 `retrying_deadlocks` runs its block again, up to 5 times, on `ActiveRecord::Deadlocked`. It wraps admission, the release in `start_coalesced_run`, and bulk discards. Most of these deadlocks come from InnoDB: admissions waiting on a key that doesn't exist yet hold gap locks that block each other, and creating a job can do the same on a new semaphore.
