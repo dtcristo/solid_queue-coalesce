@@ -39,7 +39,7 @@ class CoalescingTest < ActiveSupport::TestCase
     assert_operator runs, :<=, 100
   end
 
-  test "collected calls from several processes reach running workers exactly once and in bounded batches" do
+  test "collected calls from several processes reach running workers exactly once and in bounded runs" do
     writers = 4
     calls_per_writer = 25
 
@@ -58,11 +58,11 @@ class CoalescingTest < ActiveSupport::TestCase
       SolidQueue::CoalesceKey.none? && SolidQueue::Job.where(finished_at: nil).none?
     end
 
-    batches = skip_active_record_query_cache { JobResult.where(status: "batch").pluck(:value).map { |value| JSON.parse(value) } }
+    runs = skip_active_record_query_cache { JobResult.where(status: "collected").pluck(:value).map { |value| JSON.parse(value) } }
     expected = writers.times.flat_map { |writer| calls_per_writer.times.map { |i| "#{writer}-#{i}" } }
 
-    assert_equal expected.sort, batches.flatten.sort
-    assert_operator batches.map(&:size).max, :<=, 5
+    assert_equal expected.sort, runs.flatten.sort
+    assert_operator runs.map(&:size).max, :<=, 5
     assert_equal 0, SolidQueue::CoalescedCall.waiting.count
   end
 

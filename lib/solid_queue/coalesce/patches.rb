@@ -125,7 +125,7 @@ class SolidQueue::LogSubscriber
   subscribe_log_level :coalesce, :debug
 
   def coalesce(event)
-    debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:job_id, :active_job_id, :class_name), outcome: event.payload[:action])
+    debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:job_id, :active_job_id, :class_name), outcome: event.payload[:status])
   end
 
   def coalesced_calls_mismatch(event)

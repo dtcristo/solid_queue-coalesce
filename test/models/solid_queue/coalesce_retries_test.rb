@@ -6,10 +6,10 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class FlakyCollectedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 3
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 3
     retry_on ExpectedTestError, wait: 0.seconds, attempts: 3
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError if executions < self.class.succeed_on
     end
@@ -21,16 +21,16 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     coalesce key: "manual", on_conflict: :collect
     rescue_from(ExpectedTestError) { retry_job }
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError if executions == 1
     end
   end
 
   class FailingCollectedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
       raise ExpectedTestError unless self.class.fixed
     end
@@ -43,7 +43,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     retry_on ExpectedTestError, wait: 0.seconds
     before_enqueue { throw :abort if executions > 0 }
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       raise ExpectedTestError
     end
   end
@@ -53,7 +53,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     limits_concurrency key: ->(result) { result }
     retry_on ExpectedTestError, wait: 0.seconds
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add([ executions, calls.map(&:arguments) ])
       raise ExpectedTestError
     end
@@ -80,7 +80,7 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal rows, retry_job.coalesced_calls.order(:id).pluck(:id)
     assert_not SolidQueue::CoalesceKey.exists?(job_id: retry_job.id)
 
-    # The batch stays out of what a retry serializes
+    # The calls stay out of what a retry serializes
     assert_equal [ "g", 1 ], ActiveJob::Arguments.deserialize(retry_job.arguments["arguments"])
     assert_not retry_job.arguments.key?("coalesced_run")
 

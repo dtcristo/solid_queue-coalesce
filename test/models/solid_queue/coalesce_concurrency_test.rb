@@ -142,7 +142,7 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     assert_equal :discarded, DropJob.perform_later("g").coalesce_status
   end
 
-  # On the last statement of a batch, so the key's release and the job's delete have
+  # On the last statement of a discard, so the key's release and the job's delete have
   # to be rolled back
   test "a bulk discard retries a deadlock up to its limit, then raises with nothing lost" do
     active_job = DropJob.perform_later("g")

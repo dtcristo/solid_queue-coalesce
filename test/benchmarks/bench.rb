@@ -196,9 +196,9 @@ if CONFIG[:gem]
 
   class CollectingJob < ActiveJob::Base
     queue_as :bench
-    coalesce key: ->(key) { key }, on_conflict: :collect, batch_size: 100
+    coalesce key: ->(key) { key }, on_conflict: :collect, max_calls: 100
 
-    def perform_batch(calls) = COLLECTED.increment(calls.size)
+    def perform_calls(calls) = COLLECTED.increment(calls.size)
   end
 end
 
@@ -221,12 +221,12 @@ end
 
 # Claims the way a worker's poll does. A failed job raises what a real worker's pool
 # would report, and isn't an error here.
-def work_off(threads:, batch: 5, until_done: -> { true })
+def work_off(threads:, claim_size: 5, until_done: -> { true })
   in_threads(threads) do
     loop do
       # Asked before claiming. Asked after, a job committed in between gets left behind
       last_pass = until_done.call
-      claimed = SolidQueue::ReadyExecution.claim("*", batch, worker_process.id)
+      claimed = SolidQueue::ReadyExecution.claim("*", claim_size, worker_process.id)
       break if claimed.empty? && last_pass
 
       claimed.each do |execution|
@@ -534,14 +534,14 @@ module Maintenance
     end
   end
 
-  # How long one batch takes, with cascades into the calls of 500 finished jobs
+  # How long one delete takes, with cascades into the calls of 500 finished jobs
   def retention(shape)
-    batches = Array.new(TIMINGS) do
+    timings = Array.new(TIMINGS) do
       ids = SolidQueue::Job.finished.limit(500).pluck(:id)
       time_once { SolidQueue::Job.where(id: ids).delete_all } * 1000
     end
 
-    { "delete_500_finished_jobs_median_ms" => median(batches).round(2), "calls_per_job" => shape[:finished_calls] }
+    { "delete_500_finished_jobs_median_ms" => median(timings).round(2), "calls_per_job" => shape[:finished_calls] }
   end
 
   def size

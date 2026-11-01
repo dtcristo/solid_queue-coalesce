@@ -32,25 +32,25 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   class RecordsCollectedJob < ApplicationJob
     coalesce key: "records", on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
-  class LimitedBatchJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+  class LimitedCallsJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
     limits_concurrency key: ->(group, *) { group }, to: 1
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.size)
     end
   end
 
   class DeferredCollectedJob < ApplicationJob
     self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :always : true if respond_to?(:enqueue_after_transaction_commit=)
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
@@ -60,51 +60,51 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
 
     coalesce key: "inline", on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls)
     end
   end
 
-  class BatchOfTwoJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+  class TwoCallsJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
-  class CountingSerializesJob < BatchOfTwoJob
+  class CountingSerializesJob < TwoCallsJob
     def serialize
       super.merge("serialize_count" => (@serialize_count = @serialize_count.to_i + 1))
     end
   end
 
   class OneAtATimeJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 1
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 1
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
-  class BatchOfTwoRecordsJob < ApplicationJob
-    coalesce key: "records", on_conflict: :collect, batch_size: 2
+  class TwoRecordsJob < ApplicationJob
+    coalesce key: "records", on_conflict: :collect, max_calls: 2
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
-  class DefaultBatchSizeJob < ApplicationJob
+  class DefaultMaxCallsJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map { |call| call.arguments.last })
     end
   end
 
-  class SubclassedBatchJob < CollectedCallsJob
-    def perform_batch(calls)
+  class SubclassedCollectedJob < CollectedCallsJob
+    def perform_calls(calls)
       JobBuffer.add([ :subclass, calls.map(&:arguments) ])
     end
   end
@@ -116,12 +116,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       JobBuffer.add(:perform)
     end
 
-    def perform_batch(calls)
-      JobBuffer.add(:perform_batch)
+    def perform_calls(calls)
+      JobBuffer.add(:perform_calls)
     end
   end
 
-  class NoPerformBatchJob < ApplicationJob
+  class NoPerformCallsJob < ApplicationJob
     coalesce key: "missing", on_conflict: :collect
 
     def perform(*)
@@ -130,7 +130,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   class ExposingCallbacksJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 5
 
     before_perform { JobBuffer.add([ :before, arguments, coalesced_calls.map(&:arguments) ]) }
     around_perform do |job, block|
@@ -139,16 +139,16 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
     after_perform { JobBuffer.add([ :after, coalesced_calls.size ]) }
 
-    def perform_batch(calls)
-      JobBuffer.add([ :perform_batch, arguments, calls.equal?(coalesced_calls) ])
+    def perform_calls(calls)
+      JobBuffer.add([ :perform_calls, arguments, calls.equal?(coalesced_calls) ])
     end
   end
 
   class LimitedCollectedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
     limits_concurrency key: ->(_group, concurrency_group) { concurrency_group }
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
@@ -162,15 +162,15 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       super.merge("tenant" => self.class.current_tenant)
     end
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls)
     end
   end
 
   class BulkIndexJob < ApplicationJob
-    coalesce key: ->(status, *) { status }, on_conflict: :collect, batch_size: 100
+    coalesce key: ->(status, *) { status }, on_conflict: :collect, max_calls: 100
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       status = calls.first.arguments.first
       ids = calls.map { |call| call.arguments.last }.uniq
 
@@ -192,7 +192,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       super(job_data.merge("arguments" => job_data["arguments"].last))
     end
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls)
     end
   end
@@ -200,7 +200,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   class ForwardingJob < ApplicationJob
     coalesce key: "forwarding", on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map { |call| handle(*call.arguments) })
     end
 
@@ -222,7 +222,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       job_data.delete("field")
     end
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls)
     end
   end
@@ -230,7 +230,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   class ReversedArgumentsJob < ApplicationJob
     coalesce key: "reversed", on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls)
     end
 
@@ -248,7 +248,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     @a, @b = JobResult.create!, JobResult.create!
   end
 
-  test "every call stores its whole payload, including the first, and perform_batch gets them once in row order" do
+  test "every call stores its whole payload, including the first, and perform_calls gets them once in row order" do
     first = CollectedCallsJob.set(wait: 1.hour).perform_later("g", 1)
     second = CollectedCallsJob.set(wait: 1.hour).perform_later("g", 2)
 
@@ -281,7 +281,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     events = capture_events("coalesce.solid_queue") { second = CollectedCallsJob.perform_later("g", 2) }
 
     assert_equal :collected, second.coalesce_status
-    assert_equal({ action: :collected, key: "CollectedCallsJob/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: "CollectedCallsJob" }, events.sole.payload)
+    assert_equal({ status: :collected, key: "CollectedCallsJob/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: "CollectedCallsJob" }, events.sole.payload)
   end
 
   test "the calls table has only the columns it needs, and the keys table counts from 0" do
@@ -431,7 +431,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ [ "a", nil, true ], [ "a", { force: true }, false ], [ "a", { "force" => true }, false ] ], JobBuffer.values.sole
   end
 
-  test "ids from a batch feed one bounded query" do
+  test "ids from a job's calls feed one bounded query" do
     records = 3.times.map { JobResult.create!(status: "account") }
     records.each { |record| BulkIndexJob.perform_later("account", record.id) }
     BulkIndexJob.perform_later("account", records.first.id)
@@ -444,36 +444,36 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal 1, queries.size
   end
 
-  test "perform_batch in a subclass gets the batch too" do
-    SubclassedBatchJob.perform_later("g", 1)
+  test "perform_calls in a subclass gets the calls too" do
+    SubclassedCollectedJob.perform_later("g", 1)
 
     perform_ready_jobs
 
     assert_equal [ [ :subclass, [ [ "g", 1 ] ] ] ], JobBuffer.values
   end
 
-  test "a collecting job runs perform_batch, even when it has a perform" do
+  test "a collecting job runs perform_calls, even when it has a perform" do
     ConcretePerformJob.perform_later("a")
 
     perform_ready_jobs
 
-    assert_equal [ :perform_batch ], JobBuffer.values
+    assert_equal [ :perform_calls ], JobBuffer.values
   end
 
-  test "a collecting job without perform_batch fails its run, keeps its calls and says what to do" do
-    NoPerformBatchJob.perform_later("a")
+  test "a collecting job without perform_calls fails its run, keeps its calls and says what to do" do
+    NoPerformCallsJob.perform_later("a")
     job = SolidQueue::Job.sole
 
     error = assert_raises(NotImplementedError) { perform_ready_jobs }
 
-    assert_match(/#{NoPerformBatchJob.name}.*perform_batch/, error.message)
+    assert_match(/#{NoPerformCallsJob.name}.*perform_calls/, error.message)
     assert_empty JobBuffer.values
     assert job.reload.failed?
     assert_equal 1, job.coalesced_calls.count
   end
 
-  test "perform_now of a collecting job without perform_batch raises too" do
-    assert_raises(NotImplementedError) { NoPerformBatchJob.perform_now("a") }
+  test "perform_now of a collecting job without perform_calls raises too" do
+    assert_raises(NotImplementedError) { NoPerformCallsJob.perform_now("a") }
   end
 
   test "perform callbacks see coalesced_calls, and arguments stay those of the job's first call" do
@@ -485,7 +485,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [
       [ :before, [ "g", 1 ], [ [ "g", 1 ], [ "g", 2 ] ] ],
       [ :around, 2 ],
-      [ :perform_batch, [ "g", 1 ], true ],
+      [ :perform_calls, [ "g", 1 ], true ],
       [ :after, 2 ]
     ], JobBuffer.values
   end
@@ -493,12 +493,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   test "calls fill one job at a time: full jobs are sealed, at most one stays open, and no job is empty" do
     { 1 => [ 1 ], 99 => [ 99 ], 100 => [ 100 ], 101 => [ 100, 1 ], 250 => [ 100, 100, 50 ], 350 => [ 100, 100, 100, 50 ] }.each do |count, sizes|
       group = "group#{count}"
-      active_jobs = count.times.map { |i| DefaultBatchSizeJob.perform_later(group, i) }
+      active_jobs = count.times.map { |i| DefaultMaxCallsJob.perform_later(group, i) }
 
       jobs = active_jobs.map(&:provider_job_id).uniq
       assert_equal sizes, jobs.map { |job_id| SolidQueue::CoalescedCall.where(job_id: job_id).count }, group
 
-      open_key = SolidQueue::CoalesceKey.find_by(key: "#{DefaultBatchSizeJob.name}/#{group}")
+      open_key = SolidQueue::CoalesceKey.find_by(key: "#{DefaultMaxCallsJob.name}/#{group}")
       if sizes.last < 100
         assert_equal jobs.last, open_key.job_id, group
         assert_equal sizes.last, open_key.calls_count, group
@@ -508,10 +508,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     end
   end
 
-  test "backlogs of 1, 100 and 101 run in batches of the default size" do
+  test "backlogs of 1, 100 and 101 run in jobs of the default size" do
     { "one" => 1, "hundred" => 100, "hundred_and_one" => 101 }.each do |group, count|
       JobBuffer.clear
-      count.times { |i| DefaultBatchSizeJob.perform_later(group, i) }
+      count.times { |i| DefaultMaxCallsJob.perform_later(group, i) }
 
       perform_ready_jobs
       perform_ready_jobs
@@ -522,7 +522,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "a start takes the calls that were assigned to its job, however big the backlog" do
-    7.times { |i| BatchOfTwoJob.set(wait: 1.hour).perform_later("g", i) }
+    7.times { |i| TwoCallsJob.set(wait: 1.hour).perform_later("g", i) }
     SolidQueue::ScheduledExecution.update_all(scheduled_at: 1.minute.ago)
     SolidQueue::ScheduledExecution.dispatch_next_batch(10)
     job = SolidQueue::Job.order(:id).first
@@ -535,7 +535,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ [ [ "g", 0 ], [ "g", 1 ] ] ], JobBuffer.values
   end
 
-  test "batch_size 1 gives every call its own sealed job" do
+  test "max_calls 1 gives every call its own sealed job" do
     active_jobs = 3.times.map { |i| OneAtATimeJob.perform_later("g", i) }
 
     assert_equal 3, active_jobs.map(&:provider_job_id).uniq.size
@@ -547,11 +547,11 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ [ [ "g", 0 ] ], [ [ "g", 1 ] ], [ [ "g", 2 ] ] ], JobBuffer.values
   end
 
-  test "an open job over a batch size that got smaller is sealed as it is, and the calls go to a new job" do
-    first = BatchOfTwoJob.perform_later("g", 0)
+  test "an open job over a lowered max_calls is sealed as it is, and the calls go to a new job" do
+    first = TwoCallsJob.perform_later("g", 0)
     SolidQueue::CoalesceKey.sole.update!(calls_count: 5)
 
-    second = BatchOfTwoJob.perform_later("g", 1)
+    second = TwoCallsJob.perform_later("g", 1)
 
     assert_equal :created, second.coalesce_status
     assert_not_equal first.provider_job_id, second.provider_job_id
@@ -559,8 +559,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal second.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
   end
 
-  test "a large backlog drains in order, in bounded batches" do
-    7.times { |i| BatchOfTwoJob.perform_later("g", i) }
+  test "a large backlog drains in order, in bounded jobs" do
+    7.times { |i| TwoCallsJob.perform_later("g", i) }
 
     4.times { perform_ready_jobs }
 
@@ -570,16 +570,16 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::Job.where(finished_at: nil).count
   end
 
-  test "each batch takes its schedule, queue and priority from its own first call" do
+  test "each job takes its schedule, queue and priority from its own first call" do
     in_an_hour = 1.hour.from_now
     in_two_hours = 2.hours.from_now
 
     calls = [
-      BatchOfTwoJob.set(queue: "first", priority: 1).perform_later("g", 0),
-      BatchOfTwoJob.set(wait_until: in_two_hours, queue: "ignored", priority: 9).perform_later("g", 1),
-      BatchOfTwoJob.set(wait_until: in_an_hour, queue: "second", priority: 2).perform_later("g", 2),
-      BatchOfTwoJob.set(wait_until: in_two_hours, queue: "ignored", priority: 9).perform_later("g", 3),
-      BatchOfTwoJob.set(wait_until: in_two_hours, queue: "third", priority: 3).perform_later("g", 4)
+      TwoCallsJob.set(queue: "first", priority: 1).perform_later("g", 0),
+      TwoCallsJob.set(wait_until: in_two_hours, queue: "ignored", priority: 9).perform_later("g", 1),
+      TwoCallsJob.set(wait_until: in_an_hour, queue: "second", priority: 2).perform_later("g", 2),
+      TwoCallsJob.set(wait_until: in_two_hours, queue: "ignored", priority: 9).perform_later("g", 3),
+      TwoCallsJob.set(wait_until: in_two_hours, queue: "third", priority: 3).perform_later("g", 4)
     ]
 
     first, second, third = SolidQueue::Job.order(:id).to_a
@@ -594,12 +594,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal third.id, SolidQueue::CoalesceKey.sole.job_id
   end
 
-  test "a full delayed batch waits for its time, and a later batch with no wait can overtake it" do
+  test "a full delayed job waits for its time, and a later job with no wait can overtake it" do
     in_an_hour = 1.hour.from_now
 
-    2.times { |i| BatchOfTwoJob.set(wait_until: in_an_hour).perform_later("g", i) }
+    2.times { |i| TwoCallsJob.set(wait_until: in_an_hour).perform_later("g", i) }
     delayed = SolidQueue::Job.sole
-    BatchOfTwoJob.perform_later("g", 2)
+    TwoCallsJob.perform_later("g", 2)
 
     assert delayed.scheduled?
     assert_not delayed.ready?
@@ -616,7 +616,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "sealed jobs run independently, and can overlap" do
-    4.times { |i| BatchOfTwoJob.perform_later("g", i) }
+    4.times { |i| TwoCallsJob.perform_later("g", i) }
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "overlap-worker")
     first, second = SolidQueue::ReadyExecution.claim("*", 2, process.id).sort_by(&:job_id)
 
@@ -628,8 +628,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ [ [ "g", 2 ], [ "g", 3 ] ], [ [ "g", 0 ], [ "g", 1 ] ] ], JobBuffer.values
   end
 
-  test "every call in a batch runs with its own payload" do
-    active_jobs = 5.times.map { |i| BatchOfTwoRecordsJob.set(priority: i).perform_later(i) }
+  test "every call in a job runs with its own payload" do
+    active_jobs = 5.times.map { |i| TwoRecordsJob.set(priority: i).perform_later(i) }
     calls = []
     callback = ->(*, payload) { calls.concat(payload[:job].coalesced_calls) }
 
@@ -640,9 +640,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal (0...5).map { |i| [ i ] }, calls.map(&:arguments)
   end
 
-  test "a bulk enqueue sets each batch's schedule from its own first call" do
+  test "a bulk enqueue sets each job's schedule from its own first call" do
     in_an_hour = 1.hour.from_now
-    jobs = [ BatchOfTwoJob.new("g", 0), BatchOfTwoJob.new("g", 1), BatchOfTwoJob.new("g", 2).set(wait_until: in_an_hour) ]
+    jobs = [ TwoCallsJob.new("g", 0), TwoCallsJob.new("g", 1), TwoCallsJob.new("g", 2).set(wait_until: in_an_hour) ]
 
     SolidQueue::Job.enqueue_all(jobs)
 
@@ -653,12 +653,12 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "a bulk enqueue stores the schedule of an immediate call in its payload" do
-    SolidQueue::Job.enqueue_all([ BatchOfTwoJob.new("g", 0) ])
+    SolidQueue::Job.enqueue_all([ TwoCallsJob.new("g", 0) ])
 
     assert SolidQueue::CoalescedCall.sole.arguments["scheduled_at"].present?
   end
 
-  test "each batch's concurrency key comes from its own first call" do
+  test "each job's concurrency key comes from its own first call" do
     LimitedCollectedJob.perform_later("g", "first_group")
     LimitedCollectedJob.perform_later("g", "second_group")
     LimitedCollectedJob.perform_later("g", "third_group")
@@ -669,10 +669,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ "g", "third_group" ], second.arguments["arguments"]
   end
 
-  test "reaching the batch size never dispatches a scheduled job" do
+  test "reaching max_calls never dispatches a scheduled job" do
     in_an_hour = 1.hour.from_now
 
-    5.times { |i| BatchOfTwoJob.set(wait_until: in_an_hour).perform_later("g", i) }
+    5.times { |i| TwoCallsJob.set(wait_until: in_an_hour).perform_later("g", i) }
 
     assert_equal 3, SolidQueue::Job.count
     assert SolidQueue::Job.all.all?(&:scheduled?)
@@ -683,8 +683,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_empty JobBuffer.values
   end
 
-  test "a bulk enqueue past the batch size doesn't dispatch a scheduled job either" do
-    jobs = 5.times.map { |i| BatchOfTwoJob.new("g", i).set(wait: 1.hour) }
+  test "a bulk enqueue past max_calls doesn't dispatch a scheduled job either" do
+    jobs = 5.times.map { |i| TwoCallsJob.new("g", i).set(wait: 1.hour) }
 
     SolidQueue::Job.enqueue_all(jobs)
 
@@ -696,16 +696,16 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     in_an_hour = 1.hour.from_now
     in_three_hours = 3.hours.from_now
 
-    DefaultBatchSizeJob.set(wait_until: in_an_hour).perform_later("g", 0)
+    DefaultMaxCallsJob.set(wait_until: in_an_hour).perform_later("g", 0)
     job = SolidQueue::Job.sole
-    assert_equal :collected, DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesce_status
+    assert_equal :collected, DefaultMaxCallsJob.set(wait_until: in_three_hours).perform_later("g", 1).coalesce_status
     assert_in_delta in_an_hour.to_f, job.reload.scheduled_at.to_f, 0.001
 
     travel_to in_an_hour + 1.second do
       SolidQueue::ScheduledExecution.dispatch_next_batch(10)
 
       after_start = perform_ready_jobs_with_callback do
-        DefaultBatchSizeJob.set(wait_until: in_three_hours).perform_later("g", 2)
+        DefaultMaxCallsJob.set(wait_until: in_three_hours).perform_later("g", 2)
       end
 
       assert_equal :created, after_start.sole.coalesce_status
@@ -730,8 +730,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   test "waiting is what hasn't started: pending, delayed and blocked jobs' calls, not those of running, failed or finished ones" do
     LimitedCollectedJob.perform_later("running", "shared")
     blocked = LimitedCollectedJob.perform_later("blocked", "shared")
-    delayed = BatchOfTwoJob.set(wait: 1.hour).perform_later("delayed", 0)
-    ready = BatchOfTwoJob.perform_later("ready", 0)
+    delayed = TwoCallsJob.set(wait: 1.hour).perform_later("delayed", 0)
+    ready = TwoCallsJob.perform_later("ready", 0)
     SolidQueue::ReadyExecution.where.not(job_id: ready.provider_job_id).update_all(priority: 1)
     waiting = -> { SolidQueue::CoalescedCall.waiting.distinct.pluck(:job_id).sort }
     semaphore_holder_id = SolidQueue::Job.find_by!(class_name: LimitedCollectedJob.name, concurrency_key: "#{LimitedCollectedJob.name}/shared").id
@@ -751,7 +751,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_not_includes waiting.call, delayed.provider_job_id
   end
 
-  test "calls during execution go to a new job and never join the running batch" do
+  test "calls during execution go to a new job and never join the running job" do
     CollectedCallsJob.perform_later("g", 0)
     CollectedCallsJob.perform_later("g", 1)
 
@@ -778,9 +778,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal jobs.map(&:job_id).sort, SolidQueue::CoalescedCall.waiting.map { |row| row.arguments["job_id"] }.sort
   end
 
-  test "bulk enqueue over several batch boundaries reports each call's own outcome and job, in call order" do
-    open_job = BatchOfTwoJob.perform_later("g", 0).provider_job_id
-    jobs = 6.times.map { |i| BatchOfTwoJob.new("g", i + 1) }
+  test "bulk enqueue over several job boundaries reports each call's own outcome and job, in call order" do
+    open_job = TwoCallsJob.perform_later("g", 0).provider_job_id
+    jobs = 6.times.map { |i| TwoCallsJob.new("g", i + 1) }
 
     events = capture_events("coalesce.solid_queue") { assert_equal 6, SolidQueue::Job.enqueue_all(jobs) }
 
@@ -790,7 +790,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
       assert_includes SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }, active_job.job_id
     end
     assert_equal [ jobs[1], jobs[3], jobs[5] ].map(&:job_id), SolidQueue::Job.where.not(id: open_job).order(:id).pluck(:active_job_id)
-    assert_equal jobs.map(&:coalesce_status), events.map { |event| event.payload[:action] }
+    assert_equal jobs.map(&:coalesce_status), events.map { |event| event.payload[:status] }
     assert_equal jobs.map(&:provider_job_id), events.map { |event| event.payload[:job_id] }
 
     assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
@@ -799,7 +799,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "250 calls in bulk make 3 jobs" do
-    jobs = 250.times.map { |i| DefaultBatchSizeJob.new("g", i) }
+    jobs = 250.times.map { |i| DefaultMaxCallsJob.new("g", i) }
 
     assert_equal 250, SolidQueue::Job.enqueue_all(jobs)
 
@@ -831,23 +831,23 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     SolidQueue::CoalescedCall.stubs(:insert_all).raises(ActiveRecord::StatementInvalid, "boom")
 
     assert_no_difference -> { SolidQueue::Job.count + SolidQueue::CoalesceKey.count } do
-      assert_raises(SolidQueue::Job::EnqueueError) { BatchOfTwoJob.perform_later("g", 0) }
+      assert_raises(SolidQueue::Job::EnqueueError) { TwoCallsJob.perform_later("g", 0) }
     end
   end
 
   test "a failed join leaves the open job's count and rows alone" do
-    BatchOfTwoJob.perform_later("g", 0)
+    TwoCallsJob.perform_later("g", 0)
 
     failing_insert_all(on_attempt: 1, error: ActiveRecord::StatementInvalid) do
-      assert_raises(SolidQueue::Job::EnqueueError) { BatchOfTwoJob.perform_later("g", 1) }
+      assert_raises(SolidQueue::Job::EnqueueError) { TwoCallsJob.perform_later("g", 1) }
     end
 
     assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
     assert_equal 1, SolidQueue::CoalescedCall.count
   end
 
-  test "a failed bulk enqueue keeps the batches that committed, and only those report an outcome" do
-    jobs = 5.times.map { |i| BatchOfTwoJob.new("g", i) }
+  test "a failed bulk enqueue keeps the jobs that committed, and only those report an outcome" do
+    jobs = 5.times.map { |i| TwoCallsJob.new("g", i) }
 
     failing_insert_all(on_attempt: 2, error: ActiveRecord::StatementInvalid) do
       assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
@@ -859,8 +859,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ nil, nil, nil ], jobs.last(3).map(&:provider_job_id)
   end
 
-  test "bulk enqueue in the app's transaction rolls back with it, every batch included" do
-    jobs = 5.times.map { |i| BatchOfTwoJob.new("g", i) }
+  test "bulk enqueue in the app's transaction rolls back with it, every job included" do
+    jobs = 5.times.map { |i| TwoCallsJob.new("g", i) }
 
     SolidQueue::Record.transaction do
       SolidQueue::Job.enqueue_all(jobs)
@@ -891,7 +891,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_not SolidQueue::CoalescedCall.exists?(dropped_id)
   end
 
-  test "perform_batch and its callbacks are skipped when no calls remain, and the job finishes" do
+  test "perform_calls and its callbacks are skipped when no calls remain, and the job finishes" do
     ExposingCallbacksJob.perform_later(@a)
     @a.destroy!
 
@@ -919,7 +919,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert job.reload.finished?
   end
 
-  test "a call dropped from a batch stays out of the re-run after a crash" do
+  test "a call dropped from a job stays out of the re-run after a crash" do
     RecordsCollectedJob.perform_later(@a)
     RecordsCollectedJob.perform_later(@b)
     job = SolidQueue::Job.sole
@@ -936,7 +936,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert job.reload.finished?
   end
 
-  test "a job with no calls from before it collected runs a batch of one from its own arguments" do
+  test "a job with no calls from before it collected runs one call from its own arguments" do
     job = SolidQueue::Job.create!(
       queue_name: "default", class_name: "CollectedCallsJob", active_job_id: SecureRandom.uuid, scheduled_at: Time.current,
       arguments: CollectedCallsJob.new("g", 1).serialize
@@ -969,10 +969,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "a sealed job isn't broken by a deleted record in its own arguments, and neither is the next one" do
-    BatchOfTwoRecordsJob.perform_later(@a)
-    BatchOfTwoRecordsJob.perform_later(@a)
-    BatchOfTwoRecordsJob.perform_later(@b)
-    BatchOfTwoRecordsJob.perform_later(@a)
+    TwoRecordsJob.perform_later(@a)
+    TwoRecordsJob.perform_later(@a)
+    TwoRecordsJob.perform_later(@b)
+    TwoRecordsJob.perform_later(@a)
     @a.destroy!
 
     # The first job loses both its calls. The second has @b's arguments, and drops @a's call
@@ -983,7 +983,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::Job.where(finished_at: nil).count
   end
 
-  test "perform_now gets a batch of one with no id and writes nothing" do
+  test "perform_now gets one call with no id and writes nothing" do
     assert_no_difference -> { SolidQueue::CoalescedCall.count + SolidQueue::CoalesceKey.count + SolidQueue::Job.count } do
       InlineCollectedJob.perform_now(@a, force: true)
     end
@@ -1009,7 +1009,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_same unserializable, JobBuffer.values.last
   end
 
-  test "the inline adapter gets a batch of one" do
+  test "the inline adapter gets one call" do
     InlineCollectedJob.perform_later(@a)
 
     call = JobBuffer.values.sole.sole
@@ -1030,9 +1030,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "discarding a sealed job deletes only its own calls, and leaves the newer open job alone" do
-    sealed = BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 0).provider_job_id
-    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 1)
-    open = BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 2).provider_job_id
+    sealed = TwoCallsJob.set(wait: 1.hour).perform_later("g", 0).provider_job_id
+    TwoCallsJob.set(wait: 1.hour).perform_later("g", 1)
+    open = TwoCallsJob.set(wait: 1.hour).perform_later("g", 2).provider_job_id
 
     SolidQueue::Job.find(sealed).discard
 
@@ -1076,9 +1076,9 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "bulk discarding open and sealed jobs deletes their calls and frees only their keys" do
-    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 0)
-    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 1)
-    BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 2)
+    TwoCallsJob.set(wait: 1.hour).perform_later("g", 0)
+    TwoCallsJob.set(wait: 1.hour).perform_later("g", 1)
+    TwoCallsJob.set(wait: 1.hour).perform_later("g", 2)
 
     SolidQueue::ScheduledExecution.discard_all_in_batches
 
@@ -1088,8 +1088,8 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "bulk discarding some jobs leaves another job's key alone" do
-    discarded = BatchOfTwoJob.set(wait: 1.hour).perform_later("g", 0).provider_job_id
-    kept = BatchOfTwoJob.set(wait: 1.hour).perform_later("h", 0).provider_job_id
+    discarded = TwoCallsJob.set(wait: 1.hour).perform_later("g", 0).provider_job_id
+    kept = TwoCallsJob.set(wait: 1.hour).perform_later("h", 0).provider_job_id
 
     SolidQueue::ScheduledExecution.discard_all_from_jobs(SolidQueue::Job.where(id: discarded))
 
@@ -1098,7 +1098,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "clearing a queue frees the keys of its jobs, before releasing their semaphores" do
-    LimitedBatchJob.perform_later("g", 0)
+    LimitedCallsJob.perform_later("g", 0)
     queries = []
     callback = ->(*, payload) { queries << payload[:sql] if payload[:sql].match?(/\A(DELETE FROM .solid_queue_coalesce_keys|UPDATE .solid_queue_semaphores)/) }
 
@@ -1152,7 +1152,7 @@ end
 class SolidQueue::CoalesceTestAdapterTest < ActiveSupport::TestCase
   include ActiveJob::TestHelper
 
-  test "the test adapter gets a batch of one, sees the call's own arguments and writes nothing" do
+  test "the test adapter gets one call, sees the call's own arguments and writes nothing" do
     a, b = JobResult.create!, JobResult.create!
 
     assert_no_difference -> { SolidQueue::CoalescedCall.count + SolidQueue::CoalesceKey.count + SolidQueue::Job.count } do

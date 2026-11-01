@@ -13,16 +13,16 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
       JobBuffer.add([ :perform, arguments ])
     end
 
-    def perform_batch(calls)
-      JobBuffer.add([ :perform_batch, calls.map(&:arguments) ])
+    def perform_calls(calls)
+      JobBuffer.add([ :perform_calls, calls.map(&:arguments) ])
 
-      if self.class.fail_next_batch
-        self.class.fail_next_batch = false
+      if self.class.fail_next_run
+        self.class.fail_next_run = false
         raise ExpectedTestError
       end
     end
 
-    cattr_accessor :fail_next_batch, default: false
+    cattr_accessor :fail_next_run, default: false
   end
 
   class RetriedDiscardJob < ApplicationJob
@@ -34,16 +34,16 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     end
   end
 
-  class NoBatchJob < ApplicationJob
-    coalesce key: "no-batch", on_conflict: :collect
+  class NoPerformCallsJob < ApplicationJob
+    coalesce key: "no-perform-calls", on_conflict: :collect
   end
 
   class LimitedJob < ApplicationJob
     coalesce key: "limited", on_conflict: :collect
     limits_concurrency key: "limited", to: 1, on_conflict: :block
 
-    def perform_batch(calls)
-      JobBuffer.add([ :perform_batch, calls.map(&:arguments) ])
+    def perform_calls(calls)
+      JobBuffer.add([ :perform_calls, calls.map(&:arguments) ])
     end
   end
 
@@ -51,7 +51,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
   teardown do
     collect
-    ChangingJob.fail_next_batch = false
+    ChangingJob.fail_next_run = false
     LimitedJob.limits_concurrency key: "limited", to: 1, on_conflict: :block
     LimitedJob.coalesce key: "limited", on_conflict: :collect
   end
@@ -96,12 +96,12 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     SolidQueue::Job.find(job.id).retry
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
     assert job.reload.finished?
   end
 
   test "a job waiting to retry when its class changes fails, and a restored retry still has its calls" do
-    ChangingJob.fail_next_batch = true
+    ChangingJob.fail_next_run = true
     enqueue_calls
     perform_ready_jobs
     retrying_job = SolidQueue::Job.where(finished_at: nil).sole
@@ -115,12 +115,12 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     retrying_job.retry
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ] * 2, JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ] ] ] ] * 2, JobBuffer.values
   end
 
-  test "a collecting job whose class lost perform_batch fails and keeps its calls until it's restored" do
+  test "a collecting job whose class lost perform_calls fails and keeps its calls until it's restored" do
     job = enqueue_calls
-    rename_job_class(job, NoBatchJob.name)
+    rename_job_class(job, NoPerformCallsJob.name)
 
     assert_raises(NotImplementedError) { perform_ready_jobs }
 
@@ -131,7 +131,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     SolidQueue::Job.find(job.id).retry
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
   end
 
   test "a concurrency conflict doesn't destroy a collecting job whose class now discards conflicts" do
@@ -167,7 +167,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ] ] ] ], JobBuffer.values
     assert job.reload.finished?
   ensure
     ChangingJob.queue_adapter = :solid_queue
@@ -175,7 +175,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
   test "a retry on another adapter fails the job with its calls, and restoring the adapter runs them" do
     job = enqueue_calls
-    ChangingJob.fail_next_batch = true
+    ChangingJob.fail_next_run = true
     ChangingJob.queue_adapter = :test
 
     assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
@@ -187,7 +187,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     SolidQueue::Job.find(job.id).retry
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ] ] ] ] * 2, JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ] ] ] ] * 2, JobBuffer.values
     assert job.reload.finished?
   ensure
     ChangingJob.queue_adapter = :solid_queue
@@ -231,7 +231,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
       perform_ready_jobs
     end
 
-    assert_equal [ [ :perform_batch, [ [ 2 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 2 ] ] ] ], JobBuffer.values
     assert_equal [ { job_id: job.id, active_job_id: job.active_job_id, expected: 2, actual: 1 } ], events.map { |event| event.slice(:job_id, :active_job_id, :expected, :actual) }
   end
 
@@ -248,7 +248,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ] ] ], [ :perform_batch, [ [ 2 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ] ] ], [ :perform_calls, [ [ 2 ] ] ] ], JobBuffer.values
   end
 
   test "a call to a class switched to discarding isn't suppressed by a collecting job" do
@@ -263,11 +263,11 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_equal :discarded, ChangingJob.perform_later(4).coalesce_status
   end
 
-  test "a batch size or key changed while calls wait doesn't touch them" do
+  test "max_calls or a key changed while calls wait doesn't touch them" do
     job = enqueue_calls
-    ChangingJob.coalesce key: "changing", on_conflict: :collect, batch_size: 50
+    ChangingJob.coalesce key: "changing", on_conflict: :collect, max_calls: 50
     ChangingJob.perform_later(3)
-    ChangingJob.coalesce key: "another", on_conflict: :collect, batch_size: 1
+    ChangingJob.coalesce key: "another", on_conflict: :collect, max_calls: 1
     ChangingJob.perform_later(4)
 
     assert_equal 3, job.coalesced_calls.count
@@ -275,7 +275,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
     perform_ready_jobs
 
-    assert_equal [ [ :perform_batch, [ [ 1 ], [ 2 ], [ 3 ] ] ], [ :perform_batch, [ [ 4 ] ] ] ], JobBuffer.values
+    assert_equal [ [ :perform_calls, [ [ 1 ], [ 2 ], [ 3 ] ] ], [ :perform_calls, [ [ 4 ] ] ] ], JobBuffer.values
   end
 
   test "only the job's own payload is marked, not its calls, and ordinary jobs aren't" do
@@ -314,7 +314,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert_equal open_job, SolidQueue::CoalesceKey.sole.job_id
     assert_coalesce_invariants
 
-    ChangingJob.fail_next_batch = true
+    ChangingJob.fail_next_run = true
     perform_ready_jobs
     assert_equal 0, SolidQueue::CoalesceKey.count, "the open job released its key when it started"
 
@@ -385,7 +385,7 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
 
   private
     def collect
-      ChangingJob.coalesce key: "changing", on_conflict: :collect, batch_size: 3
+      ChangingJob.coalesce key: "changing", on_conflict: :collect, max_calls: 3
     end
 
     def discard

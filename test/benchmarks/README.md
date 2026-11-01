@@ -102,7 +102,7 @@ The same on all three databases, shown as SQL + transaction statements. `upstrea
 | bulk discard, 500 jobs | 5+2 | 6+2 | 6+2 | 1 | 9589 / 10218 / 10217 |
 | clear_finished, 500 jobs | 2+0 | 2+0 | 2+0 | 0 | 357 / 357 / 357 |
 
-Ordinary jobs now match Solid Queue on every step except bulk discard, which keeps one read per batch. Those steps allocate 4 to 17 more objects than upstream, where `base` allocated 100 to 172 more.
+Ordinary jobs now match Solid Queue on every step except bulk discard, which keeps one read per pass. Those steps allocate 4 to 17 more objects than upstream, where `base` allocated 100 to 172 more.
 
 The instrumentation changes for issue #14 don't touch these paths: ordinary jobs still emit no coalescing event, and on SQLite each step's statements and allocations are the ones above.
 

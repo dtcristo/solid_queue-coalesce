@@ -14,7 +14,7 @@ module JobsTestHelper
   end
 
   def stop_coalescing(job_class)
-    job_class.coalesce_key = job_class.coalesce_on_conflict = job_class.coalesce_batch_size = nil
+    job_class.coalesce_key = job_class.coalesce_on_conflict = job_class.coalesce_max_calls = nil
   end
 
   # What has to hold whenever nothing is in the middle of a transaction: a key's job

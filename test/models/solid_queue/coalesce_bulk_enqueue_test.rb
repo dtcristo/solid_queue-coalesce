@@ -18,13 +18,13 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
   end
 
   class CollectJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class CountingCollectJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
     attr_reader :serializations
 
@@ -33,7 +33,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
       super
     end
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class RaisingKeyJob < ApplicationJob
@@ -43,10 +43,10 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
   end
 
   class LimitedCollectJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
     limits_concurrency key: ->(_group, i) { i == :poison ? raise(ExpectedTestError, "no concurrency key") : i }
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class ConflictDiscardJob < ApplicationJob
@@ -140,17 +140,17 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert_equal jobs.map(&:job_id), SolidQueue::CoalescedCall.order(:id).map { |row| row.arguments["job_id"] }
   end
 
-  test "a raising subscriber leaves every call in a collecting batch with its outcome, and later calls with none" do
-    batch = 2.times.map { |i| CollectJob.new("a", i) }
+  test "a raising subscriber leaves every call in a collecting job with its outcome, and later calls with none" do
+    first_calls = 2.times.map { |i| CollectJob.new("a", i) }
     later = [ CollectJob.new("a", 2), DiscardJob.new("b") ]
 
     with_raising_subscriber(on_call: 1) do
-      assert_raises(ExpectedTestError) { SolidQueue::Job.enqueue_all(batch + later) }
+      assert_raises(ExpectedTestError) { SolidQueue::Job.enqueue_all(first_calls + later) }
     end
 
-    assert_equal [ :created, :collected ], batch.map(&:coalesce_status)
-    assert_equal [ batch.first.provider_job_id ] * 2, batch.map(&:provider_job_id)
-    assert_equal [ true, true ], batch.map(&:successfully_enqueued?)
+    assert_equal [ :created, :collected ], first_calls.map(&:coalesce_status)
+    assert_equal [ first_calls.first.provider_job_id ] * 2, first_calls.map(&:provider_job_id)
+    assert_equal [ true, true ], first_calls.map(&:successfully_enqueued?)
     assert_equal [ nil, nil ], later.map(&:provider_job_id)
     assert_equal 2, SolidQueue::CoalescedCall.count
   end
@@ -184,7 +184,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert_nothing_written jobs
   end
 
-  test "a failure partway through sealed batches keeps earlier work, and later calls have no outcome" do
+  test "a failure partway through sealed jobs keeps earlier work, and later calls have no outcome" do
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
 
     failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
@@ -199,7 +199,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert ordinary.successfully_enqueued?
   end
 
-  test "a failure partway through emits events only for the batches that committed" do
+  test "a failure partway through emits events only for the jobs that committed" do
     collect_a = Array.new(5) { |i| CollectJob.new("a", i) }
 
     events = capture_events do
@@ -209,7 +209,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     end
 
     assert_equal collect_a.first(2).map(&:job_id), events.map { |event| event.payload[:active_job_id] }
-    assert_equal [ :created, :collected ], events.map { |event| event.payload[:action] }
+    assert_equal [ :created, :collected ], events.map { |event| event.payload[:status] }
   end
 
   test "a failure on a discard admission keeps earlier work, and later calls have no outcome" do
@@ -227,7 +227,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert_equal [ ordinary, collect_a[0], collect_a[2], collect_a[4], collect_c ].map(&:job_id), SolidQueue::Job.order(:id).pluck(:active_job_id)
   end
 
-  test "a concurrency key that raises on a later batch's first call leaves exact outcomes" do
+  test "a concurrency key that raises on a later job's first call leaves exact outcomes" do
     jobs = [ LimitedCollectJob.new("g", 0), LimitedCollectJob.new("g", 1), LimitedCollectJob.new("g", :poison), LimitedCollectJob.new("g", 3) ]
 
     assert_raises(ExpectedTestError) { SolidQueue::Job.enqueue_all(jobs) }

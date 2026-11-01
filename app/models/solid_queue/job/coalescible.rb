@@ -155,13 +155,13 @@ module SolidQueue
           # first call's payload is like every other call's, and a retry doesn't take
           # a new snapshot.
           def collect_coalesced(key, active_jobs, payloads)
-            batch_size = active_jobs.first.class.coalesce_batch_size
+            max_calls = active_jobs.first.class.coalesce_max_calls
             pending = active_jobs.zip(payloads)
             enqueued_job = nil
 
             until pending.empty?
               admitted, created_job, job_id = raising_enqueue_errors do
-                retrying_deadlocks { transaction { admit_collected(key, pending, batch_size) } }
+                retrying_deadlocks { transaction { admit_collected(key, pending, max_calls) } }
               end
 
               record_coalesced(key, pending.shift(admitted).map(&:first), created_job.present?, job_id)
@@ -172,11 +172,11 @@ module SolidQueue
           end
 
           # Returns how many of the pending calls went in, and where. It can be none:
-          # a smaller batch size can leave the open job over its capacity, and a job
+          # a smaller max_calls can leave the open job over its capacity, and a job
           # from when the class discarded has none, and that only seals it.
-          def admit_collected(key, pending, batch_size)
+          def admit_collected(key, pending, max_calls)
             coalesce_key = CoalesceKey.admit_exclusively(key)
-            calls = pending.first([ coalesce_key.capacity(batch_size), 0 ].max)
+            calls = pending.first([ coalesce_key.capacity(max_calls), 0 ].max)
 
             if calls.empty?
               coalesce_key.destroy!
@@ -186,7 +186,7 @@ module SolidQueue
               job_id = coalesce_key.job_id || created_job.id
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
-              coalesce_key.fill(job_id, calls.size, batch_size)
+              coalesce_key.fill(job_id, calls.size, max_calls)
               dispatch_full(job_id) if coalesce_key.destroyed? && calls.first.first.class.coalesce_on_full == :dispatch
 
               [ calls.size, created_job, job_id ]
@@ -211,7 +211,7 @@ module SolidQueue
           end
 
           # Not attributes_from_active_job, which serializes the call again, and that
-          # could raise after earlier batches committed. A coalesced call is never in
+          # could raise after earlier jobs committed. A coalesced call is never in
           # a batch, so it has no batch_id to set.
           def create_collecting(active_job, payload)
             create!(
@@ -241,7 +241,7 @@ module SolidQueue
             # so one without an outcome would look like it needs enqueuing again.
             if job_id
               active_jobs.each do |active_job|
-                SolidQueue.instrument(:coalesce, action: active_job.coalesce_status, key: key, job_id: job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)
+                SolidQueue.instrument(:coalesce, status: active_job.coalesce_status, key: key, job_id: job_id, active_job_id: active_job.job_id, class_name: active_job.class.name)
               end
             end
           end
