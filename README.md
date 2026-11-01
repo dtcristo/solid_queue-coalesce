@@ -228,6 +228,8 @@ Three notifications exist:
 
 To count only what committed, register the count on the queue database's transaction. It runs at the outermost commit, straight away if there's no transaction, and never after a rollback, including a rolled-back savepoint. A transaction on your app's own database doesn't affect it, because the queue's write doesn't depend on that one.
 
+A job that [waits for your commit](#transactions) has no admission until then, so a rollback drops the call and no event fires.
+
 ```ruby
 ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
   SolidQueue::Record.current_transaction.after_commit do

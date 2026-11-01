@@ -6,13 +6,16 @@ require "test_helper"
 class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
+  # Rails 7.2 and main can defer enqueues to the commit, and these are about what happens without that
   class DiscardJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
     coalesce key: ->(group, *) { group }
 
     def perform(*); end
   end
 
   class CollectJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
     coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 3
 
     def perform_batch(_calls); end
