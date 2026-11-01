@@ -403,7 +403,7 @@ SolidQueue::CoalescedCall.waiting.minimum(:created_at) # nil when nothing is wai
 
 `waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed. A job that's waiting to retry counts again, with all of its calls.
 
-If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes.
+If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes. `waiting.minimum` reads a row for every waiting call, so it gets slower as the backlog grows: about 1 second at 1,000,000 waiting calls on PostgreSQL. See [the benchmarks](test/benchmarks/README.md).
 
 To count outcomes, subscribe to `coalesce.solid_queue` and group by `action`. Job IDs and keys make poor metric labels, because there are too many of them.
 
