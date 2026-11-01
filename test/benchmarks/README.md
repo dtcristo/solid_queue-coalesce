@@ -29,6 +29,43 @@ BENCH_VARIANT=head TARGET_DB=postgres bundle exec ruby test/benchmarks/bench.rb 
 
 `suite --only` takes a comma-separated list of modes or workloads.
 
+## The runs behind the results
+
+`bench.rb` ran from a clean extract of each commit, one database at a time, so they didn't compete for the host. `BENCH_BASE_PATH` pointed at an extract of `a5785d5`.
+
+The main suite, at `cebb294`, with `BENCH_JOBS=5000 BENCH_CALLS=4000`:
+
+```sh
+for db in sqlite postgres mysql; do
+  for variant in upstream upstream_tables base head; do
+    BENCH_VARIANT=$variant TARGET_DB=$db bundle exec ruby test/benchmarks/bench.rb statements >> statements.jsonl
+  done
+  TARGET_DB=$db bundle exec ruby test/benchmarks/bench.rb suite --reps 5 --out .
+done
+```
+
+Maintenance, 5 times for each shape, on SQLite at `cebb294`, and on PostgreSQL and MySQL at `de9b99a`:
+
+```sh
+BENCH_VARIANT=head TARGET_DB=$db bundle exec ruby test/benchmarks/bench.rb maintenance $shape >> maintenance.jsonl
+```
+
+The follow-ups at `de9b99a`, with the same settings. First `discard_hot_bulk`, 20 times for each of `base` and `head`, on MySQL and SQLite:
+
+```sh
+BENCH_VARIANT=$variant TARGET_DB=$db bundle exec ruby test/benchmarks/bench.rb coalesced discard_hot_bulk >> hot-bulk.jsonl
+```
+
+Then ordinary jobs on MySQL with relaxed durability, which this restores afterwards:
+
+```sh
+mysql -h127.0.0.1 -P33066 -uroot -e "SET GLOBAL innodb_flush_log_at_trx_commit=2; SET GLOBAL sync_binlog=0"
+TARGET_DB=mysql bundle exec ruby test/benchmarks/bench.rb suite --reps 5 --only ordinary --out relaxed
+mysql -h127.0.0.1 -P33066 -uroot -e "SET GLOBAL innodb_flush_log_at_trx_commit=1; SET GLOBAL sync_binlog=1"
+```
+
+Two earlier runs were thrown away. The first left code reloading on, so every job checked the watched files for changes, which looked like a 15% to 30% regression. The second failed on PostgreSQL with the default 64 MB `/dev/shm`, before writing any result.
+
 ## What's compared
 
 - `upstream` is Solid Queue alone, without the coalescing tables.

@@ -419,14 +419,20 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).count
   end
 
+  # On the last statement of a batch, so the key's release and the job's delete, with
+  # its calls, have to be rolled back
   test "a bulk discard retries a deadlock up to its limit, then raises with nothing lost" do
     active_job = CollectAllJob.perform_later("g", 1)
-    SolidQueue::CoalesceKey.expects(:release_all).times(6).raises(ActiveRecord::Deadlocked)
 
-    assert_raises(ActiveRecord::Deadlocked) { SolidQueue::ReadyExecution.discard_all_in_batches }
+    deadlocks = deadlocking_on(/\ADELETE FROM .solid_queue_ready_executions/) do
+      assert_raises(ActiveRecord::Deadlocked) { SolidQueue::ReadyExecution.discard_all_in_batches }
+    end
 
+    assert_equal 6, deadlocks
     assert_equal active_job.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
     assert_equal 1, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).count
+    assert SolidQueue::ReadyExecution.exists?(job_id: active_job.provider_job_id)
   end
 
   test "failures racing calls lose no call, and leave no key on a failed job" do

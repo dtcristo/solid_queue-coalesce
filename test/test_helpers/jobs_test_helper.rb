@@ -34,6 +34,21 @@ module JobsTestHelper
     assert_empty SolidQueue::CoalescedCall.where.missing(:job).pluck(:id), "calls without a job"
   end
 
+  # Raises what a deadlock raises each time the database runs a matching statement,
+  # after it ran. Returns how many times it did.
+  def deadlocking_on(statement, &block)
+    deadlocks = 0
+    callback = ->(*, payload) do
+      if payload[:sql].match?(statement)
+        deadlocks += 1
+        raise ActiveRecord::Deadlocked, "boom"
+      end
+    end
+
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+    deadlocks
+  end
+
   # Calls the block in the middle of each job's run, after it has started.
   def perform_ready_jobs_with_callback(&block)
     results = []
