@@ -246,7 +246,7 @@ module SolidQueue
         calls = coalesced_calls.order(:id).pluck(:id, :arguments)
 
         if released_key && released_key.calls_count != calls.size
-          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, active_job_id: active_job_id, expected: released_key.calls_count, actual: calls.size)
+          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, active_job_id: active_job_id, class_name: class_name, expected: released_key.calls_count, actual: calls.size)
         end
 
         { "calls" => calls, "concurrency_key" => concurrency_key }

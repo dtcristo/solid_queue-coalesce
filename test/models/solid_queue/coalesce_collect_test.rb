@@ -887,7 +887,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal job.id, payload[:job_id]
     assert_equal job.active_job_id, payload[:active_job_id]
     assert_operator payload[:exception_class].constantize, :<=, ActiveJob::DeserializationError
-    assert_equal %i[ active_job_id call_id exception_class job_id ], payload.keys.sort
+    assert_equal %i[ active_job_id call_deleted call_id class_name exception_class job_id ], payload.keys.sort
     assert_not SolidQueue::CoalescedCall.exists?(dropped_id)
   end
 
