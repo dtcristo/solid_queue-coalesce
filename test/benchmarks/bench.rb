@@ -224,8 +224,10 @@ end
 def work_off(threads:, batch: 5, until_done: -> { true })
   in_threads(threads) do
     loop do
+      # Asked before claiming. Asked after, a job committed in between gets left behind
+      last_pass = until_done.call
       claimed = SolidQueue::ReadyExecution.claim("*", batch, worker_process.id)
-      break if claimed.empty? && until_done.call
+      break if claimed.empty? && last_pass
 
       claimed.each do |execution|
         execution.perform
@@ -551,8 +553,14 @@ module Maintenance
     end
   end
 
+  # What autovacuum would have done by now. Without VACUUM, PostgreSQL can't use an
+  # index-only scan on freshly seeded rows, and has to read the table for every one.
   def analyze
-    connection.execute(TARGET_DB == "mysql" ? "ANALYZE TABLE solid_queue_jobs, solid_queue_coalesced_calls, solid_queue_failed_executions, solid_queue_claimed_executions" : "ANALYZE")
+    case TARGET_DB
+    when "postgres" then connection.execute("VACUUM ANALYZE")
+    when "mysql" then connection.execute("ANALYZE TABLE solid_queue_jobs, solid_queue_coalesced_calls, solid_queue_failed_executions, solid_queue_claimed_executions")
+    else connection.execute("ANALYZE")
+    end
   end
 
   # Oldest first, as the calls of a real table are, which is what an index on
@@ -590,7 +598,7 @@ module Maintenance
       connection.execute(<<~SQL)
         INSERT INTO solid_queue_coalesced_calls (job_id, arguments, created_at)
         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < #{calls})
-        SELECT CASE WHEN i <= #{finished_or_failed_calls} THEN ((i - 1) / #{shape[:finished_calls]}) + 1
+        SELECT CASE WHEN i <= #{finished_or_failed_calls} THEN ((i - 1) #{TARGET_DB == "mysql" ? "DIV" : "/"} #{shape[:finished_calls]}) + 1
           ELSE #{finished + failed} + ((i - #{finished_or_failed_calls} - 1) % #{waiting}) + 1 END, #{call_payload}, #{seconds_after("i", timestamp)} FROM n
       SQL
     end
