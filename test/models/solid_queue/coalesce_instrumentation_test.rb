@@ -201,7 +201,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
 
     # Something else deletes the row after the worker read it
     events = capture_events("drop_coalesced_call.solid_queue") do
-      perform_ready_jobs_with_callback { SolidQueue::CoalescedCall.where(id: dropped_id).delete_all }
+      at_start_of_perform(-> { SolidQueue::CoalescedCall.where(id: dropped_id).delete_all }) { perform_ready_jobs }
     end
 
     assert_equal false, events.sole.payload[:call_deleted]
@@ -282,6 +282,18 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
       subscriber = ActiveSupport::Notifications.subscribe(name) { |*args| events << ActiveSupport::Notifications::Event.new(*args) }
       yield
       events
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    # A worker has read the job's calls by the time perform.active_job starts
+    def at_start_of_perform(callback)
+      listener = Class.new do
+        define_method(:start) { |*| callback.call }
+        define_method(:finish) { |*| }
+      end.new
+      subscriber = ActiveSupport::Notifications.subscribe("perform.active_job", listener)
+      yield
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
     end
