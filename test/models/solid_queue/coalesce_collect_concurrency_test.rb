@@ -383,6 +383,90 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal [], SolidQueue::CoalescedCall.pluck(:job_id).uniq - SolidQueue::Job.pluck(:id)
   end
 
+  test "bulk discards racing calls keep the calls of whatever isn't discarded" do
+    results = race(5) do |thread|
+      20.times.map do |i|
+        if thread.zero?
+          SolidQueue::ReadyExecution.discard_all_in_batches
+          nil
+        else
+          CollectAllJob.perform_later("g", thread, i)
+        end
+      end
+    end.flatten.compact
+
+    assert results.all?(&:successfully_enqueued?)
+    assert_coalesce_invariants
+
+    kept = SolidQueue::CoalescedCall.pluck(:arguments).map { |payload| payload["job_id"] }
+    assert_empty kept - results.map(&:job_id)
+    drain_ready
+    assert_equal kept.size, RACED_BATCHES.flat_map(&:last).size
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "a bulk discard that's rolled back keeps the job, its key and its calls" do
+    active_job = CollectAllJob.perform_later("g", 1)
+
+    SolidQueue::Record.transaction do
+      SolidQueue::ReadyExecution.discard_all_in_batches
+      assert_equal 0, SolidQueue::CoalescedCall.count
+      raise ActiveRecord::Rollback
+    end
+
+    assert_coalesce_invariants
+    assert_equal active_job.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).count
+  end
+
+  # On the last statement of a batch, so the key's release and the job's delete, with
+  # its calls, have to be rolled back
+  test "a bulk discard retries a deadlock up to its limit, then raises with nothing lost" do
+    active_job = CollectAllJob.perform_later("g", 1)
+
+    deadlocks = deadlocking_on(/\ADELETE FROM .solid_queue_ready_executions/) do
+      assert_raises(ActiveRecord::Deadlocked) { SolidQueue::ReadyExecution.discard_all_in_batches }
+    end
+
+    assert_equal 6, deadlocks
+    assert_equal active_job.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
+    assert_equal 1, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).count
+    assert SolidQueue::ReadyExecution.exists?(job_id: active_job.provider_job_id)
+  end
+
+  test "failures racing calls lose no call, and leave no key on a failed job" do
+    done = Concurrent::AtomicBoolean.new
+    failing = in_thread { fail_claimed until done.true? }
+
+    # 31 each, so the last job isn't full and has a key left to release
+    results = race(4) { |thread| 31.times.map { |i| CollectFiveJob.perform_later("g", thread, i) } }.flatten
+    done.make_true
+    failing.value
+    fail_claimed
+
+    assert results.all?(&:successfully_enqueued?)
+    assert_equal results.map(&:job_id).sort, SolidQueue::CoalescedCall.pluck(:arguments).map { |payload| payload["job_id"] }.sort
+    results.each do |active_job|
+      assert_includes SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).map { |row| row.arguments["job_id"] }, active_job.job_id
+    end
+    assert_equal 0, SolidQueue::ClaimedExecution.count
+    assert_coalesce_invariants
+  end
+
+  test "a deadlock while failing isn't retried, and leaves the key and the calls where they were" do
+    active_job = CollectAllJob.perform_later("g", 1)
+    claimed = SolidQueue::ReadyExecution.claim("*", 1, @process.id).sole
+    SolidQueue::FailedExecution.expects(:create!).once.raises(ActiveRecord::Deadlocked)
+
+    assert_raises(ActiveRecord::Deadlocked) { claimed.failed_with(ExpectedTestError.new) }
+
+    assert_equal active_job.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
+    assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
+    assert_equal 1, SolidQueue::CoalescedCall.count
+    assert SolidQueue::ClaimedExecution.exists?(job_id: active_job.provider_job_id)
+  end
+
   test "appends racing discards of the open job don't fail, and every append ends up on a job" do
     rounds = 20
     results = race(5) do |thread|
@@ -480,6 +564,21 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       yield
     ensure
       SolidQueue::CoalescedCall.singleton_class.remove_method(:insert_all)
+    end
+
+    # Claimed but not started, so these still hold their keys, like the jobs of a
+    # process that died. Failing isn't retried on a deadlock, so a worker would stop
+    # here, and what it didn't finalize stays claimed for the next one to fail.
+    def fail_claimed
+      SolidQueue::ReadyExecution.claim("*", 2, @process.id)
+
+      SolidQueue::Job.retrying_deadlocks do
+        SolidQueue::ClaimedExecution.all.fail_all_with(ExpectedTestError.new)
+      end
+    end
+
+    def drain_ready
+      nil until SolidQueue::ReadyExecution.claim("*", 2, @process.id).each(&:perform).empty?
     end
 
     def race_appends_against_workers(job_class, appenders:, calls_per_appender:, workers:, groups: %w[ g ])

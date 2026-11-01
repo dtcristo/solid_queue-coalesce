@@ -291,16 +291,56 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal :created, FailingCollectedJob.perform_later("g", 2).coalesce_status
   end
 
-  test "a collecting job that finishes on code that stopped collecting releases its key, and new calls don't join it" do
-    FailingCollectedJob.perform_later("g", 1)
-    job = SolidQueue::Job.sole
-    rename_job_class(job, "AddToBufferJob")
-    job.update!(arguments: AddToBufferJob.new("no longer collecting").serialize)
+  # The gap the marker leaves open, kept on purpose. Nothing says this job can hold a
+  # key, so finishing or failing it doesn't look for one. Only jobs from before the
+  # marker can get here, and the README says to drain them.
+  test "an unmarked job whose class stopped coalescing keeps its key after finishing, until it's cleared" do
+    job = enqueue_unmarked_job_of_another_class
 
     SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
 
     assert job.reload.finished?
+    assert_equal job.id, SolidQueue::CoalesceKey.sole.job_id
+
+    SolidQueue::Job.clear_finished_in_batches(finished_before: 1.minute.from_now)
+
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_equal :created, FailingCollectedJob.perform_later("g", 2).coalesce_status
   end
+
+  test "a call can join an unmarked finished job that kept its key, and that call won't run" do
+    job = enqueue_unmarked_job_of_another_class
+    SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
+
+    joined = FailingCollectedJob.perform_later("g", 2)
+
+    assert_equal job.id, joined.provider_job_id
+    assert_equal 2, job.coalesced_calls.count
+    assert_empty perform_ready_jobs
+  end
+
+  test "an unmarked job whose class stopped coalescing fails without looking for its key, and discarding it releases the key" do
+    job = enqueue_unmarked_job_of_another_class
+    SolidQueue::ReadyExecution.delete_all
+
+    job.failed_with(ExpectedTestError.new("boom"))
+
+    assert job.reload.failed?
+    assert_equal job.id, SolidQueue::CoalesceKey.sole.job_id
+
+    job.discard
+
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal :created, FailingCollectedJob.perform_later("g", 2).coalesce_status
+  end
+
+  private
+    def enqueue_unmarked_job_of_another_class
+      FailingCollectedJob.perform_later("g", 1)
+
+      SolidQueue::Job.sole.tap do |job|
+        rename_job_class(job, "AddToBufferJob")
+        job.update!(arguments: AddToBufferJob.new("no longer collecting").serialize)
+      end
+    end
 end

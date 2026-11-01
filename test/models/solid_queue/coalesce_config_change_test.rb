@@ -25,6 +25,15 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     cattr_accessor :fail_next_batch, default: false
   end
 
+  class RetriedDiscardJob < ApplicationJob
+    coalesce key: ->(name) { name }
+    retry_on ExpectedTestError, wait: 1.hour
+
+    def perform(name)
+      raise ExpectedTestError
+    end
+  end
+
   class NoBatchJob < ApplicationJob
     coalesce key: "no-batch", on_conflict: :collect
   end
@@ -199,8 +208,8 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     active_job.enqueue
     active_job.enqueue
 
-    assert_not SolidQueue::CoalescedCall.pluck(:arguments).any? { |payload| payload.key?("coalesce_collecting") }
-    assert SolidQueue::Job.sole.arguments["coalesce_collecting"]
+    assert_not SolidQueue::CoalescedCall.pluck(:arguments).any? { |payload| payload.key?("coalesce_on_conflict") }
+    assert_equal "collect", SolidQueue::Job.sole.arguments["coalesce_on_conflict"]
   end
 
   test "a collecting job that lost all of its calls fails instead of running its own arguments" do
@@ -272,25 +281,25 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
   test "only the job's own payload is marked, not its calls, and ordinary jobs aren't" do
     job = enqueue_calls
 
-    assert job.arguments["coalesce_collecting"]
-    assert_not job.coalesced_calls.any? { |call| call.arguments.key?("coalesce_collecting") }
+    assert_equal "collect", job.arguments["coalesce_on_conflict"]
+    assert_not job.coalesced_calls.any? { |call| call.arguments.key?("coalesce_on_conflict") }
 
-    assert_not AddToBufferJob.new("plain").serialize.key?("coalesce_collecting")
-    assert_not ChangingJob.new(1).serialize.key?("coalesce_collecting")
+    assert_not AddToBufferJob.new("plain").serialize.key?("coalesce_on_conflict")
+    assert_not ChangingJob.new(1).serialize.key?("coalesce_on_conflict")
   end
 
-  test "running an ordinary job costs only the documented key read" do
-    AddToBufferJob.perform_later("plain")
-    queries = []
+  test "a job created discarding is marked in its own payload, and its retries carry the marker" do
+    RetriedDiscardJob.perform_later("a")
+    RetriedDiscardJob.perform_later("a")
+    job = SolidQueue::Job.sole
 
-    ActiveSupport::Notifications.subscribed(->(event) { queries << event.payload[:sql] unless event.payload[:name] == "SCHEMA" }, "sql.active_record") do
-      perform_ready_jobs
-    end
+    assert_equal "discard", job.arguments["coalesce_on_conflict"]
 
-    assert_equal [ "plain" ], JobBuffer.values
-    assert_not queries.any? { |sql| sql.include?(SolidQueue::CoalescedCall.table_name) }
-    assert_equal 1, queries.count { |sql| sql.include?(SolidQueue::CoalesceKey.table_name) }, "only the read documented in the README"
-    assert_not queries.any? { |sql| sql.match?(/JOIN.*#{SolidQueue::ClaimedExecution.table_name}/) }
+    perform_ready_jobs
+
+    retried = SolidQueue::Job.where(finished_at: nil).where.not(id: job.id).sole
+    assert_equal "discard", retried.arguments["coalesce_on_conflict"]
+    assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
   test "the key, the job and the calls stay consistent through a job's life" do

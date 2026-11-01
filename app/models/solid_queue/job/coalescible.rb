@@ -137,7 +137,9 @@ module SolidQueue
           end
 
           def create_for_coalesce_key(coalesce_key, active_job)
-            create!(**attributes_from_active_job(active_job)).tap do |job|
+            attributes = attributes_from_active_job(active_job)
+
+            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_on_conflict" => "discard")).tap do |job|
               # limits_concurrency with on_conflict: :discard destroys the job right away
               if job.persisted?
                 coalesce_key.update_columns(job_id: job.id)
@@ -200,7 +202,7 @@ module SolidQueue
               priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
               scheduled_at: active_job.scheduled_at,
               class_name: active_job.class.name,
-              arguments: payload.merge("coalesce_collecting" => true),
+              arguments: payload.merge("coalesce_on_conflict" => "collect"),
               concurrency_key: active_job.concurrency_key
             )
           end
@@ -256,9 +258,18 @@ module SolidQueue
           job_class.try(:coalesce_key).present?
         end
 
+        # Admission marks a job before giving it a key, and the class covers jobs from
+        # before the marker. Anything that can't answer gets the read, so that failing
+        # or discarding a job still works when its payload or its class can't be loaded.
+        def may_hold_coalesce_key?
+          !arguments.is_a?(Hash) || arguments.key?("coalesce_on_conflict") || coalesced?
+        rescue StandardError, ScriptError
+          true
+        end
+
         # A sealed job has no row, and lock_for_release won't touch a newer job's
         def release_coalesce_key
-          CoalesceKey.lock_for_release(id)&.destroy! if CoalesceKey.migrated?
+          CoalesceKey.lock_for_release(id)&.destroy! if may_hold_coalesce_key? && CoalesceKey.migrated?
         end
     end
   end
