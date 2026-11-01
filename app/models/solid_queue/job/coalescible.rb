@@ -187,8 +187,26 @@ module SolidQueue
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
               coalesce_key.fill(job_id, calls.size, batch_size)
+              dispatch_full(job_id) if coalesce_key.destroyed? && calls.first.first.class.coalesce_on_full == :dispatch
 
               [ calls.size, created_job, job_id ]
+            end
+          end
+
+          # A job that's ready, blocked or claimed has no scheduled execution, and has
+          # nothing to do. SKIP LOCKED because we hold the key, and a discard holds the
+          # execution while it waits for the key. Whoever holds the row is dispatching
+          # or discarding the job already. On MySQL, locking a row that isn't there takes
+          # a gap lock that blocks other jobs being scheduled, so it checks first. The
+          # time moves too, or retrying the job after it fails would wait for the old one.
+          def dispatch_full(job_id)
+            if ScheduledExecution.exists?(job_id: job_id)
+              scheduled = ScheduledExecution.where(job_id: job_id).non_blocking_lock.pluck(:job_id)
+
+              if scheduled.any?
+                where(id: scheduled).update_all(scheduled_at: Time.current)
+                ScheduledExecution.dispatch_jobs(scheduled)
+              end
             end
           end
 

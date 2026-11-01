@@ -20,6 +20,8 @@ A discarding call inserts the key if nobody holds it, skipping a conflict, and l
 
 A collecting call takes an exclusive lock, because it goes on to change the row. It inserts its calls and either adds to `calls_count` or, once the job is full, deletes the row. Deleting the row seals the job, and the next call opens a new one. Sealing changes nothing about the job itself.
 
+With `on_full: :dispatch`, the call that seals a job also dispatches it, in the same transaction, so workers can't see the job before its last call. It locks the scheduled execution, moves `scheduled_at` on the job to now, and calls `ScheduledExecution.dispatch_jobs`, the path the dispatcher uses. A job with no scheduled execution is left as it is, because it's ready, blocked or claimed already. Moving `scheduled_at` matters because `FailedExecution#retry` checks `due?`, and would send the job back to its old time. A job sealed without taking a call doesn't dispatch.
+
 A job that gets a key has a `coalesce_on_conflict` marker in its payload. The marker outlives the class's declaration, so a worker can tell how a job was created after a deploy changes the class.
 
 ## Release
@@ -37,6 +39,10 @@ Admission locks the key, then the job and its semaphore. Everything else has to 
 - Bulk discards call `CoalesceKey.release_all` before `super`, in key order, so that two of them can't deadlock with each other.
 - `lock_for_release` finds the row's key and then locks through the key's index. Locking through the `job_id` index takes InnoDB's locks on the row's indexes in the opposite order to admission.
 - Bulk enqueues sort their calls by key, and take one transaction per discard admission or collecting batch, so one call holds one key's lock at a time.
+
+`on_full: :dispatch` is the exception. It locks a scheduled execution while holding the key, and a discard holds that execution while it waits for the key. So it uses `non_blocking_lock`, and skips a row that's held: the holder is either the dispatcher, which is dispatching a job that's due, or a discard. It's why early dispatch is best effort. A discard that rolls back leaves the job at its old time. It checks that the row exists first, because on MySQL a locking read of a missing row takes a gap lock, and a stale snapshot can only leave the job at its old time too.
+
+With `use_skip_locked` off, `non_blocking_lock` waits, and the fill and a discard of the same job can deadlock. Admission retries unless it's nested, and a single discard has no retry. That takes a non-default setting and a discard racing a fill, so we accept it.
 
 ## Deadlock retries
 

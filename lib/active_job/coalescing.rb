@@ -5,6 +5,7 @@ module ActiveJob
     extend ActiveSupport::Concern
 
     COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
+    COALESCE_ON_FULL_BEHAVIOUR = %i[ wait dispatch ]
     DEFAULT_COALESCE_BATCH_SIZE = 100
 
     # A job created as a collecting job can't run the way its class says now, or has
@@ -41,13 +42,14 @@ module ActiveJob
       class_attribute :coalesce_key, instance_accessor: false
       class_attribute :coalesce_on_conflict, instance_accessor: false
       class_attribute :coalesce_batch_size, instance_accessor: false
+      class_attribute :coalesce_on_full, instance_accessor: false
 
       attr_reader :coalesce_status, :coalesced_calls
       private attr_writer :coalesce_status
     end
 
     class_methods do
-      def coalesce(key:, on_conflict: :discard, batch_size: nil)
+      def coalesce(key:, on_conflict: :discard, batch_size: nil, on_full: nil)
         unless (key.is_a?(String) || key.is_a?(Symbol) || key.is_a?(Proc)) && key.present?
           raise ArgumentError, "`key` must be a non-blank String or Symbol, or a Proc"
         end
@@ -62,8 +64,16 @@ module ActiveJob
           unless batch_size.is_a?(Integer) && batch_size.positive?
             raise ArgumentError, "`batch_size` must be a positive integer"
           end
+
+          on_full = :wait if on_full.nil?
+
+          unless on_full.in?(COALESCE_ON_FULL_BEHAVIOUR)
+            raise ArgumentError, "`on_full` must be :wait or :dispatch"
+          end
         elsif !batch_size.nil?
           raise ArgumentError, "`batch_size` needs `on_conflict: :collect`"
+        elsif !on_full.nil?
+          raise ArgumentError, "`on_full` needs `on_conflict: :collect`"
         end
 
         ensure_coalesce_compatible_with_concurrency_controls(on_conflict, concurrency_on_conflict)
@@ -71,6 +81,7 @@ module ActiveJob
         self.coalesce_key = key
         self.coalesce_on_conflict = on_conflict
         self.coalesce_batch_size = batch_size
+        self.coalesce_on_full = on_full
       end
 
       def coalesce_collect?

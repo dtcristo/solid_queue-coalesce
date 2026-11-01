@@ -24,6 +24,14 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
   end
 
+  class CollectFiveDispatchingJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5, on_full: :dispatch
+
+    def perform_batch(calls)
+      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    end
+  end
+
   class CollectFiveLimitedJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
     limits_concurrency key: "shared", to: 1
@@ -505,6 +513,122 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.where.not(job_id: SolidQueue::Job.select(:id)).count
     assert_equal 0, SolidQueue::CoalescedCall.where.not(job_id: SolidQueue::Job.select(:id)).count
     assert SolidQueue::Job.all.all? { |job| job.coalesced_calls.count.between?(1, 5) }
+  end
+
+  test "a job dispatched as it fills isn't ready for anyone else until the commit" do
+    skip_on_sqlite
+
+    4.times { |i| CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", i) }
+
+    SolidQueue::Record.transaction do
+      CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", 4)
+
+      assert_equal 0, in_thread { SolidQueue::ReadyExecution.count }.value
+    end
+
+    assert_equal 1, SolidQueue::ReadyExecution.count
+    assert_equal 5, SolidQueue::CoalescedCall.where(job_id: SolidQueue::ReadyExecution.sole.job_id).count
+  end
+
+  test "the call that fills a job doesn't wait for a dispatcher that's dispatching it, and it's ready once" do
+    skip_on_sqlite
+
+    4.times { |i| CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", i) }
+    SolidQueue::ScheduledExecution.update_all(scheduled_at: 1.second.ago)
+    dispatched = Concurrent::Event.new
+    filled = Concurrent::Event.new
+
+    dispatcher = in_thread do
+      SolidQueue::Record.transaction do
+        SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+        dispatched.set
+        filled.wait(5)
+      end
+    end
+
+    dispatched.wait(5)
+    Timeout.timeout(3) { in_thread { CollectFiveDispatchingJob.perform_later("g", 4) }.value }
+    filled.set
+    dispatcher.value
+
+    assert_equal 1, SolidQueue::ReadyExecution.count
+    assert_equal 0, SolidQueue::ScheduledExecution.count
+    assert_equal 5, SolidQueue::CoalescedCall.where(job_id: SolidQueue::ReadyExecution.sole.job_id).count
+  end
+
+  test "a job that fills while a discard that gets rolled back holds it keeps its time" do
+    skip_on_sqlite
+
+    4.times { |i| CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", i) }
+    job = SolidQueue::Job.sole
+    holding = Concurrent::Event.new
+    filled = Concurrent::Event.new
+
+    discard = in_thread do
+      SolidQueue::Record.transaction do
+        job.scheduled_execution.lock!
+        holding.set
+        filled.wait(5)
+        raise ActiveRecord::Rollback
+      end
+    end
+
+    holding.wait(5)
+    Timeout.timeout(3) { in_thread { CollectFiveDispatchingJob.perform_later("g", 4) }.value }
+    filled.set
+    discard.value
+
+    assert job.reload.scheduled?
+    assert_operator job.scheduled_at, :>, 50.minutes.from_now
+    assert_equal 5, job.coalesced_calls.count
+    assert_equal 0, SolidQueue::CoalesceKey.count
+  end
+
+  test "calls filling delayed jobs racing discards never fail, or leave a key or a call without its job" do
+    race(5) do |thread|
+      30.times do |i|
+        if thread.zero?
+          SolidQueue::Job.where(class_name: CollectFiveDispatchingJob.name).find_each(&:discard)
+        else
+          CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", thread, i)
+        end
+      end
+    end
+
+    assert_equal 0, SolidQueue::CoalesceKey.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert_equal 0, SolidQueue::CoalescedCall.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert_coalesce_invariants
+  end
+
+  # The fill and a discard can really deadlock here. Admission retries, and a single
+  # discard doesn't, so that one's error is what its caller would get.
+  test "without SKIP LOCKED, calls filling delayed jobs racing discards still lose nothing they kept" do
+    SolidQueue.with(use_skip_locked: false) do
+      race(5) do |thread|
+        30.times do |i|
+          if thread.zero?
+            begin
+              SolidQueue::Job.where(class_name: CollectFiveDispatchingJob.name).find_each(&:discard)
+            rescue ActiveRecord::Deadlocked
+            end
+          else
+            CollectFiveDispatchingJob.set(wait: 1.hour).perform_later("g", thread, i)
+          end
+        end
+      end
+    end
+
+    assert_equal 0, SolidQueue::CoalesceKey.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert_equal 0, SolidQueue::CoalescedCall.where.not(job_id: SolidQueue::Job.select(:id)).count
+    assert_coalesce_invariants
+  end
+
+  test "delayed jobs that fill while workers run lose nothing and run every call once" do
+    calls = race_appends_against_workers(CollectFiveDispatchingJob, appenders: 4, calls_per_appender: 30, workers: 3)
+
+    assert_every_call_ran_once calls
+    assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
+    assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
   private
