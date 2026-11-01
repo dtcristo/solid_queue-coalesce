@@ -18,21 +18,37 @@ class LogSubscriberTest < ActiveSupport::TestCase
     attach_log_subscriber
     instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :discarded
 
-    assert_match_logged :debug, "Coalesce call", "key: \"MyJob/1\", job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", outcome: :discarded"
+    assert_match_logged :debug, "Coalesce call", "job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", outcome: :discarded"
+  end
+
+  test "a coalesce line leaves out the key, which the app defines" do
+    attach_log_subscriber
+    instrument "coalesce.solid_queue", key: "MyJob/secret", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :created
+
+    assert_no_match(/secret/, @logger.logged(:debug).join)
+  end
+
+  test "a coalesce line isn't built above debug" do
+    subscriber = attach_log_subscriber
+    @logger.level = Logger::INFO
+
+    assert subscriber.silenced?("coalesce.solid_queue")
+    assert_not subscriber.silenced?("drop_coalesced_call.solid_queue")
+    assert_not subscriber.silenced?("coalesced_calls_mismatch.solid_queue")
   end
 
   test "drop a coalesced call" do
     attach_log_subscriber
-    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", exception_class: "ActiveJob::DeserializationError"
+    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", class_name: "MyJob", exception_class: "ActiveJob::DeserializationError", call_deleted: false
 
-    assert_match_logged :warn, "Drop coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", exception_class: \"ActiveJob::DeserializationError\""
+    assert_match_logged :warn, "Drop coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", exception_class: \"ActiveJob::DeserializationError\", call_deleted: false"
   end
 
   test "calls that don't match the key's count" do
     attach_log_subscriber
-    instrument "coalesced_calls_mismatch.solid_queue", job_id: 42, active_job_id: "abc", expected: 3, actual: 2
+    instrument "coalesced_calls_mismatch.solid_queue", job_id: 42, active_job_id: "abc", class_name: "MyJob", expected: 3, actual: 2
 
-    assert_match_logged :warn, "Coalesced calls don't match the key's count", "job_id: 42, active_job_id: \"abc\", expected: 3, actual: 2"
+    assert_match_logged :warn, "Coalesced calls don't match the key's count", "job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", expected: 3, actual: 2"
   end
 
   test "no event logs arguments or payloads, whatever it's given" do
@@ -46,7 +62,7 @@ class LogSubscriberTest < ActiveSupport::TestCase
 
   private
     def attach_log_subscriber
-      ActiveSupport::LogSubscriber.attach_to :solid_queue, SolidQueue::LogSubscriber.new
+      SolidQueue::LogSubscriber.new.tap { |subscriber| SolidQueue::LogSubscriber.attach_to :solid_queue, subscriber }
     end
 
     def instrument(...)

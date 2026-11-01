@@ -251,8 +251,8 @@ module ActiveJob
 
       def drop_coalesced_rows(rows, delete:)
         rows.each do |id, error|
-          SolidQueue.instrument(:drop_coalesced_call, call_id: id, job_id: provider_job_id, active_job_id: job_id, exception_class: error.class.name) do
-            SolidQueue::CoalescedCall.where(id: id).delete_all if delete
+          SolidQueue.instrument(:drop_coalesced_call, call_id: id, job_id: provider_job_id, active_job_id: job_id, class_name: self.class.name, exception_class: error.class.name) do |payload|
+            payload[:call_deleted] = delete && SolidQueue::CoalescedCall.where(id: id).delete_all.positive?
           end
         end
       end

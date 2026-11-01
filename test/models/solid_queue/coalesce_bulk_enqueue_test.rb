@@ -199,6 +199,19 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     assert ordinary.successfully_enqueued?
   end
 
+  test "a failure partway through emits events only for the batches that committed" do
+    collect_a = Array.new(5) { |i| CollectJob.new("a", i) }
+
+    events = capture_events do
+      failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
+        assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(collect_a) }
+      end
+    end
+
+    assert_equal collect_a.first(2).map(&:job_id), events.map { |event| event.payload[:active_job_id] }
+    assert_equal [ :created, :collected ], events.map { |event| event.payload[:action] }
+  end
+
   test "a failure on a discard admission keeps earlier work, and later calls have no outcome" do
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
     discard_c = DiscardJob.new("c")

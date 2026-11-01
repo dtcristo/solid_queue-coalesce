@@ -104,6 +104,18 @@ The same on all three databases, shown as SQL + transaction statements. `upstrea
 
 Ordinary jobs now match Solid Queue on every step except bulk discard, which keeps one read per batch. Those steps allocate 4 to 17 more objects than upstream, where `base` allocated 100 to 172 more.
 
+The instrumentation changes for issue #14 don't touch these paths: ordinary jobs still emit no coalescing event, and on SQLite each step's statements and allocations are the ones above.
+
+### Logging a coalesced call
+
+`coalesce.solid_queue` fires once per call, so `SolidQueue::LogSubscriber` skips it above debug level with `subscribe_log_level`. Measured on SQLite, in one process with the logger at info, alternating between the two, medians of 7 runs. The runs overlap for the bulk enqueue, so the per-event numbers are the ones to rely on.
+
+| | With `subscribe_log_level` | Without |
+|---|---|---|
+| Time per event | 0.19 µs | 2.23 µs |
+| Allocations per event | 3 | 28 |
+| 5,000 collected calls in bulk, calls per second | 61,145 (51,761 to 72,326) | 52,306 (43,831 to 60,644) |
+
 ### Ordinary jobs, jobs per second from the worker's side
 
 SQLite:

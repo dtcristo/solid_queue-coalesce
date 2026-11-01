@@ -219,12 +219,31 @@ Three notifications exist:
 | Event | When | Payload |
 | --- | --- | --- |
 | `coalesce.solid_queue` | A call was admitted, including the one that created the job | `action` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
-| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `exception_class` |
-| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `expected`, `actual` |
+| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class`, `call_deleted` |
+| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `class_name`, `expected`, `actual` |
 
-`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, but the key is logged, so keep secrets out of it.
+`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, and none logs the key, which your app defines. The key is only in the event's payload.
 
-`coalesce.solid_queue` fires right after the admission of a call's batch. Inside your own transaction that's before the commit, and a rollback can undo what it reported. Don't treat it as an after-commit event.
+`coalesce.solid_queue` fires right after the admission of a call's batch. Outside a transaction on the queue database, that's after the commit, and the outcome is final. Inside one, it's before the commit, so the outcome is provisional: a rollback can undo what it reported, and the event stays fired. No event fires for a retry, for a worker starting a job, or for a call that a `limits_concurrency` conflict destroyed.
+
+To count only what committed, register the count on the queue database's transaction. It runs at the outermost commit, straight away if there's no transaction, and never after a rollback, including a rolled-back savepoint. A transaction on your app's own database doesn't affect it, because the queue's write doesn't depend on that one.
+
+```ruby
+ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
+  SolidQueue::Record.current_transaction.after_commit do
+    Metrics.increment("solid_queue.coalesce", tags: payload.slice(:class_name, :action))
+  end
+end
+```
+
+`current_transaction` needs Rails 7.2. On Rails 7.1 this subscriber raises `NoMethodError`, which fails the enqueue, so count from the event directly there.
+
+The payloads' IDs last for different lengths of time:
+
+- `class_name` and `action` don't change, and have few values. They're the only ones to use as metric labels.
+- `active_job_id` is the call's own on `coalesce.solid_queue`, and the owning job's on the other two events. The owning job has the `active_job_id` of its first call, across retries.
+- `job_id` is the job at that moment. A retry moves collected calls to a job with a new ID.
+- `call_id` exists only once a worker reads the calls, because admission inserts them in bulk. A `coalesce.solid_queue` event can't be matched to a later `call_id`.
 
 ## Bulk enqueues
 
@@ -302,7 +321,7 @@ Delivery is at-least-once. There's no per-call acknowledgement or per-call conti
 
 ## Deleted records
 
-Each call is deserialized on its own. If a call refers to a deleted record, that call is deleted and `drop_coalesced_call.solid_queue` is emitted, while the others run. If that happens to every call in the batch, `perform_batch` and its callbacks are skipped and the job finishes normally. The job never falls back to its own arguments: those calls stay until the job is destroyed, so a re-run after a crash skips them too. Any other deserialization error fails the job and keeps all of its calls.
+Each call is deserialized on its own. If a call refers to a deleted record, that call is deleted and `drop_coalesced_call.solid_queue` is emitted with `call_deleted: true`, while the others run. If that happens to every call in the batch, `perform_batch` and its callbacks are skipped and the job finishes normally. The job never falls back to its own arguments: those calls stay until the job is destroyed, so a re-run after a crash skips them too. Each of them emits the event with `call_deleted: false`, and again on that re-run, so a count of these events can be higher than the number of calls. Any other deserialization error fails the job and keeps all of its calls.
 
 ## Recurring jobs and concurrency limits
 
@@ -401,11 +420,49 @@ SolidQueue::CoalescedCall.waiting.count
 SolidQueue::CoalescedCall.waiting.minimum(:created_at) # nil when nothing is waiting
 ```
 
-`waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed. A job that's waiting to retry counts again, with all of its calls.
+`waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed. So it includes the calls of scheduled and blocked jobs, and a job that's waiting to retry counts again, with all of its calls. A preserved job's calls stop counting once it finishes, though they stay in the table until it's cleared.
 
-If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes. `waiting.minimum` reads a row for every waiting call, so it gets slower as the backlog grows: about 1 second at 1,000,000 waiting calls on PostgreSQL. See [the benchmarks](test/benchmarks/README.md).
+If you alert on the age of the oldest call, allow for the wait you expect, because scheduled calls sit there until their time comes. `waiting.minimum` reads a row for every waiting call, so it gets slower as the backlog grows: about 1 second at 1,000,000 waiting calls on PostgreSQL, against about 90 ms for `waiting.count`. See [the benchmarks](test/benchmarks/README.md). Run these from one process, once a minute, not per request or per job.
 
-To count outcomes, subscribe to `coalesce.solid_queue` and group by `action`. Job IDs and keys make poor metric labels, because there are too many of them.
+Failed collected jobs and the calls they hold are separate numbers. A failed job keeps all of its calls, so the second one shows how much work is stuck:
+
+```ruby
+SolidQueue::FailedExecution.where(job_id: SolidQueue::CoalescedCall.select(:job_id)).count
+SolidQueue::CoalescedCall.where(job_id: SolidQueue::FailedExecution.select(:job_id)).count
+```
+
+Batch sizes come from Active Job's own event. `coalesced_calls` is already loaded by then, so reading it adds no query. It's `nil` for a job that doesn't collect, and empty when every record is gone. Each attempt reports its batch, so a retry counts again. A batch whose size reaches `coalesce_batch_size` filled up. No event marks a batch being sealed, and one sealed because a configuration changed looks like any smaller batch.
+
+```ruby
+# Metrics stands in for whatever client you use. Keep job IDs and keys out of the
+# labels, because there are too many of them, and because your app defines the keys.
+ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
+  Metrics.increment("solid_queue.coalesce", tags: payload.slice(:class_name, :action))
+end
+
+ActiveSupport::Notifications.subscribe("drop_coalesced_call.solid_queue") do |*, payload|
+  Metrics.increment("solid_queue.coalesce.dropped", tags: payload.slice(:class_name, :call_deleted))
+end
+
+ActiveSupport::Notifications.subscribe("coalesced_calls_mismatch.solid_queue") do |*, payload|
+  Metrics.increment("solid_queue.coalesce.mismatched", tags: payload.slice(:class_name))
+end
+
+ActiveSupport::Notifications.subscribe("perform.active_job") do |*, payload|
+  if calls = payload[:job].coalesced_calls
+    Metrics.histogram("solid_queue.coalesce.batch_size", calls.size, tags: { class_name: payload[:job].class.name })
+  end
+end
+
+# Once a minute, from one process
+waiting = SolidQueue::CoalescedCall.waiting
+Metrics.gauge("solid_queue.coalesce.waiting", waiting.count)
+Metrics.gauge("solid_queue.coalesce.oldest_age", Time.current - (waiting.minimum(:created_at) || Time.current))
+Metrics.gauge("solid_queue.coalesce.failed_jobs", SolidQueue::FailedExecution.where(job_id: SolidQueue::CoalescedCall.select(:job_id)).count)
+Metrics.gauge("solid_queue.coalesce.failed_calls", SolidQueue::CoalescedCall.where(job_id: SolidQueue::FailedExecution.select(:job_id)).count)
+```
+
+The first subscriber counts provisional outcomes too. Use the one in [Enqueue outcomes](#enqueue-outcomes) if your app enqueues inside queue-database transactions.
 
 ## Testing
 
