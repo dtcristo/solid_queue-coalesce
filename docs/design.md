@@ -56,7 +56,7 @@ A retry of a collecting job creates a new job with the same `active_job_id`, and
 
 `perform_now` calls `start_coalesced_run` first, outside the `rescue_from` of Active Job's own `perform_now`, so `retry_on` can't swallow what it raises. The error reaches `ClaimedExecution#execute`, which turns it into a failed execution with its calls.
 
-A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone stays in the table until the job is destroyed, so a re-run after a crash can see that it has nothing to do.
+A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone is deleted if the batch has other calls to run. If every call's record is gone, the rows stay until the job is destroyed, so a re-run after a crash can see that it has nothing to do.
 
 ## Cost for other jobs
 
