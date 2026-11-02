@@ -36,7 +36,7 @@ end
 BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
 ```
 
-A job accepts calls until it starts. A call after that opens a new job, so no change gets missed, but two runs can overlap. Add [`limits_concurrency`](#coalesce-or-limits_concurrency) to stop that.
+A job accepts calls until it starts. A collecting job also stops at `max_calls`, 100 by default. A call after that opens a new job, so no change gets missed, but two runs can overlap. Add [`limits_concurrency`](#coalesce-or-limits_concurrency) to stop that.
 
 ## Features
 
