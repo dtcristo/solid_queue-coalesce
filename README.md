@@ -1,14 +1,32 @@
 # Solid Queue Coalesce
 
-Coalescing for [Solid Queue](https://github.com/rails/solid_queue). Many `perform_later` calls with the same key share one pending job, and that key is held only until the job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
+Dedupe, debounce and batch [Solid Queue](https://github.com/rails/solid_queue) jobs. Many `perform_later` calls with the same key share one pending job, and that key is held only until the job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
+
+Coalescing is what this gem calls merging duplicate calls into one pending job, and deduping, unique pending jobs, debouncing, leading-edge runs and batching are all ways to use it. It has nothing to do with SQL's `COALESCE`.
+
+It isn't strict uniqueness. A key is only held until a job starts, so this doesn't guarantee a job runs once ever, and it doesn't limit how many jobs run per period. It protects pending work and doesn't stop two runs from overlapping, so use `limits_concurrency` if you need that.
 
 It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
 
-Coalescing protects pending work. It doesn't stop two runs from overlapping, so use `limits_concurrency` if you need that.
-
 ## Table of contents
 
-- [Quick start](#quick-start)
+- [Recipes](#recipes)
+  - [Dedupe jobs with one pending job per key](#dedupe-jobs-with-one-pending-job-per-key)
+  - [Wait a fixed time for more calls](#wait-a-fixed-time-for-more-calls)
+  - [Debounce until activity stops](#debounce-until-activity-stops)
+  - [Debounce with a limit](#debounce-with-a-limit)
+  - [Run on the leading edge](#run-on-the-leading-edge)
+  - [Skip work while a run is busy](#skip-work-while-a-run-is-busy)
+  - [Batch every call together](#batch-every-call-together)
+  - [Limit how many calls a batch takes](#limit-how-many-calls-a-batch-takes)
+  - [Run a batch at N calls or T seconds](#run-a-batch-at-n-calls-or-t-seconds)
+  - [Debounce a batch](#debounce-a-batch)
+  - [Coalesce a recurring task](#coalesce-a-recurring-task)
+  - [Enqueue after your transaction commits](#enqueue-after-your-transaction-commits)
+  - [Enqueue many calls at once](#enqueue-many-calls-at-once)
+  - [Find out what happened to a call](#find-out-what-happened-to-a-call)
+  - [Test a coalesced job with another adapter](#test-a-coalesced-job-with-another-adapter)
+- [Before you rely on these](#before-you-rely-on-these)
 - [Compatibility](#compatibility)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -16,6 +34,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Collecting calls](#collecting-calls)
 - [Collecting jobs and scheduling](#collecting-jobs-and-scheduling)
 - [Debouncing](#debouncing)
+- [Scheduling timelines](#scheduling-timelines)
 - [Enqueue outcomes](#enqueue-outcomes)
 - [Bulk enqueues](#bulk-enqueues)
 - [Transactions](#transactions)
@@ -29,9 +48,31 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Testing](#testing)
 - [License](#license)
 
-## Quick start
+## Recipes
 
-Suppress calls while a job is pending. This is the default, `on_conflict: :discard`:
+Start from what you want to happen to a burst of calls:
+
+```text
+Run once, with the first call's arguments
+|-- as soon as a worker is free ....... Dedupe jobs with one pending job per key
+|-- after a fixed time ................ Wait a fixed time for more calls
+|-- once calls stop ................... Debounce until activity stops
+|-- once calls stop, or by a deadline . Debounce with a limit
+|-- now, then once more after the run . Run on the leading edge
+`-- now, unless a run is busy ......... Skip work while a run is busy
+
+Run once, with every call's arguments
+|-- after a fixed time ................ Batch every call together
+|-- at most N calls per run ........... Limit how many calls a batch takes
+|-- at N calls or T seconds ........... Run a batch at N calls or T seconds
+`-- once calls stop, or at N calls .... Debounce a batch
+```
+
+`Product`, `SearchIndex` and `InventorySynchronizer` stand in for your own code. [Install the gem](#installation) first.
+
+### Dedupe jobs with one pending job per key
+
+Use this for unique pending jobs, when a duplicate call adds nothing to the work already waiting.
 
 ```ruby
 class ReindexProductJob < ApplicationJob
@@ -41,9 +82,99 @@ class ReindexProductJob < ApplicationJob
     Product.find(product_id).reindex!
   end
 end
+
+ReindexProductJob.perform_later(product.id)
 ```
 
-Keep every call, and process them together with `on_conflict: :collect`:
+The first call runs as soon as a worker is free. Later calls get discarded until it starts, so the job only sees the first call's arguments. Pass an ID and read fresh data in `perform`. See [Usage](#usage) and [Keys](#keys).
+
+### Wait a fixed time for more calls
+
+Use this when a short delay lets more calls merge into the same run.
+
+```ruby
+ReindexProductJob.set(wait: 30.seconds).perform_later(product.id)
+```
+
+The job runs 30 seconds after the call that opened it, and later calls don't move it. A plain `perform_later` that arrives first opens a job that runs right away, so every caller needs the `wait`. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and the [timeline](#scheduling-timelines).
+
+### Debounce until activity stops
+
+Use this when work should wait for a burst to finish, such as reindexing after a run of edits.
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }, debounce: 30.seconds
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+ReindexProductJob.perform_later(product.id)                      # Runs 30 seconds after the last call
+ReindexProductJob.set(wait: 5.minutes).perform_later(product.id) # This call asks for 5 minutes instead
+```
+
+A plain `perform_later` waits for the window here. A key that never goes quiet can delay its job indefinitely, so the next recipe is usually the better choice. See [Debouncing](#debouncing) and the [timeline](#scheduling-timelines).
+
+### Debounce with a limit
+
+Use this when work should wait for a burst to finish, but can't wait forever.
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }, debounce: 30.seconds, max_wait: 5.minutes
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+ReindexProductJob.perform_later(product.id)
+```
+
+The job comes due 30 seconds after the last call, and no later than 5 minutes after it opened. See [Debouncing](#debouncing) and the [timeline](#scheduling-timelines).
+
+### Run on the leading edge
+
+Use this when the first call should run right away, and calls that arrive during the run should merge into one follow-up.
+
+```ruby
+class SyncInventoryJob < ApplicationJob
+  coalesce key: :global
+  limits_concurrency to: 1, key: :global, on_conflict: :block, duration: 30.minutes
+
+  def perform
+    InventorySynchronizer.sync!
+  end
+end
+
+SyncInventoryJob.perform_later
+```
+
+This has no time window. It merges calls while a job is pending, and the next call after the follow-up starts or finishes can run straight away. A cooldown after a run isn't possible, because the key is released when a job starts. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Skip work while a run is busy
+
+Use this when a call during a run adds nothing, because the next call will catch up. It doesn't need `coalesce`.
+
+```ruby
+class SyncInventoryJob < ApplicationJob
+  limits_concurrency to: 1, key: :global, on_conflict: :discard, duration: 30.minutes
+
+  def perform
+    InventorySynchronizer.sync!
+  end
+end
+
+SyncInventoryJob.perform_later
+```
+
+Calls during a run disappear, and nothing catches up afterwards. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Batch every call together
+
+Use this when every call carries data you need, and one run should process them all.
 
 ```ruby
 class BulkReindexProductsJob < ApplicationJob
@@ -58,24 +189,77 @@ end
 BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
 ```
 
-Wait until calls stop, with `debounce:`, and limit how long that can take with `max_wait:`:
+A plain `perform_later` that arrives first opens a job that runs right away, and the batch is as small as what got there in time. A retry runs all of the job's calls again, so `perform_calls` has to be idempotent. See [Collecting calls](#collecting-calls) and [Retries](#retries).
+
+### Limit how many calls a batch takes
+
+Use this when one run can only handle so much.
 
 ```ruby
-class ReindexProductJob < ApplicationJob
-  coalesce key: ->(product_id) { product_id }, debounce: 30.seconds, max_wait: 5.minutes
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 500
 
-  def perform(product_id)
-    Product.find(product_id).reindex!
+  def perform_calls(calls)
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+    SearchIndex.bulk_index(Product.where(id: product_ids))
   end
 end
+
+BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
 ```
 
-Allow one run at a time, with one pending follow-up, by combining `coalesce` with `limits_concurrency`:
+The limit is 100 if you don't set it. A full job still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
+
+### Run a batch at N calls or T seconds
+
+Use this when a batch should run as soon as it's full, and a quiet key still shouldn't wait forever.
+
+```ruby
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 100, on_full: :dispatch
+
+  def perform_calls(calls)
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+    SearchIndex.bulk_index(Product.where(id: product_ids))
+  end
+end
+
+BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
+```
+
+The `wait` is the T. A plain `perform_later` that arrives first runs right away, and so doesn't wait for N. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and the [timeline](#scheduling-timelines).
+
+### Debounce a batch
+
+Use this when a batch should run when it's quiet, when it's full or at the cap, whichever comes first.
+
+```ruby
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id },
+           on_conflict: :collect,
+           max_calls: 100,
+           on_full: :dispatch,
+           debounce: 30.seconds,
+           max_wait: 5.minutes
+
+  def perform_calls(calls)
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+    SearchIndex.bulk_index(Product.where(id: product_ids))
+  end
+end
+
+BulkReindexProductsJob.perform_later(product.account_id, product.id)
+```
+
+See [Debouncing](#debouncing).
+
+### Coalesce a recurring task
+
+Use this when a tick that finds a job still pending should add nothing.
 
 ```ruby
 class SyncInventoryJob < ApplicationJob
   coalesce key: :global
-  limits_concurrency to: 1, key: :global, on_conflict: :block, duration: 30.minutes
 
   def perform
     InventorySynchronizer.sync!
@@ -83,7 +267,81 @@ class SyncInventoryJob < ApplicationJob
 end
 ```
 
-Before you rely on these, know that:
+```yaml
+production:
+  sync_inventory:
+    class: SyncInventoryJob
+    schedule: every minute
+```
+
+The key is free once a run starts, so a slow run can overlap the next tick's. A recurring task can't use `:collect` or `debounce:`. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Enqueue after your transaction commits
+
+Use this when you enqueue inside an app transaction and Solid Queue has its own database. Without it, a pending job can start before your commit, read the old record, and never run again.
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  self.enqueue_after_transaction_commit = true
+
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+```
+
+On Rails 7.2, set it to `:always`. Rails 7.1 doesn't have this setting. See [Transactions](#transactions).
+
+### Enqueue many calls at once
+
+Use this to enqueue a list of calls with fewer locks and transactions than one `perform_later` each.
+
+```ruby
+jobs = products.map { |product| ReindexProductJob.new(product.id) }
+
+ActiveJob.perform_all_later(jobs)
+```
+
+If this raises, some calls can already be admitted. For all-or-nothing, wrap it in a transaction on the queue database:
+
+```ruby
+SolidQueue::Record.transaction do
+  ActiveJob.perform_all_later(jobs)
+end
+```
+
+That transaction holds every key's lock until it commits. See [Bulk enqueues](#bulk-enqueues).
+
+### Find out what happened to a call
+
+Use this when your code needs to know whether a call's data will reach a job.
+
+```ruby
+call = ReindexProductJob.perform_later(product.id)
+call.coalesce_status # :created, :discarded or :collected
+```
+
+Don't read this from `successfully_enqueued?`, which is `true` for a discarded call too. See [Enqueue outcomes](#enqueue-outcomes).
+
+### Test a coalesced job with another adapter
+
+Use this to test a job without Solid Queue's tables. Other adapters ignore `coalesce`, so each call runs on its own.
+
+```ruby
+class ReindexProductJobTest < ActiveJob::TestCase
+  test "enqueues a reindex" do
+    assert_enqueued_with(job: ReindexProductJob, args: [ 1 ]) do
+      ReindexProductJob.perform_later(1)
+    end
+  end
+end
+```
+
+Nothing merges here, so test how calls coalesce against Solid Queue. If your test environment sets `config.active_job.queue_adapter = :solid_queue`, Active Job's helpers use that adapter and this example raises, so set `:test` there. See [Testing](#testing).
+
+## Before you rely on these
 
 - The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
 - With `:collect`, a full job is sealed but still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
@@ -249,6 +507,18 @@ end
 
 A key has at most one open job, and any number of sealed ones. A call joins the open job, or opens a new one if there isn't one. The call that brings a job to `max_calls` seals it, and the next call opens a new job. With `max_calls: 100`, 250 calls make 3 jobs: 2 sealed with 100 calls each, and 1 open with 50. An open job also closes when it starts, so a call that arrives during the run opens a new job.
 
+Here's a key with `on_conflict: :collect` and `max_calls: 2`. A start only releases the key if that job still holds it:
+
+```text
+event              key held by   job 1     job 2     job 3
+call A             job 1         open
+call B, now full   nobody        sealed
+call C             job 2         sealed    open
+job 1 starts       job 2         running   open
+job 2 starts       nobody        running   running
+call D             job 3         running   running   open
+```
+
 By default, sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `max_calls` is the most calls one run takes, not a limit on how many can wait. The one exception comes from lowering it: a job already over the new size gets sealed as it is, and its run takes all its calls.
 
 With `on_full: :dispatch`, a job that fills doesn't wait for the rest of its delay:
@@ -328,6 +598,43 @@ With `:collect`, a job can run when it's quiet, when it's full, or at the cap, w
 Moving is best effort. A call skips a job whose scheduled execution is held by the dispatcher or a discard, so that job can run up to a window early. That's safe, because the key is held until the job starts, so the job still covers the call. A move also has to be more than 1 second later than the job's current time. That saves a hot key from writing on every call, and the dispatcher only polls every second by default.
 
 A retry doesn't coalesce, so `debounce` and `max_wait` don't apply to it.
+
+## Scheduling timelines
+
+Three calls with the same key, A, B and C, arrive at 0, 10 and 20 seconds. `run` marks when the job comes due, and workers still have to be free. With `:discard`, one job takes the calls and runs with A's arguments. With `:collect`, its run gets the calls drawn on its line.
+
+A fixed wait, with `.set(wait: 30.seconds)`. The first call sets the time:
+
+```text
+seconds   0    10   20   30   40   50
+calls     A    B    C
+job 1     A----B----C----run
+```
+
+A batch at N calls or T seconds, with `max_calls: 2`, `on_full: :dispatch` and `.set(wait: 30.seconds)`. B fills job 1, and C opens job 2 with its own wait:
+
+```text
+seconds   0    10   20   30   40   50
+calls     A    B    C
+job 1     A----run
+job 2               C--------------run
+```
+
+A debounce, with `debounce: 30.seconds`. Each call pushes the job back:
+
+```text
+seconds   0    10   20   30   40   50
+calls     A    B    C
+job 1     A----B----C--------------run
+```
+
+A debounce with a limit, with `debounce: 30.seconds` and `max_wait: 40.seconds`. C asks for 50 seconds, and the cap holds it to 40:
+
+```text
+seconds   0    10   20   30   40   50
+calls     A    B    C
+job 1     A----B----C---------run
+```
 
 ## Enqueue outcomes
 
@@ -504,6 +811,16 @@ production:
     class: SyncInventoryJob
     schedule: every minute
 ```
+
+Here's how the `:block` version takes calls. `.` is a blocked job and `=` is a running one:
+
+```text
+job 1   A ====run====|
+job 2        B .. C .|====run====|
+job 3                     D .....|====run====|
+```
+
+A runs right away. B arrives during that run and opens job 2, which blocks on the limit and holds the key, so C gets discarded into it. Job 2 starts when job 1 finishes, and that frees the key, so D opens job 3.
 
 These behave differently. With `:block`, one tick during a run creates a blocked job, later ticks are coalesced because that job hasn't started, and it runs when the current one finishes. With concurrency `:discard` alone, busy ticks disappear and nothing catches up afterwards.
 
