@@ -99,6 +99,7 @@ Run once, with every call's arguments:
 - [Once calls stop, or at N calls](#debounce-a-batch)
 - [At midnight](#run-a-batch-at-midnight)
 - [One batch at a time](#run-one-batch-at-a-time)
+- [Resuming after a deploy](#resume-a-long-batch)
 
 Run every call:
 
@@ -277,6 +278,33 @@ BulkReindexProductsJob.perform_later(product.account_id, product.id)
 ```
 
 The second batch blocks until the first finishes, and keeps collecting until it starts. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Resume a long batch
+
+Use this when a batch can outlast a worker's shutdown, and repeating it is expensive, such as with a paid or rate-limited bulk API. It needs Rails 8.1.
+
+```ruby
+class EmbedDocumentsJob < ApplicationJob
+  include ActiveJob::Continuable
+
+  coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 5000
+
+  def perform_calls(calls)
+    documents = Document.where(id: calls.map { |call| call.arguments.last })
+
+    step :embed do |step|
+      documents.in_batches(of: 100, start: step.cursor) do |batch|
+        Embeddings.index(batch)
+        step.advance! from: batch.maximum(:id)
+      end
+    end
+  end
+end
+
+EmbedDocumentsJob.set(wait: 5.minutes).perform_later(document.account_id, document.id)
+```
+
+A worker that's stopping interrupts the job at its next `advance!`. The job resumes with its calls and its cursor, and carries on after the last finished slice. Code outside `step` runs again, and so does a slice that hadn't reached `advance!`, so it still has to be idempotent. See [`ActiveJob::Continuation`](https://api.rubyonrails.org/classes/ActiveJob/Continuation.html) and [Retries](#retries).
 
 ### Run every call, one at a time
 
@@ -657,7 +685,7 @@ If Solid Queue shares your app's database, a `perform_later` inside your transac
 
 A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps its calls through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
 
-[Active Job handles retries](https://guides.rubyonrails.org/active_job_basics.html#retrying-or-discarding-failed-jobs), and Solid Queue keeps [failed jobs](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#failed-jobs-and-retries) until you retry or discard them. Delivery is at-least-once. There's no per-call acknowledgement or per-call continuation, so a retry runs all of the job's calls again and `perform_calls` has to be idempotent.
+[Active Job handles retries](https://guides.rubyonrails.org/active_job_basics.html#retrying-or-discarding-failed-jobs), and Solid Queue keeps [failed jobs](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#failed-jobs-and-retries) until you retry or discard them. Delivery is at-least-once. There's no per-call acknowledgement, so a retry runs all of the job's calls again and `perform_calls` has to be idempotent. A `step` cursor can skip finished work, as in [Resume a long batch](#resume-a-long-batch), but `perform_calls` still receives every call.
 
 ## Deleted records
 
