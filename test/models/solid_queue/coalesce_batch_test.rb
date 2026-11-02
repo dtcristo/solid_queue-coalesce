@@ -7,7 +7,16 @@ require "test_helper"
 class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
-  class DiscardJob < ApplicationJob
+  # Enqueues inside the batch's transaction, whatever the app's defaults say
+  class ImmediateJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
+  end
+
+  class OrdinaryJob < ImmediateJob
+    def perform(*); end
+  end
+
+  class DiscardJob < ImmediateJob
     coalesce key: ->(group, *) { group }
 
     def perform(*arguments)
@@ -15,7 +24,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     end
   end
 
-  class CollectJob < ApplicationJob
+  class CollectJob < ImmediateJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
     def perform_calls(calls)
@@ -110,7 +119,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     end
   end
 
-  class FailingAdmissionJob < ApplicationJob
+  class FailingAdmissionJob < ImmediateJob
     coalesce key: ->(group) { group }
 
     def concurrency_key
@@ -121,7 +130,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
   end
 
   # Sorts after the other classes in a bulk enqueue, so it's admitted last
-  class TrailingDeadlockJob < ApplicationJob
+  class TrailingDeadlockJob < ImmediateJob
     coalesce key: ->(group) { group }
 
     def concurrency_key
@@ -351,7 +360,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
   end
 
   test "perform_all_later in a batch coalesces and mixes with ordinary jobs" do
-    calls = [ DiscardJob.new("a", 1), DiscardJob.new("a", 2), CollectJob.new("c", 3), CollectJob.new("c", 4), CollectJob.new("c", 5), AddToBufferJob.new("x") ]
+    calls = [ DiscardJob.new("a", 1), DiscardJob.new("a", 2), CollectJob.new("c", 3), CollectJob.new("c", 4), CollectJob.new("c", 5), OrdinaryJob.new("x") ]
 
     batch = SolidQueue::Batch.enqueue { ActiveJob.perform_all_later(calls) }
 
@@ -444,7 +453,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     batch = held_open_batch
 
     assert_raises(ExpectedTestError) do
-      batch.enqueue { ActiveJob.perform_all_later(AddToBufferJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), FailingAdmissionJob.new("z")) }
+      batch.enqueue { ActiveJob.perform_all_later(OrdinaryJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), FailingAdmissionJob.new("z")) }
     end
 
     assert_batch_only_holds_its_first_job(batch)
@@ -454,7 +463,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     batch = held_open_batch
 
     assert_raises(SolidQueue::Job::EnqueueError) do
-      batch.enqueue { ActiveJob.perform_all_later(AddToBufferJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), TrailingDeadlockJob.new("z")) }
+      batch.enqueue { ActiveJob.perform_all_later(OrdinaryJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), TrailingDeadlockJob.new("z")) }
     end
 
     assert_equal [ :admission ], JobBuffer.values
