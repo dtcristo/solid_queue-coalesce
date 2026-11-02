@@ -1,6 +1,11 @@
-# Solid Queue Coalesce
+<div align="center">
+  <h1>Solid Queue Coalesce</h1>
+  <p>
+    <strong>Dedupe, debounce and batch <a href="https://github.com/rails/solid_queue">Solid Queue</a> jobs</strong>
+  </p>
+</div>
 
-Dedupe, debounce and batch [Solid Queue](https://github.com/rails/solid_queue) jobs. Many `perform_later` calls with the same key share one pending job, and that key is held only until the job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
+Many `perform_later` calls with the same key share one pending job, and that key is held only until the job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
 
 It isn't strict uniqueness. A job can run again for each new call after the last run started, and two runs can overlap. Use [`limits_concurrency`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls) alongside it to stop overlaps, and see [`coalesce` or `limits_concurrency`?](#coalesce-or-limits_concurrency) to choose.
 
