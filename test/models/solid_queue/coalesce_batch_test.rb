@@ -23,9 +23,6 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     end
   end
 
-  # Sorts after the other classes in a bulk enqueue, so it's admitted last
-  class TrailingCollectJob < CollectJob; end
-
   class DispatchingJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2, on_full: :dispatch
 
@@ -118,6 +115,18 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
 
     def concurrency_key
       raise ExpectedTestError
+    end
+
+    def perform(*); end
+  end
+
+  # Sorts after the other classes in a bulk enqueue, so it's admitted last
+  class TrailingDeadlockJob < ApplicationJob
+    coalesce key: ->(group) { group }
+
+    def concurrency_key
+      JobBuffer.add(:admission)
+      raise ActiveRecord::Deadlocked, "boom"
     end
 
     def perform(*); end
@@ -444,13 +453,11 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
   test "a deadlock inside a batch isn't retried, and leaves the batch as it was" do
     batch = held_open_batch
 
-    deadlocks = deadlocking_on(/INSERT INTO .solid_queue_coalesced_calls/) do
-      assert_raises(SolidQueue::Job::EnqueueError) do
-        batch.enqueue { ActiveJob.perform_all_later(AddToBufferJob.new("x"), CollectJob.new("c", 1), DiscardJob.new("a"), TrailingCollectJob.new("z")) }
-      end
+    assert_raises(SolidQueue::Job::EnqueueError) do
+      batch.enqueue { ActiveJob.perform_all_later(AddToBufferJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), TrailingDeadlockJob.new("z")) }
     end
 
-    assert_equal 1, deadlocks
+    assert_equal [ :admission ], JobBuffer.values
     assert_batch_only_holds_its_first_job(batch)
   end
 
