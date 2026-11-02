@@ -30,7 +30,7 @@ A job that gets a key has a `coalesce_on_conflict` marker in its payload. The ma
 
 The key is released when a job starts, fails, is destroyed, or finishes while `preserve_finished_jobs` is on. A row always means a live job, because a key left on a finished job would accept calls that never run.
 
-`start_coalesced_run` commits the release before it reads the calls, in a statement of its own. The read that finds the key sets the snapshot of a MySQL `REPEATABLE READ` transaction, so a read in the same transaction could miss calls committed while it waited for the lock. Only the first start finds a key, so only that start can compare `calls_count` with the rows it read, and emit `coalesced_calls_mismatch.solid_queue`.
+`start_coalesced_run` commits the release before it reads the calls, in a statement of its own. The read that finds the key sets the snapshot of a MySQL `REPEATABLE READ` transaction, so a read in the same transaction could miss calls committed while it waited for the lock.
 
 ## Lock order
 
