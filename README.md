@@ -5,11 +5,48 @@
   </p>
 </div>
 
-Many `perform_later` calls with the same key share one pending job, and that key is held only until the job starts. A call that arrives after that opens a new job, so anything that happens after a run has started is always covered by another run.
+Solid Queue Coalesce merges repeated `perform_later` calls with the same key into one job. You choose whether that job runs with the first call or with all of them.
 
-It isn't strict uniqueness. A job can run again for each new call after the last run started, and two runs can overlap. Use [`limits_concurrency`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls) alongside it to stop overlaps, and see [`coalesce` or `limits_concurrency`?](#coalesce-or-limits_concurrency) to choose.
+Dedupe when a repeat call adds nothing:
 
-It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+ReindexProductJob.perform_later(product.id)
+```
+
+Collect when every call carries data you need. The `wait` gives calls time to join:
+
+```ruby
+class BulkReindexProductsJob < ApplicationJob
+  coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect
+
+  def perform_calls(calls)
+    product_ids = calls.map { |call| call.arguments.last }.uniq
+    SearchIndex.bulk_index(Product.where(id: product_ids))
+  end
+end
+
+BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
+```
+
+A job accepts calls until it starts. A call after that opens a new job, so no change gets missed, but two runs can overlap. Add [`limits_concurrency`](#coalesce-or-limits_concurrency) to stop that.
+
+## Features
+
+- [Dedupe](#dedupe-jobs-with-one-pending-job-per-key). Calls with the same key share one pending job, which runs with the first call's arguments.
+- [Collect](#collect-calls-into-one-run). One job receives every call's arguments, for bulk APIs and digests.
+- [Debounce](#debounce-until-activity-stops). A job waits until calls stop, with an optional deadline.
+- [Throttle](#throttle-to-one-run-per-window). A key runs at most once per time window.
+- [Run on the leading edge](#run-on-the-leading-edge). The first call runs right away, and calls during that run merge into one follow-up.
+
+It also works with [recurring tasks](#coalesce-a-recurring-task), [bulk enqueues](#bulk-enqueues) and [Solid Queue batches](#solid-queue-batches).
 
 ## Table of contents
 
@@ -52,21 +89,7 @@ bin/rails generate solid_queue:coalesce:install
 bin/rails db:migrate
 ```
 
-Add `coalesce` to a job, with a [key](#keys) that says which calls belong together:
-
-```ruby
-class ReindexProductJob < ApplicationJob
-  coalesce key: ->(product_id) { product_id }
-
-  def perform(product_id)
-    Product.find(product_id).reindex!
-  end
-end
-
-ReindexProductJob.perform_later(product.id)
-```
-
-The first call creates a job. Later calls with that key get discarded until the job starts. Pick a [recipe](#recipes) for anything more specific.
+Add `coalesce` to a job, with a [key](#keys) that says which calls belong together, then pick a [recipe](#recipes).
 
 ### Where the migration goes
 
@@ -90,23 +113,22 @@ To upgrade from an earlier version, follow [UPGRADING.md](UPGRADING.md). [CHANGE
 
 Start from what you want to happen to a burst of calls.
 
-Run once, with the first call's arguments:
+Dedupe, so one run gets the first call's arguments:
 
 - [As soon as a worker is free](#dedupe-jobs-with-one-pending-job-per-key)
 - [At most once per time window](#throttle-to-one-run-per-window)
 - [Once calls stop, or by a deadline](#debounce-until-activity-stops)
 - [Now, then once more after the run](#run-on-the-leading-edge)
 - [On a schedule, without piling up](#coalesce-a-recurring-task)
-- [With a callback once a group of jobs is done](#dedupe-jobs-in-a-solid-queue-batch)
 
-Run once, with every call's arguments:
+Collect, so one run gets every call's arguments:
 
-- [After a fixed time](#batch-calls-together)
-- [At N calls or T seconds](#run-a-batch-at-n-calls-or-t-seconds)
-- [Once calls stop, or at N calls](#debounce-a-batch)
-- [At midnight](#run-a-batch-at-midnight)
-- [One batch at a time](#run-one-batch-at-a-time)
-- [Resuming after a deploy](#resume-a-long-batch)
+- [After a fixed time](#collect-calls-into-one-run)
+- [At N calls or T seconds](#collect-until-n-calls-or-t-seconds)
+- [Once calls stop, or at N calls](#collect-until-calls-stop)
+- [At midnight](#collect-calls-until-midnight)
+- [One job at a time](#run-one-collecting-job-at-a-time)
+- [Resuming after a deploy](#resume-a-long-collecting-job)
 
 Run every call:
 
@@ -195,35 +217,7 @@ production:
 
 A tick during a run creates one blocked job, later ticks merge into it, and it runs when the current run finishes. Without `limits_concurrency`, a slow run can overlap the next tick's. A recurring task can't use `:collect` or `debounce:`. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
 
-### Dedupe jobs in a Solid Queue batch
-
-Use this when a callback should run once a group of jobs is done, and jobs in that group can ask for the same work.
-
-```ruby
-class ReindexProductJob < ApplicationJob
-  coalesce key: ->(product_id) { product_id }
-
-  def perform(product_id)
-    Product.find(product_id).reindex!
-  end
-end
-
-class ImportSupplierJob < ApplicationJob
-  def perform(supplier_id)
-    Supplier.find(supplier_id).import_products.each do |product_id|
-      batch.enqueue { ReindexProductJob.perform_later(product_id) }
-    end
-  end
-end
-
-SolidQueue::Batch.enqueue(on_success: PublishCatalogJob) do
-  supplier_ids.each { |supplier_id| ImportSupplierJob.perform_later(supplier_id) }
-end
-```
-
-Each importer adds to the batch while it runs, and that running job keeps the batch open. Two importers that reach the same pending product share one reindex. If that reindex has already started, the later call opens a new job, so the later change still gets reindexed. `PublishCatalogJob` runs once, after the importers and every reindex are done. See [Solid Queue batches](#solid-queue-batches).
-
-### Batch calls together
+### Collect calls into one run
 
 Use this when every call carries data you need, and one run should process them.
 
@@ -240,17 +234,17 @@ end
 BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
 ```
 
-`max_calls` is the most calls one run takes, 100 if you don't set it. A full job still waits for its time, and the next call opens a new job. A plain `perform_later` that arrives first opens a job that runs right away, and the batch is as small as what got there in time. A retry runs all of the job's calls again, so `perform_calls` has to be idempotent. See [Collecting calls](#collecting-calls), [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Retries](#retries).
+`max_calls` is the most calls one run takes, 100 if you don't set it. A full job still waits for its time, and the next call opens a new job. A plain `perform_later` that arrives first opens a job that runs right away, and the run only gets the calls that arrived in time. A retry runs all of the job's calls again, so `perform_calls` has to be idempotent. See [Collecting calls](#collecting-calls), [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Retries](#retries).
 
-### Run a batch at N calls or T seconds
+### Collect until N calls or T seconds
 
-Use this when a batch should run as soon as it's full, and a quiet key still shouldn't wait forever.
+Use this when a collecting job should run as soon as it's full, and a quiet key still shouldn't wait forever.
 
 ```ruby
 class BulkReindexProductsJob < ApplicationJob
   coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 100, on_full: :dispatch
 
-  # perform_calls as in the batch recipe
+  # perform_calls as in the collect recipe
 end
 
 BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
@@ -258,9 +252,9 @@ BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, p
 
 The `wait` is the T. A plain `perform_later` that arrives first runs right away, and so doesn't wait for N. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and the [timeline](#scheduling-timelines).
 
-### Debounce a batch
+### Collect until calls stop
 
-Use this when a batch should run when it's quiet, when it's full or at the cap, whichever comes first.
+Use this when a collecting job should run when it's quiet, when it's full or at the cap, whichever comes first.
 
 ```ruby
 class BulkReindexProductsJob < ApplicationJob
@@ -271,7 +265,7 @@ class BulkReindexProductsJob < ApplicationJob
            debounce: 30.seconds,
            max_wait: 5.minutes
 
-  # perform_calls as in the batch recipe
+  # perform_calls as in the collect recipe
 end
 
 BulkReindexProductsJob.perform_later(product.account_id, product.id)
@@ -279,7 +273,7 @@ BulkReindexProductsJob.perform_later(product.account_id, product.id)
 
 See [Debouncing](#debouncing).
 
-### Run a batch at midnight
+### Collect calls until midnight
 
 Use this when calls collect through the day, and all of the work should happen overnight.
 
@@ -297,26 +291,26 @@ SendDailyDigestJob.set(wait_until: Date.tomorrow.midnight).perform_later(account
 
 The first call sets the time, and later calls join without moving it. Past `max_calls`, the next call opens another job for the same midnight, and the two can overlap. A call that arrives after midnight joins a job that hasn't started yet, and otherwise opens tomorrow's. Every caller needs the `wait_until`, because a plain `perform_later` that arrives first opens a job that runs right away. Payloads wait in the queue database all day, so pass IDs.
 
-### Run one batch at a time
+### Run one collecting job at a time
 
-Use this when batches for a key shouldn't overlap, such as writes to one account's records.
+Use this when a key's collecting jobs shouldn't overlap, such as writes to one account's records.
 
 ```ruby
 class BulkReindexProductsJob < ApplicationJob
   coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 100
   limits_concurrency to: 1, key: ->(account_id, *) { account_id }, on_conflict: :block, duration: 15.minutes
 
-  # perform_calls as in the batch recipe
+  # perform_calls as in the collect recipe
 end
 
 BulkReindexProductsJob.perform_later(product.account_id, product.id)
 ```
 
-The second batch blocks until the first finishes, and keeps collecting until it starts. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+The second job blocks until the first finishes, and keeps collecting until it starts. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
 
-### Resume a long batch
+### Resume a long collecting job
 
-Use this when a batch can outlast a worker's shutdown, and repeating it is expensive, such as with a paid or rate-limited bulk API. It needs Rails 8.1.
+Use this when a collecting job can outlast a worker's shutdown, and repeating it is expensive, such as with a paid or rate-limited bulk API. It needs Rails 8.1.
 
 ```ruby
 class EmbedDocumentsJob < ApplicationJob
@@ -382,6 +376,7 @@ With `coalesce`, a retry can't be discarded by the key, and a blocked retry wait
 
 ## Things to know
 
+- It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
 - The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
 - With `:collect`, a full job is sealed but still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
 - Coalesced jobs can overlap, because the key is free as soon as a job starts. Use `limits_concurrency` to prevent that. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
@@ -455,7 +450,7 @@ The key column is declared like the one on Solid Queue's semaphores, with the da
 
 ## Collecting calls
 
-With `on_conflict: :collect`, no call is suppressed. Every accepted call is stored, including the first, and belongs to one job from the moment it's enqueued. That job runs `perform_calls` with its calls, as in the [batch recipe](#batch-calls-together):
+With `on_conflict: :collect`, no call is suppressed. Every accepted call is stored, including the first, and belongs to one job from the moment it's enqueued. That job runs `perform_calls` with its calls, as in the [collect recipe](#collect-calls-into-one-run):
 
 ```ruby
 def perform_calls(calls)
@@ -515,7 +510,7 @@ call D             job 3         running   running   open
 
 By default, sealing doesn't dispatch anything. A full job still waits for its time, and it runs like any other job. `max_calls` is the most calls one run takes, not a limit on how many can wait. The one exception comes from lowering it: a job already over the new size gets sealed as it is, and its run takes all its calls.
 
-With `on_full: :dispatch`, a job that fills doesn't wait for the rest of its delay, as in [this recipe](#run-a-batch-at-n-calls-or-t-seconds). With `.set(wait: 30.seconds)`:
+With `on_full: :dispatch`, a job that fills doesn't wait for the rest of its delay, as in [this recipe](#collect-until-n-calls-or-t-seconds). With `.set(wait: 30.seconds)`:
 
 A job that fills in 5 seconds becomes ready as the call that filled it commits, and one that doesn't fill runs at 30 seconds. The job's `scheduled_at` moves to that moment. Workers still have to be free, and if `limits_concurrency` has no room the job blocks until it does. This only matters for a delayed job, because any other job isn't waiting for its time.
 
@@ -555,7 +550,7 @@ Only a scheduled job moves. A job that's ready, blocked or claimed stays as it i
 
 `max_wait` only sets when a job comes due. It doesn't promise when the job runs: workers have to be free, and `limits_concurrency` can block the job, because Solid Queue applies [concurrency limits to scheduled jobs](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#scheduled-jobs) when they're due. It's optional, but without it a key that keeps getting calls can delay its job indefinitely.
 
-The clock starts when a job opens, and each open job has its own. A new batch after one fills gets a full `max_wait`, and so does a new job after one starts.
+The clock starts when a job opens, and each open job has its own. A new job after one fills gets a full `max_wait`, and so does a new job after one starts.
 
 With `:collect`, a job can run when it's quiet, when it's full, or at the cap, whichever comes first:
 
@@ -578,7 +573,7 @@ calls     A    B    C
 job 1     A----B----C----run
 ```
 
-A batch at N calls or T seconds, with `max_calls: 2`, `on_full: :dispatch` and `.set(wait: 30.seconds)`. B fills job 1, and C opens job 2 with its own wait:
+Collecting until N calls or T seconds, with `max_calls: 2`, `on_full: :dispatch` and `.set(wait: 30.seconds)`. B fills job 1, and C opens job 2 with its own wait:
 
 ```text
 seconds   0    10   20   30   40   50
@@ -720,7 +715,7 @@ If Solid Queue shares your app's database, a `perform_later` inside your transac
 
 A retry is the same work continuing, not a new candidate for coalescing. It can't be suppressed by a pending job, and later calls can't join it. A job keeps its calls through `retry_on`, `rescue_from` with `retry_job`, an `ActiveJob::Continuable` resume, a manual retry of a failed job, and a re-run after its worker was released. If a retry can't be enqueued, the job fails and keeps its calls.
 
-[Active Job handles retries](https://guides.rubyonrails.org/active_job_basics.html#retrying-or-discarding-failed-jobs), and Solid Queue keeps [failed jobs](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#failed-jobs-and-retries) until you retry or discard them. Delivery is at-least-once. There's no per-call acknowledgement, so a retry runs all of the job's calls again and `perform_calls` has to be idempotent. A `step` cursor can skip finished work, as in [Resume a long batch](#resume-a-long-batch), but `perform_calls` still receives every call.
+[Active Job handles retries](https://guides.rubyonrails.org/active_job_basics.html#retrying-or-discarding-failed-jobs), and Solid Queue keeps [failed jobs](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#failed-jobs-and-retries) until you retry or discard them. Delivery is at-least-once. There's no per-call acknowledgement, so a retry runs all of the job's calls again and `perform_calls` has to be idempotent. A `step` cursor can skip finished work, as in [Resume a long collecting job](#resume-a-long-collecting-job), but `perform_calls` still receives every call.
 
 ## Deleted records
 
@@ -750,13 +745,41 @@ The concurrency key of a coalesced job is the one computed for the call that cre
 
 ## Solid Queue batches
 
-A coalesced job can be part of a [`SolidQueue::Batch`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs), as in [this recipe](#dedupe-jobs-in-a-solid-queue-batch). Batches need Solid Queue's own optional migration, and nothing more from this gem.
+A coalesced job can be part of a [`SolidQueue::Batch`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs). Batches need Solid Queue's own optional migration, and nothing more from this gem.
+
+Use this when a callback should run once a group of jobs is done, and jobs in that group can ask for the same work.
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+class ImportSupplierJob < ApplicationJob
+  def perform(supplier_id)
+    Supplier.find(supplier_id).import_products.each do |product_id|
+      batch.enqueue { ReindexProductJob.perform_later(product_id) }
+    end
+  end
+end
+
+SolidQueue::Batch.enqueue(on_success: PublishCatalogJob) do
+  supplier_ids.each { |supplier_id| ImportSupplierJob.perform_later(supplier_id) }
+end
+```
+
+Each importer adds to the batch while it runs, and that running job keeps the batch open. Two importers that reach the same pending product share one reindex. If that reindex has already started, the later call opens a new job, so the later change still gets reindexed. `PublishCatalogJob` runs once, after the importers and every reindex are done.
+
+A few rules apply:
 
 - Calls with the same key share one job, and that job belongs to that batch alone. The same key in another batch, or outside a batch, runs separately. `limits_concurrency` isn't scoped to a batch, so it still stops those jobs overlapping.
 - `total_jobs` counts jobs, not calls. A call that joins a job adds nothing, and the job after a `:collect` job seals counts as another.
 - A batched key starts with its batch, as in `SolidQueue::Batch/7/ReindexProductJob/42`. `coalesce.solid_queue` reports it that way, and the prefix counts towards MySQL's 255 characters.
 - A running job adds to its batch with `batch.enqueue`. Without that a call isn't in the batch, because Solid Queue doesn't set a current batch while a job runs. Adding from anywhere else races the batch finishing, and raises `SolidQueue::Batch::AlreadyFinished` if it lost.
-- `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. It raises `SolidQueue::Job::EnqueueError` and rolls back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the recipe.
+- `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. It raises `SolidQueue::Job::EnqueueError` and rolls back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the example.
 - With `enqueue_after_transaction_commit`, which `load_defaults 8.2` turns on, calls wait until the block commits. A failure then can't roll the block back, and a deferred `perform_all_later` only keeps the batch for jobs built inside the block. Solid Queue's ordinary jobs do the same.
 - Bulk discards delete jobs without callbacks, so a batch left with no jobs finishes when Solid Queue's batch maintenance next runs.
 - A callback job isn't part of its batch, so a coalesced one uses the key it would use outside a batch.
