@@ -4,7 +4,7 @@
 # details of the version pinned in the gemspec.
 module SolidQueue
   module Coalesce
-    module Patches
+    module Patches # :nodoc: all
       # Prepended rather than added to the adapter, because RecurringTask calls
       # Job.enqueue directly.
       module Enqueuing
@@ -134,15 +134,15 @@ class SolidQueue::LogSubscriber
   # This one fires for every call, so above debug it shouldn't build a line for each
   subscribe_log_level :coalesce, :debug
 
-  def coalesce(event)
+  def coalesce(event) # :nodoc:
     debug formatted_event(event, action: "Coalesce call", **event.payload.slice(:job_id, :active_job_id, :class_name), outcome: event.payload[:status])
   end
 
-  def coalesced_calls_mismatch(event)
+  def coalesced_calls_mismatch(event) # :nodoc:
     warn formatted_event(event, action: "Coalesced calls don't match the key's count", **event.payload.slice(:job_id, :active_job_id, :class_name, :expected, :actual))
   end
 
-  def drop_coalesced_call(event)
+  def drop_coalesced_call(event) # :nodoc:
     warn formatted_event(event, action: "Skip coalesced call for a deleted record", **event.payload.slice(:call_id, :job_id, :active_job_id, :class_name, :exception_class))
   end
 end

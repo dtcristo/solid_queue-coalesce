@@ -13,6 +13,18 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class KeyedJob < ApplicationJob
+    coalesce key: ->(value) { value }
+
+    def perform(_value); end
+  end
+
+  class OtherKeyedJob < ApplicationJob
+    coalesce key: ->(value) { value }
+
+    def perform(_value); end
+  end
+
   class CollectingRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }, on_conflict: :collect
 
@@ -130,6 +142,24 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     def perform(*)
     end
+  end
+
+  test "an integer and its string give the same key" do
+    assert_equal [ :created, :discarded ], [ 1, "1" ].map { |value| KeyedJob.perform_later(value).coalesce_status }
+  end
+
+  test "an array's items make a composite key, and a slash in an item collides with two items" do
+    assert_equal [ :created, :discarded, :created ], [ [ "a", "b" ], [ "a/b" ], [ "a", "c" ] ].map { |value| KeyedJob.perform_later(value).coalesce_status }
+  end
+
+  test "two classes can't share a key" do
+    assert_equal [ :created, :created ], [ KeyedJob, OtherKeyedJob ].map { |job_class| job_class.perform_later("a").coalesce_status }
+  end
+
+  test "a key Proc that returns nil merges all of those calls" do
+    first, second = [ nil, nil ].map { |value| KeyedJob.perform_later(value) }
+
+    assert_equal [ :created, :discarded ], [ first.coalesce_status, second.coalesce_status ]
   end
 
   test "the first call creates a job, and says so" do
