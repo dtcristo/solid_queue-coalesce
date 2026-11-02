@@ -33,8 +33,8 @@ Adds debouncing with `debounce:` and `max_wait:`, and batches that run as soon a
 - Each collected call is rebuilt through the job's own `deserialize` and `deserialize_arguments`. ([#17](https://github.com/dtcristo/solid_queue-coalesce/pull/17))
 - `SolidQueue::CoalescedCall.waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed. ([#4](https://github.com/dtcristo/solid_queue-coalesce/pull/4), [#19](https://github.com/dtcristo/solid_queue-coalesce/pull/19))
 - Jobs that aren't coalesced no longer read the keys table when they finish, fail or get destroyed. ([#18](https://github.com/dtcristo/solid_queue-coalesce/pull/18))
-- The README starts with getting started, then recipes for deduping, debouncing and batching, with diagrams for timing, guidance on `coalesce` and `limits_concurrency`, and links to Solid Queue's docs. ([#29](https://github.com/dtcristo/solid_queue-coalesce/pull/29), [#PR](https://github.com/dtcristo/solid_queue-coalesce/pull/PR))
-- The public API has RDoc comments, and the gem links to its [rubydoc.info](https://www.rubydoc.info/gems/solid_queue-coalesce) documentation. ([#PR](https://github.com/dtcristo/solid_queue-coalesce/pull/PR))
+- The README starts with getting started, then recipes for deduping, debouncing and batching, with diagrams for timing, guidance on `coalesce` and `limits_concurrency`, and links to Solid Queue's docs. ([#29](https://github.com/dtcristo/solid_queue-coalesce/pull/29), [#31](https://github.com/dtcristo/solid_queue-coalesce/pull/31))
+- The public API has RDoc comments, and the gem links to its [rubydoc.info](https://www.rubydoc.info/gems/solid_queue-coalesce) documentation. ([#31](https://github.com/dtcristo/solid_queue-coalesce/pull/31))
 
 ### Fixed
 
