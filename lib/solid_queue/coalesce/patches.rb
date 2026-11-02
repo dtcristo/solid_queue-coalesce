@@ -12,7 +12,7 @@ module SolidQueue
           coalesced_jobs, other_jobs = active_jobs.partition(&:coalesced_enqueue?)
           return super if coalesced_jobs.empty?
 
-          coalesced_jobs.each { |active_job| active_job.scheduled_at ||= Time.current }
+          coalesced_jobs.each { |active_job| active_job.scheduled_at = active_job.coalesced_scheduled_at(active_job.scheduled_at) }
           ensure_coalescible(coalesced_jobs)
 
           prepared_calls = prepare_all_coalesced(coalesced_jobs)
@@ -23,9 +23,10 @@ module SolidQueue
           active_jobs.count(&:successfully_enqueued?)
         end
 
-        def enqueue(active_job, scheduled_at: Time.current)
+        # Only the adapter's enqueue_at passes a time, so a plain call passes none
+        def enqueue(active_job, **options)
           if active_job.coalesced_enqueue?
-            active_job.scheduled_at = scheduled_at
+            active_job.scheduled_at = active_job.coalesced_scheduled_at(options[:scheduled_at])
             ensure_coalescible([ active_job ])
             enqueue_coalesced(active_job.coalesce_key, [ active_job ])
           elsif active_job.class.coalesce_key
@@ -95,6 +96,7 @@ module SolidQueue
 
         included do
           validate :ensure_job_class_not_collecting
+          validate :ensure_job_class_not_debounced
         end
 
         private
@@ -103,6 +105,14 @@ module SolidQueue
           def ensure_job_class_not_collecting
             if class_name.present? && job_class&.try(:coalesce_collect?)
               errors.add :class_name, :collecting, message: "can't be a job that uses `coalesce` with `on_conflict: :collect`"
+            end
+          end
+
+          # A tick passes no time, so the window applies, and a tick that joins pushes
+          # the job back. With an interval shorter than the window it would never run.
+          def ensure_job_class_not_debounced
+            if class_name.present? && job_class&.try(:coalesce_debounce)
+              errors.add :class_name, :debounced, message: "can't be a job that uses `coalesce` with `debounce`"
             end
           end
       end

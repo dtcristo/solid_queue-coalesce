@@ -15,6 +15,7 @@ Coalescing protects pending work. It doesn't stop two runs from overlapping, so 
 - [Keys](#keys)
 - [Collecting calls](#collecting-calls)
 - [Collecting jobs and scheduling](#collecting-jobs-and-scheduling)
+- [Debouncing](#debouncing)
 - [Enqueue outcomes](#enqueue-outcomes)
 - [Bulk enqueues](#bulk-enqueues)
 - [Transactions](#transactions)
@@ -57,6 +58,18 @@ end
 BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, product.id)
 ```
 
+Wait until calls stop, with `debounce:`, and limit how long that can take with `max_wait:`:
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }, debounce: 30.seconds, max_wait: 5.minutes
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+```
+
 Allow one run at a time, with one pending follow-up, by combining `coalesce` with `limits_concurrency`:
 
 ```ruby
@@ -72,7 +85,7 @@ end
 
 Before you rely on these, know that:
 
-- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
+- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
 - With `:collect`, a full job is sealed but still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
 - Coalesced jobs can overlap, because the key is free as soon as a job starts. Use `limits_concurrency` to prevent that. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
 - `ActiveJob.perform_all_later` can admit some calls and then raise, unless you wrap it in a queue-database transaction. See [Bulk enqueues](#bulk-enqueues).
@@ -96,9 +109,9 @@ CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 | `perform_all_later` | Coalesces in sorted key order, with one transaction per discard admission or collecting job. See [Bulk enqueues](#bulk-enqueues) |
 | `perform_now` | Runs the call on its own. `perform_calls` receives one call |
 | `SolidQueue::Batch` | Raises `SolidQueue::Job::CoalescedInBatchError` |
-| Recurring tasks | `:discard` works. `:collect` makes the task's configuration invalid |
+| Recurring tasks | `:discard` works. `:collect` and `debounce:` make the task's configuration invalid |
 | Retries | Keep the job's calls, and never coalesce. See [Retries](#retries) |
-| Other adapters | Ignore `coalesce`. Each call runs on its own. See [Testing](#testing) |
+| Other adapters | Ignore `coalesce`, including `debounce:` and `max_wait:`. Each call runs on its own. See [Testing](#testing) |
 
 ## Installation
 
@@ -144,18 +157,22 @@ class ReindexProductJob < ApplicationJob
 end
 ```
 
-The default is `on_conflict: :discard`. A call that finds a pending job for its key is suppressed, and the pending job keeps its own schedule, queue, priority and arguments. The key is free again the moment that job starts, so a call that arrives during the run creates the next pending job.
+The default is `on_conflict: :discard`. A call that finds a pending job for its key is suppressed, and the pending job keeps its own queue, priority and arguments. It keeps its schedule too, unless the class uses [`debounce:`](#debouncing). The key is free again the moment that job starts, so a call that arrives during the run creates the next pending job.
 
 The options are:
 
 ```ruby
-coalesce key:, on_conflict: :discard, max_calls: nil, on_full: nil
+coalesce key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: nil, max_wait: nil
 ```
 
 - `key` is required. See [Keys](#keys).
 - `on_conflict` is `:discard` or `:collect`. Anything else raises `ArgumentError`.
 - `max_calls` is only allowed with `:collect`. It's a positive integer, 100 by default.
 - `on_full` is only allowed with `:collect`. It's `:wait`, the default, or `:dispatch`. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
+- `debounce` is a positive duration. Each call pushes a pending job back to that long from now. See [Debouncing](#debouncing).
+- `max_wait` is a duration greater than `debounce`, and needs `debounce`. It's optional. See [Debouncing](#debouncing).
+
+An invalid option raises `ArgumentError` when the class loads.
 
 ## Keys
 
@@ -257,7 +274,7 @@ Treat it as best effort. A full job keeps its original time if a discard is hold
 
 `:dispatch` adds a lock on the scheduled execution to the call that fills a job. With `use_skip_locked` off, that call can deadlock with a discard of the same job. The call retries unless it's inside your own transaction, and a discard raises the error to its caller.
 
-Each job takes its schedule, queue, priority, concurrency key and own arguments from its first call. Calls that join don't move it, even if they asked for a later time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away.
+Each job takes its schedule, queue, priority, concurrency key and own arguments from its first call. Calls that join don't move it, even if they asked for a later time. So any caller that might arrive first needs the right `wait`: a plain `perform_later` opens a job that runs right away. [`debounce:`](#debouncing) changes both rules.
 
 A key's jobs are separate, and this has consequences:
 
@@ -268,6 +285,49 @@ A key's jobs are separate, and this has consequences:
 Enqueues for the same key take turns, because each one holds an exclusive lock on the key's row until its transaction commits. Inside your own transaction, that lock lasts until your commit, so a key used in a 50ms transaction takes about 20 calls per second, however many connections you add. Keep those transactions short, or enqueue after them.
 
 To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up to a full job's calls under one lock. It keeps the order of each key's calls, and uses one transaction per job. [Bulk enqueues](#bulk-enqueues) covers what happens if it fails partway.
+
+## Debouncing
+
+By default a job takes its time from its first call, so during a burst it can run partway through and need another run straight after. With `debounce:`, each call pushes the pending job back, so it runs once calls have stopped:
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }, debounce: 30.seconds, max_wait: 5.minutes
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+ReindexProductJob.perform_later(product.id)
+```
+
+A job comes due 30 seconds after the last call, and no later than 5 minutes after it opened. It works with `on_conflict: :discard` and `:collect`, and `coalesce_status` reports the same outcomes as before. It adds no table, column, timer or process: the job's `scheduled_at` holds the time, and the dispatcher fires it as usual.
+
+A call's time comes from these rules, in this order:
+
+1. `.set(wait:)` or `.set(wait_until:)` replaces the window for that call.
+2. Otherwise, the call's time is now plus `debounce`. On a debounced class, a plain `perform_later` waits for the window instead of running right away.
+3. `max_wait` caps both. A call that creates a job can't ask for more than `max_wait` from now, and a call that joins can't move the job past `max_wait` from when it opened. A longer `.set(wait:)` gets capped without raising.
+
+`perform_all_later` follows the same rules. One admission moves a job once, to the latest time among its calls.
+
+A job only moves later. A call with a shorter wait joins without pulling the job forward, so `.set(wait: 0.seconds)` on a job that's already waiting doesn't run it sooner. The same call opening a new job makes it ready straight away, and nothing moves it after that.
+
+Only a scheduled job moves. A job that's ready, blocked or claimed stays as it is, and the call joins as usual. A concurrency-limited job takes its semaphore when it comes due, so a job that's sliding doesn't hold up others.
+
+`max_wait` only sets when a job comes due. It doesn't promise when the job runs: workers have to be free, and `limits_concurrency` can block the job. It's optional, but without it a key that keeps getting calls can delay its job indefinitely.
+
+The clock starts when a job opens, and each open job has its own. A new batch after one fills gets a full `max_wait`, and so does a new job after one starts.
+
+With `:collect`, a job can run when it's quiet, when it's full, or at the cap, whichever comes first:
+
+- With `on_full: :dispatch`, the call that fills a job dispatches it. It doesn't move the job.
+- With `on_full: :wait`, the call that fills a job moves it, and sealing it keeps that time. Nothing moves a sealed job.
+
+Moving is best effort. A call skips a job whose scheduled execution is held by the dispatcher or a discard, so that job can run up to a window early. That's safe, because the key is held until the job starts, so the job still covers the call. A move also has to be more than 1 second later than the job's current time. That saves a hot key from writing on every call, and the dispatcher only polls every second by default.
+
+A retry doesn't coalesce, so `debounce` and `max_wait` don't apply to it.
 
 ## Enqueue outcomes
 
@@ -402,7 +462,7 @@ Each call is deserialized on its own. If a call refers to a deleted record, that
 
 ## Recurring jobs and concurrency limits
 
-A recurring task can use `:discard`. A tick that finds a pending job is suppressed and not recorded in `solid_queue_recurring_executions`. A recurring task can't use `:collect`: its configuration is invalid.
+A recurring task can use `:discard`. A tick that finds a pending job is suppressed and not recorded in `solid_queue_recurring_executions`. A recurring task can't use `:collect` or `debounce:`: its configuration is invalid. A tick passes no time, so it would get the window, and an interval shorter than the window could stop the job from ever running.
 
 To skip busy ticks, use a concurrency limit on its own. This suits a job that syncs full state, and it doesn't need coalescing:
 
@@ -474,6 +534,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Rename or remove the class | The job fails with its calls |
 | Change `max_calls` | Waiting calls aren't touched. An open job that's now over the new size gets sealed by the next call |
 | Change `on_full` | The class that enqueues the call that fills a job decides, so there's nothing to drain. Jobs already sealed keep their time |
+| Change `debounce` or `max_wait` | The class that enqueues each call decides, so there's nothing to drain. A job that has moved keeps its time |
 | Change the key | Waiting jobs still run their calls. New calls open a job under the new key |
 
 Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
@@ -582,7 +643,7 @@ The first subscriber counts provisional outcomes too. Use the one in [Notificati
 
 ## Testing
 
-Everything above needs the Solid Queue adapter, so other adapters ignore `coalesce`. With the test adapter, the inline adapter or `perform_now`, each call runs on its own, and a collecting job's `perform_calls` receives one call whose `id` is `nil`. `assert_enqueued_with(args: [ product_id ])` still works, and the Solid Queue tables aren't touched.
+Everything above needs the Solid Queue adapter, so other adapters ignore `coalesce`. They ignore `debounce` and `max_wait` too, so a plain call runs right away, and an explicit `.set(wait:)` still applies. With the test adapter, the inline adapter or `perform_now`, each call runs on its own, and a collecting job's `perform_calls` receives one call whose `id` is `nil`. `assert_enqueued_with(args: [ product_id ])` still works, and the Solid Queue tables aren't touched.
 
 That call builds `job_data` when you read it, so `perform_now` with arguments that can't be serialized only raises if you read it.
 

@@ -22,7 +22,7 @@ module SolidQueue
           return collect_coalesced(key, active_jobs, payloads || active_jobs.map(&:serialize)) if active_jobs.first.class.coalesce_collect?
 
           enqueued_job, open_job_id = raising_enqueue_errors do
-            retrying_deadlocks { admit_discarding(key, active_jobs.first) }
+            retrying_deadlocks { admit_discarding(key, active_jobs) }
           end
 
           record_coalesced(key, active_jobs, enqueued_job&.persisted?, open_job_id)
@@ -117,20 +117,21 @@ module SolidQueue
           # call waiting on the key holds the same share lock, and upgrading it deadlocks
           # with all of them. Inside the caller's own transaction it can't be outside,
           # so that deadlock can reach the caller, as in retrying_deadlocks.
-          def admit_discarding(key, active_job)
+          def admit_discarding(key, active_jobs)
             loop do
-              admitted = transaction { admit_unless_collecting(key, active_job) }
+              admitted = transaction { admit_unless_collecting(key, active_jobs) }
               return admitted if admitted
 
               transaction { CoalesceKey.seal_collecting(key) }
             end
           end
 
-          def admit_unless_collecting(key, active_job)
+          def admit_unless_collecting(key, active_jobs)
             coalesce_key = CoalesceKey.admit(key)
 
             unless coalesce_key.collecting?
-              enqueued_job = create_for_coalesce_key(coalesce_key, active_job) if coalesce_key.job_id.nil?
+              enqueued_job = create_for_coalesce_key(coalesce_key, active_jobs.first) if coalesce_key.job_id.nil?
+              debounce_coalesced(coalesce_key, coalesce_key.job_id, enqueued_job ? active_jobs.drop(1) : active_jobs)
 
               [ enqueued_job, coalesce_key.job_id ]
             end
@@ -187,9 +188,51 @@ module SolidQueue
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
               coalesce_key.fill(job_id, calls.size, max_calls)
-              dispatch_full(job_id) if coalesce_key.destroyed? && calls.first.first.class.coalesce_on_full == :dispatch
+
+              if coalesce_key.destroyed? && calls.first.first.class.coalesce_on_full == :dispatch
+                dispatch_full(job_id)
+              else
+                debounce_coalesced(coalesce_key, job_id, calls.drop(created_job ? 1 : 0).map(&:first))
+              end
 
               [ calls.size, created_job, job_id ]
+            end
+          end
+
+          # The time moves too, or retrying the job after it fails would wait for the old one.
+          def dispatch_full(job_id)
+            scheduled = lock_scheduled(ScheduledExecution.where(job_id: job_id))
+
+            if scheduled.any?
+              where(id: scheduled).update_all(scheduled_at: Time.current)
+              ScheduledExecution.dispatch_jobs(scheduled)
+            end
+          end
+
+          # The calls that joined the job move it once, to the latest of their times,
+          # capped at max_wait from when its key opened. Each open job has its own key,
+          # so each has its own clock. A sealed job has no key, so nothing moves it again.
+          def debounce_coalesced(coalesce_key, job_id, joined_jobs)
+            job_class = joined_jobs.first&.class
+
+            if job_id && job_class&.coalesce_debounce
+              scheduled_at = joined_jobs.map(&:scheduled_at).max
+              scheduled_at = [ scheduled_at, coalesce_key.created_at + job_class.coalesce_max_wait ].min if job_class.coalesce_max_wait
+
+              move_later(job_id, scheduled_at)
+            end
+          end
+
+          # Only an execution more than a second before the new time matches. That keeps
+          # moves later-only, and saves a hot key from writing on every call. The time
+          # moves on the job too, because a failed job's retry goes by the job's. If this
+          # skips a row that's held, the job runs early, and the key still covers the call.
+          def move_later(job_id, scheduled_at)
+            scheduled = lock_scheduled(ScheduledExecution.where(job_id: job_id, scheduled_at: ...(scheduled_at - 1.second)))
+
+            if scheduled.any?
+              where(id: scheduled).update_all(scheduled_at: scheduled_at)
+              ScheduledExecution.where(job_id: scheduled).update_all(scheduled_at: scheduled_at)
             end
           end
 
@@ -197,17 +240,9 @@ module SolidQueue
           # nothing to do. SKIP LOCKED because we hold the key, and a discard holds the
           # execution while it waits for the key. Whoever holds the row is dispatching
           # or discarding the job already. On MySQL, locking a row that isn't there takes
-          # a gap lock that blocks other jobs being scheduled, so it checks first. The
-          # time moves too, or retrying the job after it fails would wait for the old one.
-          def dispatch_full(job_id)
-            if ScheduledExecution.exists?(job_id: job_id)
-              scheduled = ScheduledExecution.where(job_id: job_id).non_blocking_lock.pluck(:job_id)
-
-              if scheduled.any?
-                where(id: scheduled).update_all(scheduled_at: Time.current)
-                ScheduledExecution.dispatch_jobs(scheduled)
-              end
-            end
+          # a gap lock that blocks other jobs being scheduled, so it checks first.
+          def lock_scheduled(executions)
+            executions.exists? ? executions.non_blocking_lock.pluck(:job_id) : []
           end
 
           # Not attributes_from_active_job, which serializes the call again, and that
