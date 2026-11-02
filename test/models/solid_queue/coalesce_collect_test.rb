@@ -878,7 +878,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     RecordsCollectedJob.perform_later(@a)
     RecordsCollectedJob.perform_later(@b)
     job = SolidQueue::Job.sole
-    dropped_id = SolidQueue::CoalescedCall.order(:id).first.id
+    skipped_id = SolidQueue::CoalescedCall.order(:id).first.id
     @a.destroy!
 
     events = SolidQueue.with(preserve_finished_jobs: true) do
@@ -888,10 +888,10 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal [ [ [ @b ] ] ], JobBuffer.values
     assert_empty SolidQueue::FailedExecution.all
     assert_equal 2, job.coalesced_calls.count
-    assert SolidQueue::CoalescedCall.exists?(dropped_id)
+    assert SolidQueue::CoalescedCall.exists?(skipped_id)
 
     payload = events.sole.payload
-    assert_equal dropped_id, payload[:call_id]
+    assert_equal skipped_id, payload[:call_id]
     assert_equal job.id, payload[:job_id]
     assert_equal job.active_job_id, payload[:active_job_id]
     assert_operator payload[:exception_class].constantize, :<=, ActiveJob::DeserializationError
@@ -1000,14 +1000,17 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     TwoRecordsJob.perform_later(@a)
     TwoRecordsJob.perform_later(@b)
     TwoRecordsJob.perform_later(@a)
+    jobs = SolidQueue::Job.order(:id).to_a
+    rows = jobs.map { |job| job.coalesced_calls.order(:id).pluck(:id, :arguments) }
     @a.destroy!
 
     # The first job skips both calls. The second has @b's arguments, and skips @a's call
-    perform_ready_jobs
+    SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
 
     assert_equal [ [ [ @b ] ] ], JobBuffer.values
     assert_empty SolidQueue::FailedExecution.all
     assert_equal 0, SolidQueue::Job.where(finished_at: nil).count
+    assert_equal rows, jobs.map { |job| job.coalesced_calls.order(:id).pluck(:id, :arguments) }
   end
 
   test "perform_now gets one call with no id and writes nothing" do

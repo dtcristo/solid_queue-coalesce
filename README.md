@@ -937,7 +937,7 @@ ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
 end
 
 ActiveSupport::Notifications.subscribe("drop_coalesced_call.solid_queue") do |*, payload|
-  Metrics.increment("solid_queue.coalesce.dropped", tags: payload.slice(:class_name))
+  Metrics.increment("solid_queue.coalesce.skipped", tags: payload.slice(:class_name))
 end
 
 ActiveSupport::Notifications.subscribe("coalesced_calls_mismatch.solid_queue") do |*, payload|

@@ -168,12 +168,12 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     RecordsJob.perform_later(@a)
     RecordsJob.perform_later(@b)
     job = SolidQueue::Job.sole
-    dropped_id = job.coalesced_calls.order(:id).first.id
+    skipped_id = job.coalesced_calls.order(:id).first.id
     @a.destroy!
 
     payload = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }.sole.payload
 
-    assert_equal dropped_id, payload[:call_id]
+    assert_equal skipped_id, payload[:call_id]
     assert_equal RecordsJob.name, payload[:class_name]
     assert_equal %i[ active_job_id call_id class_name exception_class job_id ], payload.keys.sort
   end
