@@ -79,3 +79,12 @@ jobs:
             test/dummy/log/test.log
           if-no-files-found: ignore
           retention-days: 30
+
+  build:
+    name: Build
+    needs: [ rubocop, tests ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: test "${{ needs.rubocop.result }}" = success && test "${{ needs.tests.result }}" = success
