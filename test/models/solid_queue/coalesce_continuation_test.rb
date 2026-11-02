@@ -93,3 +93,45 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
     assert_equal 3, old_job.coalesced_calls.count
   end
 end
+
+# What the README's resume recipe promises
+class SolidQueue::CoalesceResumeRecipeTest < ActiveSupport::TestCase
+  self.use_transactional_tests = false
+
+  class LongBatchJob < ApplicationJob
+    include ActiveJob::Continuable
+
+    coalesce key: "long", on_conflict: :collect
+
+    self.resume_options = { wait: 0 }
+
+    def perform_calls(calls)
+      results = JobResult.where(id: calls.map { |call| call.arguments.last })
+
+      step :process do |step|
+        results.in_batches(of: 2, start: step.cursor) do |batch|
+          JobBuffer.add(batch.ids.sort)
+          step.advance! from: batch.maximum(:id)
+        end
+      end
+    end
+  end
+
+  test "a long batch resumes after its last finished slice" do
+    ids = 5.times.map { JobResult.create!.id }.sort
+    ids.each { |id| LongBatchJob.perform_later("account", id) }
+
+    ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = true
+    perform_ready_jobs
+    assert_equal [ ids.first(2) ], JobBuffer.values
+
+    resumed = SolidQueue::Job.where(finished_at: nil).sole
+    assert_equal 5, resumed.coalesced_calls.count
+
+    ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
+    perform_ready_jobs
+
+    assert resumed.reload.finished?
+    assert_equal ids.each_slice(2).to_a, JobBuffer.values
+  end
+end
