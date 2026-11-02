@@ -32,6 +32,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 - Each collected call is rebuilt through the job's own `deserialize` and `deserialize_arguments`.
 - `SolidQueue::CoalescedCall.waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed.
 - Jobs that aren't coalesced no longer read the keys table when they finish, fail or get destroyed.
+- The README leads with recipes for deduping, debouncing and batching, and has diagrams for choosing a recipe and for timing.
 
 ### Fixed
 

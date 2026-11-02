@@ -6,8 +6,8 @@ Gem::Specification.new do |spec|
   spec.authors     = [ "David Cristofaro" ]
   spec.email       = [ "david@dtcristo.com" ]
   spec.homepage    = "https://github.com/dtcristo/solid_queue-coalesce"
-  spec.summary     = "Coalescing for Solid Queue."
-  spec.description = "Lets many perform_later calls with the same key share one pending Solid Queue job."
+  spec.summary     = "Dedupe, debounce and batch Solid Queue jobs."
+  spec.description = "Lets many perform_later calls with the same key share one pending Solid Queue job, for deduplicating jobs, unique pending jobs, debouncing, leading-edge runs, and batching or collecting calls."
   spec.license     = "MIT"
 
   spec.metadata["homepage_uri"] = spec.homepage
