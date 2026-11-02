@@ -162,45 +162,6 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     }
   end
 
-  test "coalesced jobs can't be enqueued in a batch, single or bulk" do
-    assert_no_difference -> { SolidQueue::Job.count } do
-      assert_raises(SolidQueue::Job::CoalescedInBatchError) do
-        SolidQueue::Batch.enqueue { SolidQueue::Job.enqueue(CoalescedRefreshJob.new("a")) }
-      end
-
-      assert_raises(SolidQueue::Job::CoalescedInBatchError) do
-        SolidQueue::Batch.enqueue { ActiveJob.perform_all_later([ CoalescedRefreshJob.new("b") ]) }
-      end
-
-      assert_raises(SolidQueue::Job::CoalescedInBatchError) do
-        SolidQueue::Batch.enqueue { CoalescedRefreshJob.perform_later("a") }
-      end
-    end
-  end
-
-  test "collecting jobs can't be enqueued in a batch either" do
-    assert_raises(SolidQueue::Job::CoalescedInBatchError) do
-      SolidQueue::Batch.enqueue { SolidQueue::Job.enqueue(CollectedCallsJob.new("g")) }
-    end
-
-    assert_raises(SolidQueue::Job::CoalescedInBatchError) do
-      SolidQueue::Batch.enqueue { ActiveJob.perform_all_later([ CollectedCallsJob.new("g") ]) }
-    end
-  end
-
-  test "a job built in a batch and enqueued in bulk afterwards can't either" do
-    active_job = nil
-    SolidQueue::Batch.enqueue { active_job = CoalescedRefreshJob.new("a") }
-
-    assert_raises(SolidQueue::Job::CoalescedInBatchError) { SolidQueue::Job.enqueue_all([ active_job ]) }
-  end
-
-  test "normal jobs in a bulk enqueue aren't affected by the batch rule" do
-    assert_difference -> { SolidQueue::Job.count }, +1 do
-      SolidQueue::Batch.enqueue { ActiveJob.perform_all_later([ AddToBufferJob.new("a") ]) }
-    end
-  end
-
   test "a recurring task for a collect job is invalid" do
     task = SolidQueue::RecurringTask.new(key: "collecting", class_name: CollectingRecurringJob.name, schedule: "every hour")
 

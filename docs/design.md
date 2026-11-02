@@ -40,7 +40,7 @@ Admission locks the key, then the job and its semaphore. Everything else has to 
 - `failed_with` and `finished!` release the key before calling `super`.
 - Bulk discards call `CoalesceKey.release_all` before `super`, in key order, so that two of them can't deadlock with each other.
 - `lock_for_release` finds the row's key and then locks through the key's index. Locking through the `job_id` index takes InnoDB's locks on the row's indexes in the opposite order to admission.
-- Bulk enqueues sort their calls by key, and take one transaction per discard admission or collecting job, so one call holds one key's lock at a time.
+- Bulk enqueues sort their calls by key, and take one transaction per discard admission or collecting job, so one call holds one key's lock at a time. Inside a batch's transaction they hold them all until it commits. See [Batches](#batches).
 
 `on_full: :dispatch` and moving a debounced job are the exceptions. They lock a scheduled execution while holding the key, and a discard holds that execution while it waits for the key. So they use `non_blocking_lock`, and skip a row that's held: the holder is either the dispatcher, which is dispatching a job that's due, or a discard. It's why both are best effort. A discard that rolls back leaves the job at its old time. A lost move can only make a job run early, and the job still covers the call, because the key is held until it starts. `:discard` keeps its share lock when it moves a job, because a move doesn't change the key row. Calls sharing that lock skip each other's held row too. A move only matches an execution more than a second before the new time, so it's later-only under the lock, and hot keys skip the write. They check that the row exists first, because on MySQL a locking read of a missing row takes a gap lock, and a stale snapshot can only leave the job at its old time too.
 
@@ -57,6 +57,14 @@ Inside a bigger transaction it raises straight away, because InnoDB has already 
 Sealing a key that belongs to a collecting job runs after the transaction that found it. Every call waiting on the key holds the same share lock, and upgrading it would deadlock with all of them. Inside the caller's own transaction it can't run after, so that deadlock can reach the caller.
 
 `failed_with` has no retry. A deadlock there can stop the worker, with the error Solid Queue raises for a job it can't finalize.
+
+## Batches
+
+A batched key starts with its batch, so a call only finds a job in its own batch. A batch column would need a composite unique index, where null batch IDs wouldn't conflict. Unbatched keys can't collide with the prefix, because they start with a job class.
+
+Solid Queue's accounting stays authoritative. A job created by admission carries its `batch_id`, and upstream's callbacks add its batch execution and count it. A call that joins touches neither. A key row means the job hasn't started and still has its batch execution, and everything that ends a job releases the key first, so a batch can't finish between a join and the job's run. Without a key, a new job goes through upstream's guard, which raises `AlreadyFinished` for a finished batch. Each coalesced job belongs to one batch, so workers don't change.
+
+Admitting a new key takes the key, then the job, then the batch's row, for `total_jobs`, and keeps them until the transaction commits. A later key in the same block waits with the batch's row held, so two blocks adding different new keys to one batch can deadlock. `retrying_deadlocks` can't help inside `Batch.enqueue`. Keys of different batches never contend, and a single call per block has no second key to wait for. We document this rather than handle it, because batches added to concurrently with many keys in a block are rare.
 
 ## Call ownership
 

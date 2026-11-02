@@ -12,8 +12,12 @@ module SolidQueue
           coalesced_jobs, other_jobs = active_jobs.partition(&:coalesced_enqueue?)
           return super if coalesced_jobs.empty?
 
-          coalesced_jobs.each { |active_job| active_job.scheduled_at = active_job.coalesced_scheduled_at(active_job.scheduled_at) }
-          ensure_coalescible(coalesced_jobs)
+          # Bulk enqueues bypass ActiveJob#enqueue, and the key depends on the batch
+          coalesced_jobs.each do |active_job|
+            active_job.scheduled_at = active_job.coalesced_scheduled_at(active_job.scheduled_at)
+            active_job.batch_id = Batch.current_batch_id || active_job.batch_id
+          end
+          ensure_coalescible
 
           prepared_calls = prepare_all_coalesced(coalesced_jobs)
 
@@ -27,7 +31,7 @@ module SolidQueue
         def enqueue(active_job, **options)
           if active_job.coalesced_enqueue?
             active_job.scheduled_at = active_job.coalesced_scheduled_at(options[:scheduled_at])
-            ensure_coalescible([ active_job ])
+            ensure_coalescible
             enqueue_coalesced(active_job.coalesce_key, [ active_job ])
           elsif active_job.class.coalesce_key
             continuing_coalesced_run(active_job) { super }

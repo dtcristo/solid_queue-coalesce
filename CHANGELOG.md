@@ -2,7 +2,7 @@
 
 ## 0.2.0 (Unreleased)
 
-Adds debouncing with `debounce:` and `max_wait:`, and batches that run as soon as they fill with `on_full: :dispatch`. Collecting jobs now use `perform_calls(calls)`, so upgrading from 0.1.0 needs code changes, a drain and a migration. See [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
+Adds debouncing with `debounce:` and `max_wait:`, batches that run as soon as they fill with `on_full: :dispatch`, and support for [`SolidQueue::Batch`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs). Collecting jobs now use `perform_calls(calls)`, so upgrading from 0.1.0 needs code changes, a drain and a migration. See [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
 
 ### Breaking changes
 
@@ -17,9 +17,11 @@ Adds debouncing with `debounce:` and `max_wait:`, and batches that run as soon a
 - `SolidQueue::CoalescedArgument` and its table are now `SolidQueue::CoalescedCall` and `solid_queue_coalesced_calls`. ([#3](https://github.com/dtcristo/solid_queue-coalesce/pull/3))
 - The key column uses the database's default collation, like Solid Queue's semaphores. Under a case-insensitive collation, keys that differ only by case now coalesce together. ([#3](https://github.com/dtcristo/solid_queue-coalesce/pull/3))
 - A retry runs all of the job's calls again. Calls can no longer be skipped with an `ActiveJob::Continuable` cursor over `perform`'s array. ([#27](https://github.com/dtcristo/solid_queue-coalesce/pull/27))
+- `SolidQueue::Job::CoalescedInBatchError` is gone, because coalesced jobs can now be part of a `SolidQueue::Batch`.
 
 ### Added
 
+- Coalesced jobs can be part of a `SolidQueue::Batch`. Calls with the same key share one job within a batch, and that job belongs to that batch alone.
 - `on_full: :dispatch` for `coalesce`, which dispatches a delayed collecting job as soon as it fills. ([#21](https://github.com/dtcristo/solid_queue-coalesce/pull/21))
 - `debounce:` and `max_wait:` for `coalesce`. Each call pushes a pending job back by the window, and `max_wait` caps how far. A recurring task can't use a debounced class. ([#28](https://github.com/dtcristo/solid_queue-coalesce/pull/28))
 - `class_name` in the `coalesce.solid_queue` and `drop_coalesced_call.solid_queue` payloads. ([#19](https://github.com/dtcristo/solid_queue-coalesce/pull/19))

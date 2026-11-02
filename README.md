@@ -25,6 +25,7 @@ It's a separate gem that adds to Solid Queue from the outside, with its own tabl
 - [Retries](#retries)
 - [Deleted records](#deleted-records)
 - [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits)
+- [Solid Queue batches](#solid-queue-batches)
 - [Discarding and retention](#discarding-and-retention)
 - [Changing a job's configuration](#changing-a-jobs-configuration)
 - [Rules and limitations](#rules-and-limitations)
@@ -91,6 +92,7 @@ Run once, with the first call's arguments:
 - [Once calls stop, or by a deadline](#debounce-until-activity-stops)
 - [Now, then once more after the run](#run-on-the-leading-edge)
 - [On a schedule, without piling up](#coalesce-a-recurring-task)
+- [With a callback once a group of jobs is done](#dedupe-jobs-in-a-solid-queue-batch)
 
 Run once, with every call's arguments:
 
@@ -187,6 +189,34 @@ production:
 ```
 
 A tick during a run creates one blocked job, later ticks merge into it, and it runs when the current run finishes. Without `limits_concurrency`, a slow run can overlap the next tick's. A recurring task can't use `:collect` or `debounce:`. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Dedupe jobs in a Solid Queue batch
+
+Use this when a callback should run once a group of jobs is done, and jobs in that group can ask for the same work.
+
+```ruby
+class ReindexProductJob < ApplicationJob
+  coalesce key: ->(product_id) { product_id }
+
+  def perform(product_id)
+    Product.find(product_id).reindex!
+  end
+end
+
+class ImportSupplierJob < ApplicationJob
+  def perform(supplier_id)
+    Supplier.find(supplier_id).import_products.each do |product_id|
+      batch.enqueue { ReindexProductJob.perform_later(product_id) }
+    end
+  end
+end
+
+SolidQueue::Batch.enqueue(on_success: PublishCatalogJob) do
+  supplier_ids.each { |supplier_id| ImportSupplierJob.perform_later(supplier_id) }
+end
+```
+
+Each importer adds to the batch while it runs, and that running job keeps the batch open. Two importers that reach the same pending product share one reindex. If that reindex has already started, the later call opens a new job, so the later change still gets reindexed. `PublishCatalogJob` runs once, after the importers and every reindex are done. See [Solid Queue batches](#solid-queue-batches).
 
 ### Batch calls together
 
@@ -370,7 +400,7 @@ CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 | `perform_later` | Coalesces, and stores the call with `:collect` |
 | `perform_all_later` | Coalesces in sorted key order, with one transaction per discard admission or collecting job. See [Bulk enqueues](#bulk-enqueues) |
 | `perform_now` | Runs the call on its own. `perform_calls` receives one call |
-| `SolidQueue::Batch` | Raises `SolidQueue::Job::CoalescedInBatchError` |
+| `SolidQueue::Batch` | Coalesces within each batch. See [Solid Queue batches](#solid-queue-batches) |
 | Recurring tasks | `:discard` works. `:collect` and `debounce:` make the task's configuration invalid |
 | Retries | Keep the job's calls, and never coalesce. See [Retries](#retries) |
 | Other adapters | Ignore `coalesce`, including `debounce:` and `max_wait:`. Each call runs on its own. See [Testing](#testing) |
@@ -414,7 +444,7 @@ coalesce key: ->(account_id, kind) { [ account_id, kind ] } # Composite key
 - A Proc that returns `nil` gives the class-wide key, so all of those calls merge.
 - Keys longer than 255 characters fail on MySQL.
 
-Keys are always scoped to the job class name, and there's no `group` option, so two classes can't share a key.
+Keys are always scoped to the job class name, and there's no `group` option, so two classes can't share a key. In a [Solid Queue batch](#solid-queue-batches) they're scoped to the batch too.
 
 The key column is declared like the one on Solid Queue's semaphores, with the database's default collation and a unique index. That's upstream parity, and it isn't a guarantee of bytewise uniqueness. Under a case- and accent-insensitive collation such as MySQL's `utf8mb4_0900_ai_ci`, `Job/a`, `Job/A` and `Job/á` compare equal and coalesce together. Under a case-sensitive or binary collation they stay distinct.
 
@@ -713,6 +743,19 @@ A runs right away. B arrives during that run and opens job 2, which blocks on th
 
 The concurrency key of a coalesced job is the one computed for the call that created it, and a blocked job still holds its coalesce key, since it hasn't started. `:collect` works with `on_conflict: :block`. It can't be combined with `limits_concurrency` with `on_conflict: :discard`, in either order, because a conflict would destroy a job holding calls, so that raises `ArgumentError` when the class loads. `:discard` can, and the destroyed job frees the key.
 
+## Solid Queue batches
+
+A coalesced job can be part of a [`SolidQueue::Batch`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs), as in [this recipe](#dedupe-jobs-in-a-solid-queue-batch). Batches need Solid Queue's own optional migration, and nothing more from this gem.
+
+- Calls with the same key share one job, and that job belongs to that batch alone. The same key in another batch, or outside a batch, runs separately. `limits_concurrency` isn't scoped to a batch, so it still stops those jobs overlapping.
+- `total_jobs` counts jobs, not calls. A call that joins a job adds nothing, and the job after a `:collect` job seals counts as another.
+- A batched key starts with its batch, as in `SolidQueue::Batch/7/ReindexProductJob/42`. `coalesce.solid_queue` reports it that way, and the prefix counts towards MySQL's 255 characters.
+- A running job adds to its batch with `batch.enqueue`. Without that a call isn't in the batch, because Solid Queue doesn't set a current batch while a job runs. Adding from anywhere else races the batch finishing, and raises `SolidQueue::Batch::AlreadyFinished` if it lost.
+- `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. It raises `SolidQueue::Job::EnqueueError` and rolls back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the recipe.
+- With `enqueue_after_transaction_commit`, a deferred `perform_all_later` runs after the block ends, so only jobs built inside the block keep the batch, and a failure can't roll the block back. Solid Queue's ordinary jobs do the same.
+- Bulk discards delete jobs without callbacks, so a batch left with no jobs finishes when Solid Queue's batch maintenance next runs.
+- A callback job isn't part of its batch, so a coalesced one uses the key it would use outside a batch.
+
 ## Discarding and retention
 
 Calls belong to their job, and are deleted with it. Discarding a pending job deletes it and its calls, and frees the key if the job was open. Other jobs for the key aren't affected. If [`preserve_finished_jobs`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#other-configuration-settings) is on, a job's calls stay until the job is cleared, along with the finished job itself.
@@ -745,7 +788,6 @@ Jobs enqueued by version 0.1 don't have this record, so drain them before you up
 
 ## Rules and limitations
 
-- A coalesced job can't be enqueued inside [`SolidQueue::Batch.enqueue`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs), either alone or in bulk. A call that joins a pending job adds no job to the batch, which could finish early. Trying raises `SolidQueue::Job::CoalescedInBatchError`.
 - Calling `perform_later` inside a transaction on the same database as Solid Queue doesn't abort the transaction when the call finds a pending job. On MySQL, however, a deadlock rolls back the entire transaction, so we can only retry it automatically outside of one. Inside your own transaction it raises `SolidQueue::Job::EnqueueError`. On any database with row locks, the same can happen inside your own transaction to a call that takes over a key from a collecting job, after its class switched to `:discard`.
 - Solid Queue's bulk discards, such as `discard_all_in_batches`, are retried on a deadlock like enqueues are, so the same limit applies inside your own transaction.
 - On MySQL, a deadlock while failing a job isn't retried, and it can stop the worker with the error Solid Queue raises for a job it can't finalize.
