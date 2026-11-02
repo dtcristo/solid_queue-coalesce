@@ -196,8 +196,8 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
   setup { @start = Time.current.change(usec: 0) }
   teardown { CALLS_DURING_RUN.clear }
 
-  test "every job class in the recipes loads with the options it shows" do
-    classes = File.read(File.expand_path("../../../README.md", __dir__))[/^## Recipes$.*?(?=^## )/m].scan(/^class \w+ < ApplicationJob$.*?^end$/m)
+  test "every job class in the README loads with the options it shows" do
+    classes = File.read(File.expand_path("../../../README.md", __dir__)).scan(/^class \w+ < ApplicationJob$.*?^end$/m)
 
     assert_operator classes.size, :>=, 9
     classes.reject! { |definition| definition.include?("ActiveJob::Continuable") } unless defined?(ActiveJob::Continuable)
