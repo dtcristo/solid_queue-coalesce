@@ -712,7 +712,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Change `debounce` or `max_wait` | The class that enqueues each call decides, so there's nothing to drain. A job that has moved keeps its time |
 | Change the key | Waiting jobs still run their calls. New calls open a job under the new key |
 
-Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and emits `coalesced_calls_mismatch.solid_queue` if it still had its key. A sealed job has no key to compare with, so a partial deletion from one goes unnoticed.
+Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and nothing reports the loss.
 
 Jobs enqueued by version 0.1 don't have this record, so drain them before you upgrade. See [UPGRADING.md](UPGRADING.md).
 
@@ -747,15 +747,14 @@ SolidQueue::CoalescedCall.where(job_id: SolidQueue::FailedExecution.select(:job_
 
 ### Notifications
 
-Three notifications exist:
+Two notifications exist:
 
 | Event | When | Payload |
 | --- | --- | --- |
 | `coalesce.solid_queue` | A call was admitted, including the one that created the job | `status` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
 | `drop_coalesced_call.solid_queue` | A collected call was skipped on this attempt because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class` |
-| `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `class_name`, `expected`, `actual` |
 
-`SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, and none logs the key, which your app defines. The key is only in the event's payload.
+`SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, and neither logs the key, which your app defines. The key is only in the event's payload.
 
 `coalesce.solid_queue` fires right after a call's admission. Outside a transaction on the queue database, that's after the commit, and the outcome is final. Inside one, it's before the commit, so the outcome is provisional: a rollback can undo what it reported, and the event stays fired. No event fires for a retry, for a worker starting a job, or for a call that a `limits_concurrency` conflict destroyed.
 
@@ -776,7 +775,7 @@ end
 The payloads' IDs last for different lengths of time:
 
 - `class_name` and `status` don't change, and have few values. They're the only ones to use as metric labels.
-- `active_job_id` is the call's own on `coalesce.solid_queue`, and the owning job's on the other two events. The owning job has the `active_job_id` of its first call, across retries.
+- `active_job_id` is the call's own on `coalesce.solid_queue`, and the owning job's on `drop_coalesced_call.solid_queue`. The owning job has the `active_job_id` of its first call, across retries.
 - `job_id` is the job at that moment. A retry moves collected calls to a job with a new ID.
 - `call_id` exists only once a worker reads the calls, because admission inserts them in bulk. A `coalesce.solid_queue` event can't be matched to a later `call_id`.
 
@@ -789,10 +788,6 @@ Call counts come from Active Job's own event. `coalesced_calls` is already loade
 # labels, because there are too many of them, and because your app defines the keys.
 ActiveSupport::Notifications.subscribe("drop_coalesced_call.solid_queue") do |*, payload|
   Metrics.increment("solid_queue.coalesce.skipped", tags: payload.slice(:class_name))
-end
-
-ActiveSupport::Notifications.subscribe("coalesced_calls_mismatch.solid_queue") do |*, payload|
-  Metrics.increment("solid_queue.coalesce.mismatched", tags: payload.slice(:class_name))
 end
 
 ActiveSupport::Notifications.subscribe("perform.active_job") do |*, payload|

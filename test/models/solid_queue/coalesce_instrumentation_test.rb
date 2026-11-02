@@ -153,17 +153,6 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     assert_equal job.active_job_id, SolidQueue::Job.where(finished_at: nil).sole.active_job_id
   end
 
-  test "a mismatch names the job's class" do
-    CollectJob.perform_later("g", 1)
-    CollectJob.perform_later("g", 2)
-    job = SolidQueue::Job.sole
-    job.coalesced_calls.order(:id).first.delete
-
-    events = capture_events("coalesced_calls_mismatch.solid_queue") { perform_ready_jobs }
-
-    assert_equal({ job_id: job.id, active_job_id: job.active_job_id, class_name: CollectJob.name, expected: 2, actual: 1 }, events.sole.payload)
-  end
-
   test "a skipped call is reported without a deletion outcome when other calls run" do
     RecordsJob.perform_later(@a)
     RecordsJob.perform_later(@b)

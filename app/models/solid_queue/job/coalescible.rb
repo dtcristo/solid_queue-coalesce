@@ -291,20 +291,12 @@ module SolidQueue
       # read that finds the key in lock_for_release sets the snapshot of a MySQL
       # REPEATABLE READ transaction, so a read in the same transaction could miss
       # calls committed while it waited for the lock.
-      #
-      # Only the first start finds a key, so only it can compare the count. Rows that
-      # went missing can't come back, so failing wouldn't help the ones left.
       def start_coalesced_run
         return unless coalesced? && CoalesceKey.migrated?
 
-        released_key = self.class.retrying_deadlocks { transaction { release_coalesce_key } }
-        calls = coalesced_calls.order(:id).pluck(:id, :arguments)
+        self.class.retrying_deadlocks { transaction { release_coalesce_key } }
 
-        if released_key && released_key.calls_count != calls.size
-          SolidQueue.instrument(:coalesced_calls_mismatch, job_id: id, active_job_id: active_job_id, class_name: class_name, expected: released_key.calls_count, actual: calls.size)
-        end
-
-        { "calls" => calls, "concurrency_key" => concurrency_key }
+        { "calls" => coalesced_calls.order(:id).pluck(:id, :arguments), "concurrency_key" => concurrency_key }
       end
 
       private
