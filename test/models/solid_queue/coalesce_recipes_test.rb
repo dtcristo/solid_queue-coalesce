@@ -61,6 +61,9 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
   test "every job class in the recipes loads with the options it shows" do
     classes = File.read(File.expand_path("../../../README.md", __dir__))[/^## Recipes$.*?(?=^## )/m].scan(/^class \w+ < ApplicationJob$.*?^end$/m)
 
+    # The recipe says Rails 7.1 doesn't have this setting
+    classes.reject! { |definition| definition.include?("enqueue_after_transaction_commit") } unless ActiveJob::Base.respond_to?(:enqueue_after_transaction_commit=)
+
     assert_operator classes.size, :>=, 10
     classes.each { |definition| Module.new.module_eval(definition) }
   end
