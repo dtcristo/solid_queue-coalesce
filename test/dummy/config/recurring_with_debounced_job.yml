@@ -1,0 +1,3 @@
+debounced_task:
+  class: SolidQueue::CoalesceValidationTest::DebouncedRecurringJob
+  schedule: every minute

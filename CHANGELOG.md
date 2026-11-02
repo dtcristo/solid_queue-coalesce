@@ -20,6 +20,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 ### Added
 
 - `on_full: :dispatch` for `coalesce`, which dispatches a delayed collecting job as soon as it fills.
+- `debounce:` and `max_wait:` for `coalesce`. Each call pushes a pending job back by the window, and `max_wait` caps how far. A recurring task can't use a debounced class.
 - The `coalesced_calls_mismatch.solid_queue` notification.
 - `class_name` in the `coalesce.solid_queue` and `drop_coalesced_call.solid_queue` payloads.
 - `ActiveJob::Coalescing::CollectedJobMismatch`. A collecting job whose configuration changed fails with its calls, and you can recover by restoring the declaration and retrying it.

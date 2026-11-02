@@ -44,13 +44,15 @@ module ActiveJob
       class_attribute :coalesce_on_conflict, instance_accessor: false
       class_attribute :coalesce_max_calls, instance_accessor: false
       class_attribute :coalesce_on_full, instance_accessor: false
+      class_attribute :coalesce_debounce, instance_accessor: false
+      class_attribute :coalesce_max_wait, instance_accessor: false
 
       attr_reader :coalesce_status, :coalesced_calls
       private attr_writer :coalesce_status
     end
 
     class_methods do
-      def coalesce(key:, on_conflict: :discard, max_calls: nil, on_full: nil)
+      def coalesce(key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: nil, max_wait: nil)
         unless (key.is_a?(String) || key.is_a?(Symbol) || key.is_a?(Proc)) && key.present?
           raise ArgumentError, "`key` must be a non-blank String or Symbol, or a Proc"
         end
@@ -77,12 +79,26 @@ module ActiveJob
           raise ArgumentError, "`on_full` needs `on_conflict: :collect`"
         end
 
+        unless debounce.nil? || (debounce.is_a?(ActiveSupport::Duration) && debounce.positive?)
+          raise ArgumentError, "`debounce` must be a positive duration"
+        end
+
+        unless max_wait.nil?
+          raise ArgumentError, "`max_wait` needs `debounce`" if debounce.nil?
+
+          unless max_wait.is_a?(ActiveSupport::Duration) && max_wait > debounce
+            raise ArgumentError, "`max_wait` must be a duration greater than `debounce`"
+          end
+        end
+
         ensure_coalesce_compatible_with_concurrency_controls(on_conflict, concurrency_on_conflict)
 
         self.coalesce_key = key
         self.coalesce_on_conflict = on_conflict
         self.coalesce_max_calls = max_calls
         self.coalesce_on_full = on_full
+        self.coalesce_debounce = debounce
+        self.coalesce_max_wait = max_wait
       end
 
       def coalesce_collect?
@@ -143,6 +159,15 @@ module ActiveJob
     # A retry is the same work continuing, so it can't join or suppress anything
     def coalesced_enqueue?
       self.class.coalesce_key.present? && executions.to_i.zero?
+    end
+
+    # A call's own time if it has one, and otherwise now plus the window. A longer
+    # wait is capped without raising, because a scheduling preference shouldn't fail
+    # the caller's request.
+    def coalesced_scheduled_at(scheduled_at)
+      scheduled_at ||= self.class.coalesce_debounce&.from_now || Time.current
+
+      self.class.coalesce_max_wait ? [ scheduled_at, self.class.coalesce_max_wait.from_now ].min : scheduled_at
     end
 
     # The stored key, in case the arguments it was computed from are gone

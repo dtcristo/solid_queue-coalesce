@@ -18,6 +18,13 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
+  class DebouncedRecurringJob < ApplicationJob
+    coalesce key: "recurring", debounce: 30.seconds
+
+    def perform
+    end
+  end
+
   test "on_conflict defaults to discard, with no max_calls" do
     job_class = new_job_class { coalesce key: "a" }
 
@@ -70,6 +77,38 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
   test "on_full defaults to wait when collecting" do
     assert_equal :wait, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_on_full
     assert_nil new_job_class { coalesce key: "a" }.coalesce_on_full
+  end
+
+  test "debounce and max_wait are optional, and work with both on_conflict behaviours" do
+    assert_nil new_job_class { coalesce key: "a" }.coalesce_debounce
+    assert_nil new_job_class { coalesce key: "a" }.coalesce_max_wait
+
+    discarding = new_job_class { coalesce key: "a", debounce: 30.seconds }
+    assert_equal 30.seconds, discarding.coalesce_debounce
+    assert_nil discarding.coalesce_max_wait
+
+    collecting = new_job_class { coalesce key: "a", on_conflict: :collect, debounce: 30.seconds, max_wait: 5.minutes }
+    assert_equal 30.seconds, collecting.coalesce_debounce
+    assert_equal 5.minutes, collecting.coalesce_max_wait
+  end
+
+  test "debounce has to be a positive duration" do
+    [ 0.seconds, -1.second, 30, 1.5, "30", :soon, false ].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", debounce: value } }
+      assert_match(/`debounce` must be a positive duration/, error.message)
+    end
+  end
+
+  test "max_wait needs debounce" do
+    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", max_wait: 5.minutes } }
+    assert_match(/`max_wait` needs `debounce`/, error.message)
+  end
+
+  test "max_wait has to be a duration greater than debounce" do
+    [ 30.seconds, 10.seconds, 0.seconds, -1.minute, 300, "300", false ].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", debounce: 30.seconds, max_wait: value } }
+      assert_match(/`max_wait` must be a duration greater than `debounce`/, error.message)
+    end
   end
 
   test "the options from before don't exist" do
@@ -174,6 +213,20 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
 
     assert_not configuration.valid?
     assert_match(/collect/, configuration.errors.full_messages.to_sentence)
+  end
+
+  test "a recurring task for a debounced job is invalid" do
+    task = SolidQueue::RecurringTask.new(key: "debounced", class_name: DebouncedRecurringJob.name, schedule: "every minute")
+
+    assert_not task.valid?
+    assert_match(/debounce/, task.errors.full_messages.to_sentence)
+  end
+
+  test "configuration validation rejects a debounced job too" do
+    configuration = SolidQueue::Configuration.new(recurring_schedule_file: config_file_path(:recurring_with_debounced_job))
+
+    assert_not configuration.valid?
+    assert_match(/debounce/, configuration.errors.full_messages.to_sentence)
   end
 
   test "a recurring task for a discarding job is valid and a suppressed tick records nothing" do

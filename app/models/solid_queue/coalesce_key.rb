@@ -83,11 +83,13 @@ module SolidQueue
         # a duplicate would abort an enclosing transaction on PostgreSQL. On MySQL it
         # also avoids a deadlock: a plain INSERT that hits a duplicate takes a shared
         # lock, and two of those on a row being deleted can't both go on to insert.
+        # created_at starts the max_wait clock, so it's set here and not by the database:
+        # MySQL would write it in the server's time zone, whatever the app's is.
         def insert_unless_held(key)
           if supports_insert_conflict_target?
-            insert({ key: key }, unique_by: :key)
+            insert({ key: key, created_at: Time.current }, unique_by: :key)
           else
-            insert({ key: key })
+            insert({ key: key, created_at: Time.current })
           end
         end
     end
