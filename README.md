@@ -250,7 +250,6 @@ Use this when calls collect through the day, and all of the work should happen o
 ```ruby
 class SendDailyDigestJob < ApplicationJob
   coalesce key: ->(account_id, *) { account_id }, on_conflict: :collect, max_calls: 1000
-  limits_concurrency to: 1, key: ->(account_id, *) { account_id }, on_conflict: :block, duration: 1.hour
 
   def perform_calls(calls)
     DigestMailer.daily(calls.first.arguments.first, calls.map { |call| call.arguments.last }).deliver_now
@@ -260,7 +259,7 @@ end
 SendDailyDigestJob.set(wait_until: Date.tomorrow.midnight).perform_later(account.id, event.id)
 ```
 
-The first call sets the time, and later calls join without moving it. Past `max_calls`, the next call opens another job for the same midnight, and the concurrency limit runs them one at a time. A call that arrives after midnight joins a job that hasn't started yet, and otherwise opens tomorrow's. Every caller needs the `wait_until`, because a plain `perform_later` that arrives first opens a job that runs right away. Payloads wait in the queue database all day, so pass IDs.
+The first call sets the time, and later calls join without moving it. Past `max_calls`, the next call opens another job for the same midnight, and the two can overlap. A call that arrives after midnight joins a job that hasn't started yet, and otherwise opens tomorrow's. Every caller needs the `wait_until`, because a plain `perform_later` that arrives first opens a job that runs right away. Payloads wait in the queue database all day, so pass IDs.
 
 ### Run one batch at a time
 
