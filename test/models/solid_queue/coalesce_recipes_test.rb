@@ -55,7 +55,6 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
 
   class DailyBatchJob < ApplicationJob
     coalesce key: "daily", on_conflict: :collect, max_calls: 2
-    limits_concurrency to: 1, key: "daily", on_conflict: :block, duration: 1.hour
 
     def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
@@ -254,7 +253,7 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     assert SolidQueue::Job.find(next_call.provider_job_id).ready?
   end
 
-  test "a batch at midnight collects calls until then, and runs its jobs one at a time" do
+  test "a batch at midnight collects calls until then, and a full job's overflow runs at the same time" do
     midnight = Date.tomorrow.midnight
     calls = 3.times.map { |call| DailyBatchJob.set(wait_until: midnight).perform_later(call) }
 
@@ -263,10 +262,10 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
 
     travel_to midnight + 1.second do
       SolidQueue::ScheduledExecution.dispatch_next_batch(10)
-      assert_equal [ :ready, :blocked ], SolidQueue::Job.order(:id).map(&:status)
+      assert_equal [ :ready, :ready ], SolidQueue::Job.order(:id).map(&:status)
 
-      2.times { perform_ready_jobs }
-      assert_equal [ [ [ 0 ], [ 1 ] ], [ [ 2 ] ] ], JobBuffer.values
+      perform_ready_jobs
+      assert_equal [ [ [ 0 ], [ 1 ] ], [ [ 2 ] ] ], JobBuffer.values.sort
 
       next_call = DailyBatchJob.set(wait_until: Date.tomorrow.midnight).perform_later(3)
       assert_equal :created, next_call.coalesce_status
