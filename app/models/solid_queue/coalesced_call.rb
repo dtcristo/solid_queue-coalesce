@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 module SolidQueue
-  # The Active Job payload of one collected perform_later call. It belongs to one
-  # job from the moment it's admitted, across that job's retries, until the job is
-  # destroyed.
+  # The Active Job payload of one collected perform_later call. It's kept from the
+  # moment it's admitted until the job that holds it is destroyed, and a retry moves
+  # it to the new job.
   class CoalescedCall < Record
     belongs_to :job
 
