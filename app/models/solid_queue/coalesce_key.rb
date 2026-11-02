@@ -6,7 +6,8 @@ module SolidQueue
   # and the end of the admission that inserted it, so it's never visible to others.
   # calls_count is how many calls the job owns: at least one if it's collecting, and
   # zero if it's discarding. A sealed or started job has no row, and so no count.
-  class CoalesceKey < Record
+  class CoalesceKey < Record # :nodoc:
+    # Enqueuing a job that uses +coalesce+ before the gem's migration has run.
     class PendingMigrations < StandardError
       def initialize(message = "The coalescing schema hasn't been installed yet. Run `bin/rails generate solid_queue:coalesce:install` to copy the migration to your application, and then `bin/rails db:migrate` to run it")
         super

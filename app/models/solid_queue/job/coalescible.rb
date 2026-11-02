@@ -2,9 +2,11 @@
 
 module SolidQueue
   class Job
+    # A coalesced job can't be part of a SolidQueue::Batch, because a call that joins
+    # a pending job adds no job to the batch.
     class CoalescedInBatchError < EnqueueError; end
 
-    module Coalescible
+    module Coalescible # :nodoc: all
       extend ActiveSupport::Concern
 
       included do

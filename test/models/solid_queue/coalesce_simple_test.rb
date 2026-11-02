@@ -13,6 +13,18 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  class KeyedJob < ApplicationJob
+    coalesce key: ->(value) { value }
+
+    def perform(_value); end
+  end
+
+  class OtherKeyedJob < ApplicationJob
+    coalesce key: ->(value) { value }
+
+    def perform(_value); end
+  end
+
   class CollectingRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }, on_conflict: :collect
 
@@ -130,6 +142,21 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
 
     def perform(*)
     end
+  end
+
+  test "a key is built from the job class and the key Proc's result" do
+    assert_equal "#{KeyedJob.name}/a", KeyedJob.new("a").coalesce_key
+    assert_equal KeyedJob.new(1).coalesce_key, KeyedJob.new("1").coalesce_key
+    assert_equal "#{KeyedJob.name}/a/b", KeyedJob.new([ "a", "b" ]).coalesce_key
+    assert_equal KeyedJob.new([ "a/b" ]).coalesce_key, KeyedJob.new([ "a", "b" ]).coalesce_key
+    assert_equal KeyedJob.name, KeyedJob.new(nil).coalesce_key
+    assert_not_equal KeyedJob.new("a").coalesce_key, OtherKeyedJob.new("a").coalesce_key
+  end
+
+  test "a key Proc that returns nil merges all of those calls" do
+    first, second = [ nil, nil ].map { |value| KeyedJob.perform_later(value) }
+
+    assert_equal [ :created, :discarded ], [ first.coalesce_status, second.coalesce_status ]
   end
 
   test "the first call creates a job, and says so" do

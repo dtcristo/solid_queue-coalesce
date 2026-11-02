@@ -9,6 +9,14 @@ module SolidQueue
 
     serialize :arguments, coder: JSON
 
+    ##
+    # :singleton-method: waiting
+    #
+    # Calls whose job hasn't finished, isn't running and hasn't failed, for measuring
+    # the backlog.
+    #
+    #   SolidQueue::CoalescedCall.waiting.count
+    #   SolidQueue::CoalescedCall.waiting.minimum(:created_at)
     scope :waiting, -> { where(job_id: Job.where(finished_at: nil).where.missing(:claimed_execution, :failed_execution).select(:id)) }
   end
 end
