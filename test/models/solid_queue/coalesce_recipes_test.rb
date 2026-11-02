@@ -178,6 +178,7 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     classes = File.read(File.expand_path("../../../README.md", __dir__))[/^## Recipes$.*?(?=^## )/m].scan(/^class \w+ < ApplicationJob$.*?^end$/m)
 
     assert_operator classes.size, :>=, 9
+    classes.reject! { |definition| definition.include?("ActiveJob::Continuable") } unless defined?(ActiveJob::Continuable)
     classes.each { |definition| Module.new.module_eval(definition) }
   end
 
