@@ -487,7 +487,7 @@ call.job_data  # The call's whole serialized Active Job payload
 
 `arguments` comes from the same deserialization as a normal run. Each call is rebuilt on its own instance of the job, from its payload, through `deserialize` and `deserialize_arguments`. So GlobalID, custom serializers and your own overrides of those methods all apply. Keyword arguments are a trailing hash with Ruby's keyword marker, so `some_method(*call.arguments)` passes them as keywords. A trailing hash that was passed positionally stays a plain hash, and stays positional.
 
-If a call refers to a deleted record, that call is dropped. Any other error while deserializing, including one from your own override, fails the job with its calls. See [Deleted records](#deleted-records).
+If a call refers to a deleted record, that call is skipped for this attempt. Any other error while deserializing, including one from your own override, fails the job with its calls. See [Deleted records](#deleted-records).
 
 `job_data` is the raw snapshot taken when the call was enqueued: `job_id`, `queue_name`, `priority`, `locale`, `timezone`, `enqueued_at`, `scheduled_at`, and whatever your `serialize` adds. It's the payload as stored, so it doesn't go through your `deserialize`, and arguments that `serialize` wrapped are still wrapped. It's frozen at the top level.
 
@@ -765,7 +765,9 @@ Delivery is at-least-once. There's no per-call acknowledgement or per-call conti
 
 ## Deleted records
 
-Each call is deserialized on its own. If a call refers to a deleted record, that call is deleted and `drop_coalesced_call.solid_queue` is emitted with `call_deleted: true`, while the others run. If that happens to every call in the job, `perform_calls` and its callbacks are skipped and the job finishes normally. The job never falls back to its own arguments: those calls stay until the job is destroyed, so a re-run after a crash skips them too. Each of them emits the event with `call_deleted: false`, and again on that re-run, so a count of these events can be higher than the number of calls. Any other deserialization error fails the job and keeps all of its calls.
+Each call is deserialized on its own. If a call refers to a deleted record, that call is skipped for this attempt and `drop_coalesced_call.solid_queue` is emitted, while the others run. If that happens to every call in the job, `perform_calls` and its callbacks are skipped and the job finishes normally. The job never falls back to its own arguments. Any other deserialization error fails the job with all of its calls, before any skipped-call events are emitted.
+
+Every call row stays until its job is destroyed, including calls skipped because their records are gone. Retries and re-runs after a crash deserialize them all again. A record that's still gone is skipped and reported again, so these events count attempts, not unique calls. If the record becomes resolvable again, its call can run on a later attempt. With `preserve_finished_jobs`, skipped payloads stay with the finished job until it's cleared. See [Discarding and retention](#discarding-and-retention).
 
 ## Recurring jobs and concurrency limits
 
@@ -895,7 +897,7 @@ Three notifications exist:
 | Event | When | Payload |
 | --- | --- | --- |
 | `coalesce.solid_queue` | A call was admitted, including the one that created the job | `status` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
-| `drop_coalesced_call.solid_queue` | A collected call was skipped because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class`, `call_deleted` |
+| `drop_coalesced_call.solid_queue` | A collected call was skipped on this attempt because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class` |
 | `coalesced_calls_mismatch.solid_queue` | A starting job has a different number of calls than its key counted | `job_id`, `active_job_id`, `class_name`, `expected`, `actual` |
 
 `SolidQueue::LogSubscriber` logs the first at debug level and the others at warn level. None logs arguments or payloads, and none logs the key, which your app defines. The key is only in the event's payload.
@@ -935,7 +937,7 @@ ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
 end
 
 ActiveSupport::Notifications.subscribe("drop_coalesced_call.solid_queue") do |*, payload|
-  Metrics.increment("solid_queue.coalesce.dropped", tags: payload.slice(:class_name, :call_deleted))
+  Metrics.increment("solid_queue.coalesce.skipped", tags: payload.slice(:class_name))
 end
 
 ActiveSupport::Notifications.subscribe("coalesced_calls_mismatch.solid_queue") do |*, payload|

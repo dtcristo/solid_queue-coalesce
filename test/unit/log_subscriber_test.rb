@@ -37,11 +37,11 @@ class LogSubscriberTest < ActiveSupport::TestCase
     assert_not subscriber.silenced?("coalesced_calls_mismatch.solid_queue")
   end
 
-  test "drop a coalesced call" do
+  test "skip a coalesced call" do
     attach_log_subscriber
-    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", class_name: "MyJob", exception_class: "ActiveJob::DeserializationError", call_deleted: false
+    instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", class_name: "MyJob", exception_class: "ActiveJob::DeserializationError"
 
-    assert_match_logged :warn, "Drop coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", exception_class: \"ActiveJob::DeserializationError\", call_deleted: false"
+    assert_match_logged :warn, "Skip coalesced call for a deleted record", "call_id: 7, job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", exception_class: \"ActiveJob::DeserializationError\""
   end
 
   test "calls that don't match the key's count" do

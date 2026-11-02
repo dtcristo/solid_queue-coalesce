@@ -66,7 +66,7 @@ A retry of a collecting job creates a new job with the same `active_job_id`, and
 
 `perform_now` calls `start_coalesced_run` first, outside the `rescue_from` of Active Job's own `perform_now`, so `retry_on` can't swallow what it raises. The error reaches `ClaimedExecution#execute`, which turns it into a failed execution with its calls.
 
-A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone is deleted if the job has other calls to run. If every call's record is gone, the rows stay until the job is destroyed, so a re-run after a crash can see that it has nothing to do.
+A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone is skipped for this attempt, and every row stays until its job is destroyed. Reading the calls never deletes them. Retries and re-runs deserialize all the rows again, so still-missing records are skipped and reported again, and a restored record's call can run. If every record is gone, the job skips `perform_calls` and its callbacks. Skipped-call notifications are emitted only after every call has been deserialized without another error.
 
 ## Cost for other jobs
 

@@ -393,7 +393,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal "kept", JobBuffer.values.sole.sole.job_data["field"]
   end
 
-  test "a job with its own deserialize drops the call whose record is gone, and runs the others" do
+  test "a job with its own deserialize skips the call whose record is gone, and runs the others" do
     gone = JobResult.create!
     WrappedPayloadJob.perform_later(@a)
     WrappedPayloadJob.perform_later(gone)
@@ -403,22 +403,26 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
 
     assert_equal [ [ @a ], [ @b ] ], JobBuffer.values.sole.map(&:arguments)
-    assert_equal 2, SolidQueue::CoalescedCall.count
+    assert_equal 3, SolidQueue::CoalescedCall.count
     assert_equal 1, events.size
   end
 
   test "an error from a job's own deserialize fails the run and keeps the calls" do
-    WrappedPayloadJob.perform_later("x")
+    WrappedPayloadJob.perform_later(@a)
     WrappedPayloadJob.perform_later("y")
     job = SolidQueue::Job.sole
     corrupt = SolidQueue::CoalescedCall.order(:id).last
     corrupt.update!(arguments: corrupt.arguments.merge("corrupt" => true))
+    @a.destroy!
 
-    assert_raises(ArgumentError) { perform_ready_jobs }
+    events = capture_events("drop_coalesced_call.solid_queue") do
+      assert_raises(ArgumentError) { perform_ready_jobs }
+    end
 
     assert job.reload.failed?
     assert_equal 2, job.coalesced_calls.count
     assert_empty JobBuffer.values
+    assert_empty events
   end
 
   test "forwarding a call's arguments keeps keywords and trailing hashes apart" do
@@ -870,25 +874,28 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::Job.count + SolidQueue::CoalesceKey.count + SolidQueue::CoalescedCall.count
   end
 
-  test "a deleted record's call is dropped with an event and the others run" do
+  test "a deleted record's call is skipped with an event and retained with the others" do
     RecordsCollectedJob.perform_later(@a)
     RecordsCollectedJob.perform_later(@b)
     job = SolidQueue::Job.sole
-    dropped_id = SolidQueue::CoalescedCall.order(:id).first.id
+    skipped_id = SolidQueue::CoalescedCall.order(:id).first.id
     @a.destroy!
 
-    events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
+    events = SolidQueue.with(preserve_finished_jobs: true) do
+      capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
+    end
 
     assert_equal [ [ [ @b ] ] ], JobBuffer.values
     assert_empty SolidQueue::FailedExecution.all
+    assert_equal 2, job.coalesced_calls.count
+    assert SolidQueue::CoalescedCall.exists?(skipped_id)
 
     payload = events.sole.payload
-    assert_equal dropped_id, payload[:call_id]
+    assert_equal skipped_id, payload[:call_id]
     assert_equal job.id, payload[:job_id]
     assert_equal job.active_job_id, payload[:active_job_id]
     assert_operator payload[:exception_class].constantize, :<=, ActiveJob::DeserializationError
-    assert_equal %i[ active_job_id call_deleted call_id class_name exception_class job_id ], payload.keys.sort
-    assert_not SolidQueue::CoalescedCall.exists?(dropped_id)
+    assert_equal %i[ active_job_id call_id class_name exception_class job_id ], payload.keys.sort
   end
 
   test "perform_calls and its callbacks are skipped when no calls remain, and the job finishes" do
@@ -909,7 +916,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "crashing-worker")
     claimed = SolidQueue::ReadyExecution.claim("*", 10, process.id).sole
 
-    # The run drops the call, and the worker dies before recording the job as finished
+    # The run skips the call, and the worker dies before recording the job as finished
     claimed.send(:execute)
     claimed.release
     perform_ready_jobs
@@ -919,7 +926,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert job.reload.finished?
   end
 
-  test "a call dropped from a job stays out of the re-run after a crash" do
+  test "a missing record is skipped and reported again on the re-run after a crash" do
     RecordsCollectedJob.perform_later(@a)
     RecordsCollectedJob.perform_later(@b)
     job = SolidQueue::Job.sole
@@ -932,6 +939,26 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
 
     assert_equal [ [ [ @b ] ], [ [ @b ] ] ], JobBuffer.values
+    assert_equal 1, events.size
+    assert job.reload.finished?
+  end
+
+  test "a record restored after being skipped can run on the next attempt" do
+    RecordsCollectedJob.perform_later(@a)
+    RecordsCollectedJob.perform_later(@b)
+    job = SolidQueue::Job.sole
+    rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    @a.destroy!
+    process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "crashing-worker")
+    claimed = SolidQueue::ReadyExecution.claim("*", 10, process.id).sole
+
+    claimed.send(:execute)
+    assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    restored = JobResult.create!(id: @a.id)
+    claimed.release
+    events = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
+
+    assert_equal [ [ [ @b ] ], [ [ restored ], [ @b ] ] ], JobBuffer.values
     assert_empty events
     assert job.reload.finished?
   end
@@ -973,14 +1000,17 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     TwoRecordsJob.perform_later(@a)
     TwoRecordsJob.perform_later(@b)
     TwoRecordsJob.perform_later(@a)
+    jobs = SolidQueue::Job.order(:id).to_a
+    rows = jobs.map { |job| job.coalesced_calls.order(:id).pluck(:id, :arguments) }
     @a.destroy!
 
-    # The first job loses both its calls. The second has @b's arguments, and drops @a's call
-    perform_ready_jobs
+    # The first job skips both calls. The second has @b's arguments, and skips @a's call
+    SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
 
     assert_equal [ [ [ @b ] ] ], JobBuffer.values
     assert_empty SolidQueue::FailedExecution.all
     assert_equal 0, SolidQueue::Job.where(finished_at: nil).count
+    assert_equal rows, jobs.map { |job| job.coalesced_calls.order(:id).pluck(:id, :arguments) }
   end
 
   test "perform_now gets one call with no id and writes nothing" do
@@ -1107,6 +1137,28 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_equal 0, SolidQueue::CoalescedCall.count
     assert_equal [ "DELETE", "UPDATE" ], queries.map { |sql| sql.split.first }
+  end
+
+  [ true, false ].each do |preserve|
+    test "skipped calls follow job retention with preserve_finished_jobs #{preserve}" do
+      RecordsCollectedJob.perform_later(@a)
+      RecordsCollectedJob.perform_later(@b)
+      job = SolidQueue::Job.sole
+      rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
+      @a.destroy!
+
+      SolidQueue.with(preserve_finished_jobs: preserve) { perform_ready_jobs }
+
+      assert_equal [ [ [ @b ] ] ], JobBuffer.values
+      if preserve
+        assert job.reload.finished?
+        assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
+        SolidQueue::Job.clear_finished_in_batches(finished_before: 1.minute.from_now)
+      end
+
+      assert_not SolidQueue::Job.exists?(job.id)
+      assert_equal 0, SolidQueue::CoalescedCall.count
+    end
   end
 
   test "clearing a finished job deletes its calls" do
