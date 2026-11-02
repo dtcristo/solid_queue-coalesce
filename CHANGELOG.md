@@ -22,7 +22,6 @@ Adds debouncing with `debounce:` and `max_wait:`, and batches that run as soon a
 
 - `on_full: :dispatch` for `coalesce`, which dispatches a delayed collecting job as soon as it fills. ([#21](https://github.com/dtcristo/solid_queue-coalesce/pull/21))
 - `debounce:` and `max_wait:` for `coalesce`. Each call pushes a pending job back by the window, and `max_wait` caps how far. A recurring task can't use a debounced class. ([#28](https://github.com/dtcristo/solid_queue-coalesce/pull/28))
-- The `coalesced_calls_mismatch.solid_queue` notification. ([#15](https://github.com/dtcristo/solid_queue-coalesce/pull/15))
 - `class_name` in the `coalesce.solid_queue` and `drop_coalesced_call.solid_queue` payloads. ([#19](https://github.com/dtcristo/solid_queue-coalesce/pull/19))
 - `ActiveJob::Coalescing::CollectedJobMismatch`. A collecting job whose configuration changed fails with its calls, and you can recover by restoring the declaration and retrying it. ([#15](https://github.com/dtcristo/solid_queue-coalesce/pull/15))
 

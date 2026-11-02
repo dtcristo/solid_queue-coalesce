@@ -222,17 +222,13 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     assert job.reload.failed?
   end
 
-  test "a collecting job that lost some of its calls runs the rest and warns" do
+  test "a collecting job that lost some of its calls runs the rest" do
     job = enqueue_calls
     job.coalesced_calls.order(:id).first.delete
-    events = []
 
-    ActiveSupport::Notifications.subscribed(->(event) { events << event.payload }, "coalesced_calls_mismatch.solid_queue") do
-      perform_ready_jobs
-    end
+    perform_ready_jobs
 
     assert_equal [ [ :perform_calls, [ [ 2 ] ] ] ], JobBuffer.values
-    assert_equal [ { job_id: job.id, active_job_id: job.active_job_id, expected: 2, actual: 1 } ], events.map { |event| event.slice(:job_id, :active_job_id, :expected, :actual) }
   end
 
   test "a call to a class switched to collecting doesn't join a discarding job, and both calls run" do
