@@ -137,6 +137,33 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  class DiscardingDuringRunJob < ApplicationJob
+    limits_concurrency to: 1, key: "discarding_during_run", on_conflict: :discard, duration: 5.minutes
+
+    def perform(call)
+      JobBuffer.add(call)
+      CALLS_DURING_RUN << self.class.perform_later("during") if call == "first"
+    end
+  end
+
+  class DiscardingAboveLimitJob < ApplicationJob
+    limits_concurrency to: 2, key: "discarding_above_limit", on_conflict: :discard, duration: 5.minutes
+
+    def perform; end
+  end
+
+  class DiscardingGroupedJob < ApplicationJob
+    limits_concurrency key: "shared", group: "discarding_group", on_conflict: :discard, duration: 5.minutes
+
+    def perform; end
+  end
+
+  class OtherDiscardingGroupedJob < ApplicationJob
+    limits_concurrency key: "shared", group: "discarding_group", on_conflict: :discard, duration: 5.minutes
+
+    def perform; end
+  end
+
   class CoalescingDelayedJob < ApplicationJob
     coalesce key: "coalescing_duplicates"
 
@@ -321,6 +348,41 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
 
     assert_equal 5, SolidQueue::Job.where(class_name: DiscardingDelayedJob.name).count
     assert_equal 1, SolidQueue::Job.where(class_name: CoalescingDelayedJob.name).count
+  end
+
+  test "a concurrency discard drops a call during a run" do
+    DiscardingDuringRunJob.perform_later("first")
+
+    perform_ready_jobs
+
+    assert_nil CALLS_DURING_RUN.sole.provider_job_id
+    assert_equal [ "first" ], JobBuffer.values
+    assert_no_unfinished_jobs
+  end
+
+  test "a concurrency discard drops calls until duration passes if a semaphore isn't released" do
+    held = DiscardingDelayedJob.perform_later
+    SolidQueue::ReadyExecution.claim(SolidQueue::Job.find(held.provider_job_id).queue_name, 1, SolidQueue::Process.register(kind: "Worker", pid: 1, name: "dead").id)
+
+    assert_nil DiscardingDelayedJob.perform_later.provider_job_id
+
+    travel_to 6.minutes.from_now do
+      SolidQueue::Semaphore.expired.delete_all
+
+      assert DiscardingDelayedJob.perform_later.provider_job_id
+    end
+  end
+
+  test "a concurrency discard sheds load above a limit of more than one" do
+    jobs = 3.times.map { DiscardingAboveLimitJob.perform_later }
+
+    assert_equal [ true, true, false ], jobs.map { |job| job.provider_job_id.present? }
+  end
+
+  test "a concurrency discard dedupes across classes that share a group" do
+    DiscardingGroupedJob.perform_later
+
+    assert_nil OtherDiscardingGroupedJob.perform_later.provider_job_id
   end
 
   private

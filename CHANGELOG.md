@@ -42,6 +42,8 @@ Adds debouncing with `debounce:` and `max_wait:`, and batches that run as soon a
 
 ## 0.1.0 (2026-10-30)
 
+The first release lets many `perform_later` calls with the same key share one pending Solid Queue job. Install it with the generator, and there's nothing to upgrade from.
+
 - First release, with `coalesce key:`, `collect:`, `limit:` and `flush_when_full:`. ([#1](https://github.com/dtcristo/solid_queue-coalesce/pull/1))
 - Calls that share a key share one pending job, and the key is free again when that job starts. ([#1](https://github.com/dtcristo/solid_queue-coalesce/pull/1))
 - The `solid_queue:coalesce:install` generator. ([#1](https://github.com/dtcristo/solid_queue-coalesce/pull/1))

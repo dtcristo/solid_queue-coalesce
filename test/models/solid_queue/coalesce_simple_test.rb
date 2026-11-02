@@ -144,13 +144,16 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
-  test "a key is built from the job class and the key Proc's result" do
-    assert_equal "#{KeyedJob.name}/a", KeyedJob.new("a").coalesce_key
-    assert_equal KeyedJob.new(1).coalesce_key, KeyedJob.new("1").coalesce_key
-    assert_equal "#{KeyedJob.name}/a/b", KeyedJob.new([ "a", "b" ]).coalesce_key
-    assert_equal KeyedJob.new([ "a/b" ]).coalesce_key, KeyedJob.new([ "a", "b" ]).coalesce_key
-    assert_equal KeyedJob.name, KeyedJob.new(nil).coalesce_key
-    assert_not_equal KeyedJob.new("a").coalesce_key, OtherKeyedJob.new("a").coalesce_key
+  test "an integer and its string give the same key" do
+    assert_equal [ :created, :discarded ], [ 1, "1" ].map { |value| KeyedJob.perform_later(value).coalesce_status }
+  end
+
+  test "an array's items make a composite key, and a slash in an item collides with two items" do
+    assert_equal [ :created, :discarded, :created ], [ [ "a", "b" ], [ "a/b" ], [ "a", "c" ] ].map { |value| KeyedJob.perform_later(value).coalesce_status }
+  end
+
+  test "two classes can't share a key" do
+    assert_equal [ :created, :created ], [ KeyedJob, OtherKeyedJob ].map { |job_class| job_class.perform_later("a").coalesce_status }
   end
 
   test "a key Proc that returns nil merges all of those calls" do
