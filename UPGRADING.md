@@ -66,6 +66,8 @@ Deploy these changes together with the migration:
 
 These behaviours change too:
 
+- Calls that refer to deleted records are skipped for that attempt, and their rows stay until the job is destroyed. Retrying or re-running the job reports each still-missing call again; a restored record's call can run. Allow for these payloads in finished-job retention. To decide which records to process in your own code, enqueue IDs and look them up in `perform_calls` instead of passing records as GlobalIDs.
+- Remove `call_deleted` from notification subscribers, log parsers and metric labels. `drop_coalesced_call.solid_queue` reports a skip on an attempt, with no deletion outcome. Count these events as skipped attempts, or deduplicate by `call_id` if you need unique calls.
 - If you relied on reaching `limit` to dispatch a scheduled job early, jobs now wait for their time unless you set `on_full: :dispatch`.
 - A retry runs all of the job's calls again, so make `perform_calls` idempotent. Cursors over `perform`'s array don't carry over.
 - The key column uses the database's default collation. If that's case-insensitive, keys that differ only by case now coalesce together. Use a case-sensitive collation in the migration above if they have to stay apart.

@@ -104,6 +104,32 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     assert_equal [ [ 1, [ [ "a" ], [ "b" ] ] ], [ 2, [ [ "a" ], [ "b" ] ] ] ], JobBuffer.values
   end
 
+  test "a failed job keeps skipped calls through a manual retry and reports them again" do
+    missing, other = JobResult.create!, JobResult.create!
+    FailingCollectedJob.perform_later("g", missing)
+    FailingCollectedJob.perform_later("g", other)
+    job = SolidQueue::Job.sole
+    rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    missing.destroy!
+    skipped_ids = []
+    subscriber = ->(*, payload) { skipped_ids << payload[:call_id] }
+
+    ActiveSupport::Notifications.subscribed(subscriber, "drop_coalesced_call.solid_queue") do
+      assert_raises(ExpectedTestError) { perform_ready_jobs }
+      assert job.reload.failed?
+      assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
+
+      FailingCollectedJob.fixed = true
+      job.retry
+      SolidQueue.with(preserve_finished_jobs: true) { perform_ready_jobs }
+    end
+
+    assert job.reload.finished?
+    assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    assert_equal [ rows.first.first, rows.first.first ], skipped_ids
+    assert_equal [ [ [ "g", other ] ], [ [ "g", other ] ] ], JobBuffer.values
+  end
+
   test "a retry that can't be enqueued fails the run, which keeps its rows" do
     FlakyCollectedJob.perform_later("g", 1)
     job = SolidQueue::Job.sole
@@ -122,24 +148,36 @@ class SolidQueue::CoalesceRetriesTest < ActiveSupport::TestCase
     RetriedLimitedJob.perform_later(result)
     RetriedLimitedJob.perform_later(other)
     job = SolidQueue::Job.sole
+    rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
     result.destroy!
 
     perform_ready_jobs
 
     retried = SolidQueue::Job.where(active_job_id: job.active_job_id, finished_at: nil).sole
     assert_equal job.concurrency_key, retried.concurrency_key
-    assert_equal 1, retried.coalesced_calls.count
+    assert_equal rows, retried.coalesced_calls.order(:id).pluck(:id, :arguments)
     assert_equal [ [ 1, [ [ other ] ] ] ], JobBuffer.values
+
+    perform_ready_jobs
+
+    next_retry = SolidQueue::Job.where(active_job_id: job.active_job_id, finished_at: nil).sole
+    assert_equal job.concurrency_key, next_retry.concurrency_key
+    assert_equal rows, next_retry.coalesced_calls.order(:id).pluck(:id, :arguments)
+    assert_equal [ [ 1, [ [ other ] ] ], [ 2, [ [ other ] ] ] ], JobBuffer.values
   end
 
   test "a retry stopped by a callback fails the run too" do
-    AbortedRetryJob.perform_later("a")
+    missing, other = JobResult.create!, JobResult.create!
+    AbortedRetryJob.perform_later(missing)
+    AbortedRetryJob.perform_later(other)
     job = SolidQueue::Job.sole
+    rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    missing.destroy!
 
     assert_raises(SolidQueue::Job::EnqueueError) { perform_ready_jobs }
 
     assert job.reload.failed?
-    assert_equal 1, job.coalesced_calls.count
+    assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
   end
 
   test "exhausted retries leave a failed execution and manual retry reprocesses the same rows" do

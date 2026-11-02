@@ -258,11 +258,9 @@ module ActiveJob
         end
       end
 
-      # Anything but a deleted record raises on the way, before any row has been
-      # dropped, and fails the run with its rows. When every record is gone the rows
-      # stay until the job is destroyed: if this run crashes before finishing, the
-      # re-run needs them to tell it has nothing to do, because a collecting job
-      # without rows fails with CollectedJobMismatch.
+      # Calls whose records are gone are skipped for this attempt. Every row stays
+      # until its job is destroyed, and the next attempt deserializes them again.
+      # Any other error fails the run before skipped calls have been reported.
       def calls_from_coalesced_rows
         missing = {}
 
@@ -275,7 +273,7 @@ module ActiveJob
           nil
         end
 
-        drop_coalesced_rows(missing, delete: calls.any?)
+        instrument_skipped_calls(missing)
 
         calls
       end
@@ -286,11 +284,9 @@ module ActiveJob
         self.class.deserialize(job_data.dup).tap { |call| call.send(:deserialize_arguments_if_needed) }.arguments
       end
 
-      def drop_coalesced_rows(rows, delete:)
+      def instrument_skipped_calls(rows)
         rows.each do |id, error|
-          SolidQueue.instrument(:drop_coalesced_call, call_id: id, job_id: provider_job_id, active_job_id: job_id, class_name: self.class.name, exception_class: error.class.name) do |payload|
-            payload[:call_deleted] = delete && SolidQueue::CoalescedCall.where(id: id).delete_all.positive?
-          end
+          SolidQueue.instrument(:drop_coalesced_call, call_id: id, job_id: provider_job_id, active_job_id: job_id, class_name: self.class.name, exception_class: error.class.name)
         end
       end
 

@@ -6,6 +6,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 
 ### Breaking changes
 
+- Calls skipped because their records are gone stay until their job is destroyed and are reconsidered on each attempt. `call_deleted` is removed from `drop_coalesced_call.solid_queue`; the event reports a skip on each attempt, not a row deletion.
 - `coalesce` takes `on_conflict: :discard` or `:collect`, and `max_calls:`. These replace `collect:`, `limit:` and `flush_when_full:`.
 - Collecting jobs run `perform_calls(calls)`, which receives `ActiveJob::Coalescing::Call` objects. It replaces `perform(array)`.
 - Each call stores its whole Active Job payload, and belongs to one job from the moment it's enqueued.

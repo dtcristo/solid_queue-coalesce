@@ -164,7 +164,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     assert_equal({ job_id: job.id, active_job_id: job.active_job_id, class_name: CollectJob.name, expected: 2, actual: 1 }, events.sole.payload)
   end
 
-  test "a dropped call is reported as deleted when other calls run" do
+  test "a skipped call is reported without a deletion outcome when other calls run" do
     RecordsJob.perform_later(@a)
     RecordsJob.perform_later(@b)
     job = SolidQueue::Job.sole
@@ -175,10 +175,10 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
 
     assert_equal dropped_id, payload[:call_id]
     assert_equal RecordsJob.name, payload[:class_name]
-    assert_equal true, payload[:call_deleted]
+    assert_equal %i[ active_job_id call_id class_name exception_class job_id ], payload.keys.sort
   end
 
-  test "calls are reported as kept when every record is gone, and a re-run reports them again" do
+  test "every missing record is reported on each attempt" do
     RecordsJob.perform_later(@a)
     job = SolidQueue::Job.sole
     @a.destroy!
@@ -191,40 +191,30 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     claimed.release
     re_run = capture_events("drop_coalesced_call.solid_queue") { perform_ready_jobs }
 
-    assert_equal [ false ], first_run.map { |event| event.payload[:call_deleted] }
-    assert_equal [ false ], re_run.map { |event| event.payload[:call_deleted] }
+    assert_equal 1, first_run.size
+    assert_equal first_run.sole.payload[:call_id], re_run.sole.payload[:call_id]
+    assert_not first_run.sole.payload.key?(:call_deleted)
+    assert_not re_run.sole.payload.key?(:call_deleted)
   end
 
-  test "a call whose row is already gone isn't reported as deleted" do
+  test "skipping missing records doesn't write to the calls table" do
     RecordsJob.perform_later(@a)
     RecordsJob.perform_later(@b)
     job = SolidQueue::Job.sole
-    dropped_id = job.coalesced_calls.order(:id).first.id
+    rows = job.coalesced_calls.order(:id).pluck(:id, :arguments)
     @a.destroy!
-
-    # Something else deletes the row after the worker read it
-    events = capture_events("drop_coalesced_call.solid_queue") do
-      at_start_of_perform(-> { SolidQueue::CoalescedCall.where(id: dropped_id).delete_all }) { perform_ready_jobs }
+    writes = []
+    subscriber = ->(*, payload) do
+      writes << payload[:sql] if payload[:sql].match?(/\A(?:DELETE FROM|UPDATE|INSERT INTO) ["`]?solid_queue_coalesced_calls\b/)
     end
 
-    assert_equal false, events.sole.payload[:call_deleted]
-  end
-
-  test "a call that can't be deleted reports the error and isn't reported as deleted" do
-    RecordsJob.perform_later(@a)
-    RecordsJob.perform_later(@b)
-    @a.destroy!
-
-    SolidQueue::CoalescedCall.define_singleton_method(:where) { |*| raise ActiveRecord::StatementInvalid, "boom" }
-
-    events = capture_events("drop_coalesced_call.solid_queue") do
-      assert_raises(ActiveRecord::StatementInvalid) { perform_ready_jobs }
+    SolidQueue.with(preserve_finished_jobs: true) do
+      ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") { perform_ready_jobs }
     end
 
-    assert_equal "ActiveRecord::StatementInvalid", events.sole.payload[:exception].first
-    assert_not events.sole.payload.key?(:call_deleted)
-  ensure
-    SolidQueue::CoalescedCall.singleton_class.remove_method(:where)
+    assert job.reload.finished?
+    assert_equal rows, job.coalesced_calls.order(:id).pluck(:id, :arguments)
+    assert_empty writes
   end
 
   test "perform.active_job reports a job's call count on each attempt" do
