@@ -6,6 +6,28 @@ require "test_helper"
 class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
+  class ReindexProductJob < ApplicationJob
+    coalesce key: ->(product_id) { product_id }
+
+    def perform(product_id)
+      JobBuffer.add(product_id)
+    end
+  end
+
+  class ImportSupplierJob < ApplicationJob
+    def perform(product_ids)
+      product_ids.each do |product_id|
+        batch.enqueue { ReindexProductJob.perform_later(product_id) }
+      end
+    end
+  end
+
+  class PublishCatalogJob < ApplicationJob
+    def perform
+      JobBuffer.add(:published)
+    end
+  end
+
   class FixedWaitJob < ApplicationJob
     coalesce key: "fixed", on_conflict: :collect
 
@@ -358,6 +380,25 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     assert_nil CALLS_DURING_RUN.sole.provider_job_id
     assert_equal [ "first" ], JobBuffer.values
     assert_no_unfinished_jobs
+  end
+
+  test "importers in a batch share a pending reindex, and the callback runs once after them all" do
+    batch = SolidQueue::Batch.enqueue(on_success: PublishCatalogJob) do
+      [ [ 1, 2 ], [ 2, 3 ] ].each { |product_ids| ImportSupplierJob.perform_later(product_ids) }
+    end
+
+    perform_ready_jobs
+    assert_equal 5, batch.reload.total_jobs
+    assert_not batch.finished?
+
+    perform_ready_jobs
+    assert_equal [ 1, 2, 3 ], JobBuffer.values.sort
+    assert batch.reload.finished?
+
+    perform_ready_jobs
+    assert_equal [ 1, 2, 3, :published ], JobBuffer.values
+
+    SolidQueue::Batch.destroy_all
   end
 
   test "a concurrency discard drops calls until duration passes if a semaphore isn't released" do

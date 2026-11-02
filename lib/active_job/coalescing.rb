@@ -179,16 +179,18 @@ module ActiveJob
       @coalesce_on_conflict = job_data["coalesce_on_conflict"]
     end
 
-    # Scoped to the job class name, and built like concurrency_key
+    # Scoped to the job class name, and built like concurrency_key. In a batch it's
+    # scoped to the batch too, so each coalesced job belongs to one batch, and a call
+    # that joins it can't leave a batch waiting on another batch's job.
     def coalesce_key # :nodoc:
       if self.class.coalesce_key
         param = compute_concurrency_parameter(self.class.coalesce_key)
 
         case param
         when ActiveRecord::Base
-          [ self.class.name, param.class.name, param.id ]
+          [ coalesce_batch_scope, self.class.name, param.class.name, param.id ]
         else
-          [ self.class.name, param ]
+          [ coalesce_batch_scope, self.class.name, param ]
         end.compact.join("/")
       end
     end
@@ -236,6 +238,10 @@ module ActiveJob
     end
 
     private
+      def coalesce_batch_scope
+        [ SolidQueue::Batch.name, batch_id ] if batch_id
+      end
+
       # Only the run of a job a worker has claimed. perform_now on an instance that
       # went through perform_later also has a provider_job_id. A collecting job always
       # looks for its run, because the marker outlives the class's key and adapter.

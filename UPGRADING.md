@@ -70,6 +70,7 @@ These behaviours change too:
 - `drop_coalesced_call.solid_queue` reports a skip on an attempt, with no deletion outcome. Count these events as skipped attempts, or deduplicate by `call_id` if you need unique calls.
 - If you relied on reaching `limit` to dispatch a scheduled job early, jobs now wait for their time unless you set `on_full: :dispatch`.
 - A retry runs all of the job's calls again, so make `perform_calls` idempotent. Cursors over `perform`'s array don't carry over.
+- `SolidQueue::Job::CoalescedInBatchError` is gone. Remove any `rescue` of it, because Ruby would raise `NameError` when an exception reaches that `rescue`. Coalesced jobs that a `rescue` kept out of a batch now join it.
 - The key column uses the database's default collation. If that's case-insensitive, keys that differ only by case now coalesce together. Use a case-sensitive collation in the migration above if they have to stay apart.
 
 If you run pre-release code from `main`, remove `call_deleted` from notification subscribers, log parsers and metric labels. This field was added after 0.1.0 and removed before 0.2.0.

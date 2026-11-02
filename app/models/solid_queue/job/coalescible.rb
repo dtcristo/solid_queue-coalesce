@@ -2,10 +2,6 @@
 
 module SolidQueue
   class Job
-    # A coalesced job can't be part of a SolidQueue::Batch, because a call that joins
-    # a pending job adds no job to the batch.
-    class CoalescedInBatchError < EnqueueError; end
-
     module Coalescible # :nodoc: all
       extend ActiveSupport::Concern
 
@@ -51,12 +47,8 @@ module SolidQueue
           prepared_calls.each { |key, calls, payloads| enqueue_coalesced(key, calls, payloads) }
         end
 
-        def ensure_coalescible(active_jobs)
+        def ensure_coalescible
           raise CoalesceKey::PendingMigrations unless CoalesceKey.migrated?
-
-          if Batch.current_batch_id || active_jobs.any?(&:batch_id)
-            raise CoalescedInBatchError, "#{active_jobs.first.class.name} coalesces its calls, so it can't be enqueued as part of a batch: a call that joins an open job adds no job to the batch"
-          end
         end
 
         MAX_COALESCE_DEADLOCK_RETRIES = 5
@@ -248,10 +240,9 @@ module SolidQueue
           end
 
           # Not attributes_from_active_job, which serializes the call again, and that
-          # could raise after earlier jobs committed. A coalesced call is never in
-          # a batch, so it has no batch_id to set.
+          # could raise after earlier jobs committed.
           def create_collecting(active_job, payload)
-            create!(
+            attributes = {
               queue_name: active_job.queue_name || singleton_class::DEFAULT_QUEUE_NAME,
               active_job_id: active_job.job_id,
               priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
@@ -259,7 +250,10 @@ module SolidQueue
               class_name: active_job.class.name,
               arguments: payload.merge("coalesce_on_conflict" => "collect"),
               concurrency_key: active_job.concurrency_key
-            )
+            }
+            attributes[:batch_id] = active_job.batch_id if Batch.migrated?
+
+            create!(**attributes)
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
