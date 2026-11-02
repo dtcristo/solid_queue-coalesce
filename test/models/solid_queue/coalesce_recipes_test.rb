@@ -35,6 +35,7 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
 
     def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
+      CALLS_DURING_RUN << self.class.perform_later("D") if calls.first.arguments == [ "A" ]
     end
   end
 
@@ -46,16 +47,16 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
       JobBuffer.add(call)
 
       if call == "A"
-        FOLLOW_UP_CALLS << self.class.perform_later("B")
-        FOLLOW_UP_CALLS << self.class.perform_later("C")
+        CALLS_DURING_RUN << self.class.perform_later("B")
+        CALLS_DURING_RUN << self.class.perform_later("C")
       end
     end
   end
 
-  FOLLOW_UP_CALLS = Concurrent::Array.new
+  CALLS_DURING_RUN = Concurrent::Array.new
 
   setup { @start = Time.current.change(usec: 0) }
-  teardown { FOLLOW_UP_CALLS.clear }
+  teardown { CALLS_DURING_RUN.clear }
 
   test "every job class in the recipes loads with the options it shows" do
     classes = File.read(File.expand_path("../../../README.md", __dir__))[/^## Recipes$.*?(?=^## )/m].scan(/^class \w+ < ApplicationJob$.*?^end$/m)
@@ -102,16 +103,18 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     assert_equal [ :created, :collected, :created ], [ a, b, c ].map(&:coalesce_status)
     assert_equal a.provider_job_id, b.provider_job_id
     assert_not_equal a.provider_job_id, c.provider_job_id
-    assert_equal c.provider_job_id, SolidQueue::CoalesceKey.sole.job_id
 
     travel_to 2.minutes.from_now do
       SolidQueue::ScheduledExecution.dispatch_next_batch(10)
       perform_ready_jobs
     end
-    assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_equal [ [ [ "A" ], [ "B" ] ], [ [ "C" ] ] ], JobBuffer.values
 
-    assert_equal :created, SealingJob.perform_later("D").coalesce_status
+    during_first_run = CALLS_DURING_RUN.sole
+    assert_equal :collected, during_first_run.coalesce_status, "job 2 still holds the key while job 1 runs"
+    assert_equal c.provider_job_id, during_first_run.provider_job_id
+    assert_equal [ [ [ "A" ], [ "B" ] ], [ [ "C" ], [ "D" ] ] ], JobBuffer.values
+
+    assert_equal :created, SealingJob.perform_later("E").coalesce_status
   end
 
   test "calls during a run merge into one follow-up, and the next call after it runs straight away" do
@@ -120,7 +123,7 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
 
     perform_ready_jobs
 
-    created, discarded = FOLLOW_UP_CALLS.to_a
+    created, discarded = CALLS_DURING_RUN.to_a
     assert_equal [ :created, :discarded ], [ created.coalesce_status, discarded.coalesce_status ]
     assert_equal created.provider_job_id, discarded.provider_job_id
 
