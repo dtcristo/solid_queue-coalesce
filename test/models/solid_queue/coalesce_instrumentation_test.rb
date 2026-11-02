@@ -16,22 +16,22 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
 
   class CollectJob < ApplicationJob
     self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 3
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 3
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class RecordsJob < ApplicationJob
     coalesce key: "records", on_conflict: :collect
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class FlakyJob < ApplicationJob
     coalesce key: "flaky", on_conflict: :collect
     retry_on ExpectedTestError, wait: 1.hour, attempts: 2
 
-    def perform_batch(_calls)
+    def perform_calls(_calls)
       raise ExpectedTestError
     end
   end
@@ -39,7 +39,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
   class FailingJob < ApplicationJob
     coalesce key: "failing", on_conflict: :collect
 
-    def perform_batch(_calls)
+    def perform_calls(_calls)
       raise ExpectedTestError
     end
   end
@@ -68,7 +68,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
       end
     end
 
-    assert_equal [ :created ], events.map { |event| event.payload[:action] }
+    assert_equal [ :created ], events.map { |event| event.payload[:status] }
     assert_equal 0, SolidQueue::Job.count
   end
 
@@ -134,7 +134,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
 
     events = capture_events("coalesce.solid_queue") { second = DiscardJob.perform_later("g") }
 
-    assert_equal({ action: :discarded, key: "#{DiscardJob.name}/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: DiscardJob.name }, events.sole.payload)
+    assert_equal({ status: :discarded, key: "#{DiscardJob.name}/g", job_id: first.provider_job_id, active_job_id: second.job_id, class_name: DiscardJob.name }, events.sole.payload)
   end
 
   test "a worker starting a job emits no coalesce event" do
@@ -227,12 +227,12 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     SolidQueue::CoalescedCall.singleton_class.remove_method(:where)
   end
 
-  test "perform.active_job reports a batch's size on each attempt" do
+  test "perform.active_job reports a job's call count on each attempt" do
     CollectJob.perform_later("g", 1)
     CollectJob.perform_later("g", 2)
     DiscardJob.perform_later("g")
 
-    sizes = batch_sizes { perform_ready_jobs }
+    sizes = call_counts { perform_ready_jobs }
 
     assert_equal [ 2 ], sizes
   end
@@ -241,7 +241,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     RecordsJob.perform_later(@a)
     @a.destroy!
 
-    assert_equal [ 0 ], batch_sizes { perform_ready_jobs }
+    assert_equal [ 0 ], call_counts { perform_ready_jobs }
   end
 
   test "a job waiting to retry counts in waiting, with all of its calls" do
@@ -304,7 +304,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
     def counted_after_commit
       counted = []
       subscriber = ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
-        SolidQueue::Record.current_transaction.after_commit { counted << payload[:action] }
+        SolidQueue::Record.current_transaction.after_commit { counted << payload[:status] }
       end
       yield
       counted
@@ -312,7 +312,7 @@ class SolidQueue::CoalesceInstrumentationTest < ActiveSupport::TestCase
       ActiveSupport::Notifications.unsubscribe(subscriber)
     end
 
-    def batch_sizes
+    def call_counts
       sizes = []
       subscriber = ActiveSupport::Notifications.subscribe("perform.active_job") do |*, payload|
         calls = payload[:job].coalesced_calls

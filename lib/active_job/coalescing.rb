@@ -6,15 +6,16 @@ module ActiveJob
 
     COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
     COALESCE_ON_FULL_BEHAVIOUR = %i[ wait dispatch ]
-    DEFAULT_COALESCE_BATCH_SIZE = 100
+    DEFAULT_COALESCE_MAX_CALLS = 100
 
     # A job created as a collecting job can't run the way its class says now, or has
     # lost the calls it collected. Nothing has run, and the job fails with its calls.
     class CollectedJobMismatch < StandardError; end
 
-    # One accepted call in a batch. job_data is the call's Active Job payload as it
-    # was at enqueue, frozen at the top level. A call that never went through the
-    # queue passes a Proc, so only reading it needs the arguments to be serializable.
+    # One accepted call to a collecting job. job_data is the call's Active Job
+    # payload as it was at enqueue, frozen at the top level. A call that never went
+    # through the queue passes a Proc, so only reading it needs the arguments to be
+    # serializable.
     class Call
       attr_reader :id, :arguments
 
@@ -31,17 +32,17 @@ module ActiveJob
     end
 
     # Sits in front of the job's own #perform, whichever class defines it, so
-    # a collecting job runs #perform_batch instead.
+    # a collecting job runs #perform_calls instead.
     module CollectedPerform
       def perform(*)
-        perform_batch(coalesced_calls)
+        perform_calls(coalesced_calls)
       end
     end
 
     included do
       class_attribute :coalesce_key, instance_accessor: false
       class_attribute :coalesce_on_conflict, instance_accessor: false
-      class_attribute :coalesce_batch_size, instance_accessor: false
+      class_attribute :coalesce_max_calls, instance_accessor: false
       class_attribute :coalesce_on_full, instance_accessor: false
 
       attr_reader :coalesce_status, :coalesced_calls
@@ -49,7 +50,7 @@ module ActiveJob
     end
 
     class_methods do
-      def coalesce(key:, on_conflict: :discard, batch_size: nil, on_full: nil)
+      def coalesce(key:, on_conflict: :discard, max_calls: nil, on_full: nil)
         unless (key.is_a?(String) || key.is_a?(Symbol) || key.is_a?(Proc)) && key.present?
           raise ArgumentError, "`key` must be a non-blank String or Symbol, or a Proc"
         end
@@ -59,10 +60,10 @@ module ActiveJob
         end
 
         if on_conflict == :collect
-          batch_size = DEFAULT_COALESCE_BATCH_SIZE if batch_size.nil?
+          max_calls = DEFAULT_COALESCE_MAX_CALLS if max_calls.nil?
 
-          unless batch_size.is_a?(Integer) && batch_size.positive?
-            raise ArgumentError, "`batch_size` must be a positive integer"
+          unless max_calls.is_a?(Integer) && max_calls.positive?
+            raise ArgumentError, "`max_calls` must be a positive integer"
           end
 
           on_full = :wait if on_full.nil?
@@ -70,8 +71,8 @@ module ActiveJob
           unless on_full.in?(COALESCE_ON_FULL_BEHAVIOUR)
             raise ArgumentError, "`on_full` must be :wait or :dispatch"
           end
-        elsif !batch_size.nil?
-          raise ArgumentError, "`batch_size` needs `on_conflict: :collect`"
+        elsif !max_calls.nil?
+          raise ArgumentError, "`max_calls` needs `on_conflict: :collect`"
         elsif !on_full.nil?
           raise ArgumentError, "`on_full` needs `on_conflict: :collect`"
         end
@@ -80,7 +81,7 @@ module ActiveJob
 
         self.coalesce_key = key
         self.coalesce_on_conflict = on_conflict
-        self.coalesce_batch_size = batch_size
+        self.coalesce_max_calls = max_calls
         self.coalesce_on_full = on_full
       end
 
@@ -135,8 +136,8 @@ module ActiveJob
       end
     end
 
-    def perform_batch(_calls)
-      raise NotImplementedError, "#{self.class.name} uses `coalesce` with `on_conflict: :collect`, so it needs a `perform_batch(calls)` method"
+    def perform_calls(_calls)
+      raise NotImplementedError, "#{self.class.name} uses `coalesce` with `on_conflict: :collect`, so it needs a `perform_calls(calls)` method"
     end
 
     # A retry is the same work continuing, so it can't join or suppress anything

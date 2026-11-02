@@ -94,8 +94,8 @@ module SolidQueue
 
     # How many more calls the open job can take. A job created while its class was
     # discarding runs from its own arguments, so a call that joined it would replace them.
-    def capacity(batch_size)
-      discarding? ? 0 : batch_size - calls_count
+    def capacity(max_calls)
+      discarding? ? 0 : max_calls - calls_count
     end
 
     def collecting?
@@ -108,8 +108,8 @@ module SolidQueue
 
     # Records calls added to the job. A full job is sealed by deleting this row, so
     # the next call opens a new one, and nothing about the sealed job changes.
-    def fill(job_id, count, batch_size)
-      if count >= capacity(batch_size)
+    def fill(job_id, count, max_calls)
+      if count >= capacity(max_calls)
         destroy!
       else
         update_columns(job_id: job_id, calls_count: calls_count + count)

@@ -6,7 +6,7 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
   class CollectingRecurringJob < ApplicationJob
     coalesce key: "recurring", on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
     end
   end
 
@@ -18,11 +18,11 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
-  test "on_conflict defaults to discard, with no batch size" do
+  test "on_conflict defaults to discard, with no max_calls" do
     job_class = new_job_class { coalesce key: "a" }
 
     assert_equal :discard, job_class.coalesce_on_conflict
-    assert_nil job_class.coalesce_batch_size
+    assert_nil job_class.coalesce_max_calls
   end
 
   test "on_conflict is discard or collect, and anything else raises" do
@@ -35,22 +35,22 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
-  test "batch_size needs on_conflict collect" do
-    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", batch_size: 5 } }
+  test "max_calls needs on_conflict collect" do
+    error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", max_calls: 5 } }
     assert_match(/on_conflict: :collect/, error.message)
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :discard, batch_size: 5 } }
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :discard, max_calls: 5 } }
   end
 
-  test "batch_size has to be a positive integer" do
+  test "max_calls has to be a positive integer" do
     [ 0, -1, "5", 1.5, false ].each do |value|
-      assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: :collect, batch_size: value } }
+      assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: :collect, max_calls: value } }
     end
 
-    assert_equal 5, new_job_class { coalesce key: "a", on_conflict: :collect, batch_size: 5 }.coalesce_batch_size
+    assert_equal 5, new_job_class { coalesce key: "a", on_conflict: :collect, max_calls: 5 }.coalesce_max_calls
   end
 
-  test "batch_size defaults to 100 when collecting" do
-    assert_equal 100, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_batch_size
+  test "max_calls defaults to 100 when collecting" do
+    assert_equal 100, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_max_calls
   end
 
   test "on_full needs on_conflict collect" do

@@ -16,7 +16,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   class CollectingRefreshJob < ApplicationJob
     coalesce key: ->(name) { name }, on_conflict: :collect
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.size)
     end
   end
@@ -143,7 +143,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
       end
     end
 
-    assert_equal({ action: :created, key: "CoalescedRefreshJob/a", job_id: SolidQueue::Job.last.id, active_job_id: SolidQueue::Job.last.active_job_id, class_name: "CoalescedRefreshJob" }, events.sole.payload)
+    assert_equal({ status: :created, key: "CoalescedRefreshJob/a", job_id: SolidQueue::Job.last.id, active_job_id: SolidQueue::Job.last.active_job_id, class_name: "CoalescedRefreshJob" }, events.sole.payload)
   end
 
   test "coalesce_status is nil until an enqueue, and for perform_now" do
@@ -208,7 +208,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal [ true, false ], jobs.map(&:successfully_enqueued?)
     assert_equal [ :created, :discarded ], jobs.map(&:coalesce_status)
     assert_equal SolidQueue::Job.sole.id, jobs.map(&:provider_job_id).uniq.sole
-    assert_equal [ :created, :discarded ], events.map { |event| event.payload[:action] }
+    assert_equal [ :created, :discarded ], events.map { |event| event.payload[:status] }
     assert_equal jobs.map(&:job_id), events.map { |event| event.payload[:active_job_id] }
     assert_empty JobBuffer.values
   end
@@ -267,7 +267,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal 1, events.size
     assert_equal "CoalescedRefreshJob/a", events.first.payload[:key]
     assert_equal first.provider_job_id, events.first.payload[:job_id]
-    assert_equal :discarded, events.first.payload[:action]
+    assert_equal :discarded, events.first.payload[:status]
     assert_equal "CoalescedRefreshJob", events.first.payload[:class_name]
     assert_equal second.job_id, events.first.payload[:active_job_id]
   end
@@ -490,7 +490,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     assert_equal 1, queries.count { |sql| sql.match?(/\ASAVEPOINT/i) }, queries.to_s
   end
 
-  test "bulk discards read the keys table once per batch, however many jobs are in it" do
+  test "bulk discards read the keys table once per pass, however many jobs are in it" do
     AddToBufferJob.perform_later("a")
     AddToBufferJob.perform_later("b")
 

@@ -6,15 +6,16 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 
 ### Breaking changes
 
-- `coalesce` takes `on_conflict: :discard` or `:collect`, and `batch_size:`. These replace `collect:`, `limit:` and `flush_when_full:`.
-- Collecting jobs run `perform_batch(calls)`, which receives `ActiveJob::Coalescing::Call` objects. It replaces `perform(array)`.
+- `coalesce` takes `on_conflict: :discard` or `:collect`, and `max_calls:`. These replace `collect:`, `limit:` and `flush_when_full:`.
+- Collecting jobs run `perform_calls(calls)`, which receives `ActiveJob::Coalescing::Call` objects. It replaces `perform(array)`.
 - Each call stores its whole Active Job payload, and belongs to one job from the moment it's enqueued.
-- Reaching `batch_size` seals a job, and by default doesn't dispatch it early. A sealed job waits for its time unless `on_full: :dispatch` is set, and each batch takes its schedule from its first call.
+- Reaching `max_calls` seals a job, and by default doesn't dispatch it early. A sealed job waits for its time unless `on_full: :dispatch` is set, and each job takes its schedule from its first call.
 - `coalesce_status` replaces `coalesced?`. The `:dropped` outcome is now `:discarded`.
+- `action` in the `coalesce.solid_queue` payload is now `status`.
 - `drop_coalesced_argument.solid_queue` is now `drop_coalesced_call.solid_queue`, and its `argument_id` is now `call_id`.
 - `SolidQueue::CoalescedArgument` and its table are now `SolidQueue::CoalescedCall` and `solid_queue_coalesced_calls`.
 - The key column uses the database's default collation, like Solid Queue's semaphores. Under a case-insensitive collation, keys that differ only by case now coalesce together.
-- A retry runs the whole batch again. Calls can no longer be skipped with an `ActiveJob::Continuable` cursor over `perform`'s array.
+- A retry runs all of the job's calls again. Calls can no longer be skipped with an `ActiveJob::Continuable` cursor over `perform`'s array.
 
 ### Added
 
@@ -26,7 +27,7 @@ Upgrading from 0.1.0 needs a drain and a migration. See [UPGRADING.md](UPGRADING
 ### Changed
 
 - Keys are released when a job starts, fails or gets destroyed, so a dispatcher no longer has to release stranded keys.
-- `ActiveJob.perform_all_later` works out keys and payloads before it writes anything, and stores one transaction per discard admission or collecting batch. Wrap it in `SolidQueue::Record.transaction` for all-or-nothing.
+- `ActiveJob.perform_all_later` works out keys and payloads before it writes anything, and stores one transaction per discard admission or collecting job. Wrap it in `SolidQueue::Record.transaction` for all-or-nothing.
 - Each collected call is rebuilt through the job's own `deserialize` and `deserialize_arguments`.
 - `SolidQueue::CoalescedCall.waiting` is worked out from the job that owns each call: it hasn't finished, isn't running and hasn't failed.
 - Jobs that aren't coalesced no longer read the keys table when they finish, fail or get destroyed.

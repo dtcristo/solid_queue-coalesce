@@ -14,7 +14,7 @@ class ResumableCollectedJob < ApplicationJob
   cattr_accessor :stop_after
   self.resume_options = { wait: 0 }
 
-  def perform_batch(calls)
+  def perform_calls(calls)
     results = calls.map { |call| call.arguments.first }
     JobBuffer.add([ :run, results.map(&:id) ])
 

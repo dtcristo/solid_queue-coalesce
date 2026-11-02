@@ -58,7 +58,7 @@ class SolidQueue::CoalesceOutcomesTest < ActiveSupport::TestCase
     self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
     coalesce key: "not_deferred", on_conflict: :collect
 
-    def perform_batch(_calls)
+    def perform_calls(_calls)
     end
   end
 
@@ -66,7 +66,7 @@ class SolidQueue::CoalesceOutcomesTest < ActiveSupport::TestCase
     coalesce key: "callback", on_conflict: :collect
     after_enqueue { JobBuffer.add([ coalesce_status, provider_job_id ]) }
 
-    def perform_batch(_calls)
+    def perform_calls(_calls)
     end
   end
 
@@ -84,7 +84,7 @@ class SolidQueue::CoalesceOutcomesTest < ActiveSupport::TestCase
     coalesce key: "worker", on_conflict: :collect
     rescue_from(ExpectedTestError) { retry_job.then { |retried| JobBuffer.add([ :retried, retried.coalesce_status, retried.provider_job_id, retried.successfully_enqueued? ]) } }
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add([ coalesce_status, provider_job_id, successfully_enqueued?.present?, calls.map(&:id) ])
       raise ExpectedTestError if executions == 1
     end
@@ -104,7 +104,7 @@ class SolidQueue::CoalesceOutcomesTest < ActiveSupport::TestCase
       self.tenant = job_data["tenant"]
     end
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add([ I18n.locale, Time.zone.name, tenant, calls.map(&:job_data) ])
     end
   end

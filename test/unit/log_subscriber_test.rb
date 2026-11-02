@@ -16,14 +16,14 @@ class LogSubscriberTest < ActiveSupport::TestCase
 
   test "coalesce a call" do
     attach_log_subscriber
-    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :discarded
+    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", status: :discarded
 
     assert_match_logged :debug, "Coalesce call", "job_id: 42, active_job_id: \"abc\", class_name: \"MyJob\", outcome: :discarded"
   end
 
   test "a coalesce line leaves out the key, which the app defines" do
     attach_log_subscriber
-    instrument "coalesce.solid_queue", key: "MyJob/secret", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :created
+    instrument "coalesce.solid_queue", key: "MyJob/secret", job_id: 42, active_job_id: "abc", class_name: "MyJob", status: :created
 
     assert_no_match(/secret/, @logger.logged(:debug).join)
   end
@@ -53,7 +53,7 @@ class LogSubscriberTest < ActiveSupport::TestCase
 
   test "no event logs arguments or payloads, whatever it's given" do
     attach_log_subscriber
-    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", action: :created, arguments: [ "secret" ], job_data: { "arguments" => [ "secret" ] }
+    instrument "coalesce.solid_queue", key: "MyJob/1", job_id: 42, active_job_id: "abc", class_name: "MyJob", status: :created, arguments: [ "secret" ], job_data: { "arguments" => [ "secret" ] }
     instrument "drop_coalesced_call.solid_queue", call_id: 7, job_id: 42, active_job_id: "abc", exception_class: "E", arguments: [ "secret" ]
     instrument "coalesced_calls_mismatch.solid_queue", job_id: 42, active_job_id: "abc", expected: 3, actual: 2, arguments: [ "secret" ]
 

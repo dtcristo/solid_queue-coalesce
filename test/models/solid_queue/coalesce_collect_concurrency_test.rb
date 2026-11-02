@@ -9,43 +9,43 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class CollectAllJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 10_000
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 10_000
 
-    def perform_batch(calls)
-      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    def perform_calls(calls)
+      RACED_RUNS << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectFiveJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 5
 
-    def perform_batch(calls)
-      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    def perform_calls(calls)
+      RACED_RUNS << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectFiveDispatchingJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5, on_full: :dispatch
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 5, on_full: :dispatch
 
-    def perform_batch(calls)
-      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    def perform_calls(calls)
+      RACED_RUNS << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectFiveLimitedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 5
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 5
     limits_concurrency key: "shared", to: 1
 
-    def perform_batch(calls)
-      RACED_BATCHES << [ provider_job_id, calls.map(&:arguments) ]
+    def perform_calls(calls)
+      RACED_RUNS << [ provider_job_id, calls.map(&:arguments) ]
     end
   end
 
   class CollectTwoPerCallLimitedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
     limits_concurrency key: ->(_group, limit_group) { limit_group }, to: 1
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class DiscardPerKeyJob < ApplicationJob
@@ -62,10 +62,10 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     coalesce key: ->(group, *) { group }, on_conflict: :collect
   end
 
-  RACED_BATCHES = Concurrent::Array.new
+  RACED_RUNS = Concurrent::Array.new
 
   setup do
-    RACED_BATCHES.clear
+    RACED_RUNS.clear
     @process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "race-worker")
   end
 
@@ -100,7 +100,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
-  test "bulk enqueues racing over batch boundaries don't exceed capacity, and each call knows its job" do
+  test "bulk enqueues racing over job boundaries don't exceed capacity, and each call knows its job" do
     results = race(4) do |thread|
       jobs = 12.times.map { |i| CollectFiveJob.new("g", thread, i) }
       SolidQueue::Job.enqueue_all(jobs)
@@ -142,23 +142,23 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 22, discarding.count { |active_job| active_job.coalesce_status == :discarded }
   end
 
-  test "another connection can update an earlier batch's semaphore during a bulk enqueue" do
+  test "another connection can update an earlier job's semaphore during a bulk enqueue" do
     skip_on_sqlite
 
-    jobs = limited_batches
-    update, finished = updating_first_semaphore_at_second_batch(jobs) { SolidQueue::Job.enqueue_all(jobs) }
+    jobs = limited_jobs
+    update, finished = updating_first_semaphore_at_second_job(jobs) { SolidQueue::Job.enqueue_all(jobs) }
 
     assert finished, "the update should go through while the enqueue runs"
     assert_equal 1, update.value
     assert_equal 3, jobs.map(&:provider_job_id).uniq.size
   end
 
-  test "inside an enclosing transaction, an earlier batch's semaphore stays locked until the commit" do
+  test "inside an enclosing transaction, an earlier job's semaphore stays locked until the commit" do
     skip_on_sqlite
 
-    jobs = limited_batches
+    jobs = limited_jobs
     update, finished = SolidQueue::Record.transaction do
-      updating_first_semaphore_at_second_batch(jobs, waiting: 0.5) { SolidQueue::Job.enqueue_all(jobs) }
+      updating_first_semaphore_at_second_job(jobs, waiting: 0.5) { SolidQueue::Job.enqueue_all(jobs) }
     end
 
     assert_not finished, "the update should wait for the commit"
@@ -261,8 +261,8 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
 
     perform_ready_jobs
 
-    assert_equal [ sealed_job.id ], RACED_BATCHES.map(&:first)
-    assert_equal 5, RACED_BATCHES.sole.last.size
+    assert_equal [ sealed_job.id ], RACED_RUNS.map(&:first)
+    assert_equal 5, RACED_RUNS.sole.last.size
     assert_equal open_job, SolidQueue::CoalesceKey.sole.job_id
     assert_equal 1, SolidQueue::CoalesceKey.sole.calls_count
   end
@@ -271,17 +271,17 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     calls = race_appends_against_workers(CollectFiveJob, appenders: 6, calls_per_appender: 40, workers: 3)
 
     assert_every_call_ran_once calls
-    assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
+    assert RACED_RUNS.all? { |_, calls| calls.size <= 5 }
     assert_equal 0, SolidQueue::CoalescedCall.waiting.count
     assert_equal 0, SolidQueue::CoalesceKey.count
-    assert_batches_match_their_rows
+    assert_runs_match_their_rows
   end
 
   test "appends racing starts with several keys and a blocking concurrency limit" do
     calls = race_appends_against_workers(CollectFiveLimitedJob, appenders: 4, calls_per_appender: 30, workers: 3, groups: %w[ a b ])
 
     assert_every_call_ran_once calls
-    assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
+    assert RACED_RUNS.all? { |_, calls| calls.size <= 5 }
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
@@ -409,7 +409,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     kept = SolidQueue::CoalescedCall.pluck(:arguments).map { |payload| payload["job_id"] }
     assert_empty kept - results.map(&:job_id)
     drain_ready
-    assert_equal kept.size, RACED_BATCHES.flat_map(&:last).size
+    assert_equal kept.size, RACED_RUNS.flat_map(&:last).size
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
@@ -427,7 +427,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::CoalescedCall.where(job_id: active_job.provider_job_id).count
   end
 
-  # On the last statement of a batch, so the key's release and the job's delete, with
+  # On the last statement of a discard, so the key's release and the job's delete, with
   # its calls, have to be rolled back
   test "a bulk discard retries a deadlock up to its limit, then raises with nothing lost" do
     active_job = CollectAllJob.perform_later("g", 1)
@@ -633,7 +633,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     calls = race_appends_against_workers(CollectFiveDispatchingJob, appenders: 4, calls_per_appender: 30, workers: 3)
 
     assert_every_call_ran_once calls
-    assert RACED_BATCHES.all? { |_, batch| batch.size <= 5 }
+    assert RACED_RUNS.all? { |_, calls| calls.size <= 5 }
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 
@@ -642,23 +642,23 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       ChangingModeJob.coalesce key: ->(group, *) { group }, on_conflict: on_conflict
     end
 
-    # Four calls in two batches on one key, and a third batch on another. Each batch
+    # Four calls in two jobs on one key, and a third job on another. Each job
     # has its own semaphore, already there, so that holding one means locking its row.
-    def limited_batches
+    def limited_jobs
       [ %w[ g s1 ], %w[ g s1 ], %w[ g s2 ], %w[ g s2 ], %w[ h s3 ] ].map { |arguments| CollectTwoPerCallLimitedJob.new(*arguments) }.tap do |jobs|
         jobs.map(&:concurrency_key).uniq.each { |key| SolidQueue::Semaphore.create!(key: key, value: 1, expires_at: 1.hour.from_now) }
       end
     end
 
-    # Subscribers run on the enqueuing thread, between one batch's transaction and
+    # Subscribers run on the enqueuing thread, between one job's transaction and
     # the next, so the update always starts at that point, and the enqueue waits for
     # it. Returns the update's thread, with its row count as its value, and whether
     # it finished in time. One that's still waiting finishes when the locks go away.
-    def updating_first_semaphore_at_second_batch(jobs, waiting: 5)
+    def updating_first_semaphore_at_second_job(jobs, waiting: 5)
       update = finished = nil
       created = 0
       subscriber = ActiveSupport::Notifications.subscribe("coalesce.solid_queue") do |*, payload|
-        if payload[:action] == :created && (created += 1) == 2
+        if payload[:status] == :created && (created += 1) == 2
           update = in_thread { SolidQueue::Semaphore.where(key: jobs.first.concurrency_key).update_all(value: 0) }
           finished = update.join(waiting).present?
         end
@@ -778,7 +778,7 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
     end
 
     def assert_every_call_ran_once(calls)
-      assert_equal calls.sort_by(&:to_s), RACED_BATCHES.flat_map(&:last).sort_by(&:to_s)
+      assert_equal calls.sort_by(&:to_s), RACED_RUNS.flat_map(&:last).sort_by(&:to_s)
     end
 
     def assert_jobs_hold_their_calls_within_capacity(results, total:)
@@ -796,10 +796,10 @@ class SolidQueue::CoalesceCollectConcurrencyTest < ActiveSupport::TestCase
       end
     end
 
-    def assert_batches_match_their_rows
-      RACED_BATCHES.each do |job_id, batch|
+    def assert_runs_match_their_rows
+      RACED_RUNS.each do |job_id, calls|
         rows = SolidQueue::CoalescedCall.where(job_id: job_id).order(:id).map { |row| row.arguments["arguments"] }
-        assert_equal rows, batch
+        assert_equal rows, calls
       end
     end
 

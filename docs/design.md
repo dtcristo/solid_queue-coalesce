@@ -38,7 +38,7 @@ Admission locks the key, then the job and its semaphore. Everything else has to 
 - `failed_with` and `finished!` release the key before calling `super`.
 - Bulk discards call `CoalesceKey.release_all` before `super`, in key order, so that two of them can't deadlock with each other.
 - `lock_for_release` finds the row's key and then locks through the key's index. Locking through the `job_id` index takes InnoDB's locks on the row's indexes in the opposite order to admission.
-- Bulk enqueues sort their calls by key, and take one transaction per discard admission or collecting batch, so one call holds one key's lock at a time.
+- Bulk enqueues sort their calls by key, and take one transaction per discard admission or collecting job, so one call holds one key's lock at a time.
 
 `on_full: :dispatch` is the exception. It locks a scheduled execution while holding the key, and a discard holds that execution while it waits for the key. So it uses `non_blocking_lock`, and skips a row that's held: the holder is either the dispatcher, which is dispatching a job that's due, or a discard. It's why early dispatch is best effort. A discard that rolls back leaves the job at its old time. It checks that the row exists first, because on MySQL a locking read of a missing row takes a gap lock, and a stale snapshot can only leave the job at its old time too.
 
@@ -64,8 +64,8 @@ A retry of a collecting job creates a new job with the same `active_job_id`, and
 
 `perform_now` calls `start_coalesced_run` first, outside the `rescue_from` of Active Job's own `perform_now`, so `retry_on` can't swallow what it raises. The error reaches `ClaimedExecution#execute`, which turns it into a failed execution with its calls.
 
-A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone is deleted if the batch has other calls to run. If every call's record is gone, the rows stay until the job is destroyed, so a re-run after a crash can see that it has nothing to do.
+A collecting job never falls back to its own arguments, which are a copy of its first call's. With no calls it raises `CollectedJobMismatch`. A call whose record is gone is deleted if the job has other calls to run. If every call's record is gone, the rows stay until the job is destroyed, so a re-run after a crash can see that it has nothing to do.
 
 ## Cost for other jobs
 
-A job that isn't coalesced doesn't read the keys table when it finishes, fails or gets destroyed. It only parses its own payload to find that out. A job with the marker, or whose class coalesces, does one indexed read each time, even if it has no key left. Solid Queue's bulk discards do one read per batch, whatever the jobs are. [The benchmarks](../test/benchmarks/README.md) have the numbers.
+A job that isn't coalesced doesn't read the keys table when it finishes, fails or gets destroyed. It only parses its own payload to find that out. A job with the marker, or whose class coalesces, does one indexed read each time, even if it has no key left. Solid Queue's bulk discards do one read per pass, whatever the jobs are. [The benchmarks](../test/benchmarks/README.md) have the numbers.

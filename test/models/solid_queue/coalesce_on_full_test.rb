@@ -6,44 +6,44 @@ class SolidQueue::CoalesceOnFullTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class DispatchedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2, on_full: :dispatch
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2, on_full: :dispatch
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
   class WaitingJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class SingleCallJob < ApplicationJob
-    coalesce key: "single", on_conflict: :collect, batch_size: 1, on_full: :dispatch
+    coalesce key: "single", on_conflict: :collect, max_calls: 1, on_full: :dispatch
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class HundredsJob < ApplicationJob
-    coalesce key: "hundreds", on_conflict: :collect, batch_size: 100, on_full: :dispatch
+    coalesce key: "hundreds", on_conflict: :collect, max_calls: 100, on_full: :dispatch
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class LimitedJob < ApplicationJob
-    coalesce key: ->(group, *) { group }, on_conflict: :collect, batch_size: 2, on_full: :dispatch
+    coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2, on_full: :dispatch
     limits_concurrency key: "shared", to: 1
 
-    def perform_batch(calls)
+    def perform_calls(calls)
       JobBuffer.add(calls.map(&:arguments))
     end
   end
 
   class FailingJob < ApplicationJob
-    coalesce key: "failing", on_conflict: :collect, batch_size: 2, on_full: :dispatch
+    coalesce key: "failing", on_conflict: :collect, max_calls: 2, on_full: :dispatch
 
-    def perform_batch(_calls)
+    def perform_calls(_calls)
       raise ExpectedTestError
     end
   end
@@ -84,7 +84,7 @@ class SolidQueue::CoalesceOnFullTest < ActiveSupport::TestCase
     assert SolidQueue::Job.sole.ready?
   end
 
-  test "a bulk enqueue dispatches each batch it fills, and nothing else" do
+  test "a bulk enqueue dispatches each job it fills, and nothing else" do
     ActiveJob.perform_all_later(250.times.map { |i| HundredsJob.new(i).set(wait: 1.hour) })
 
     jobs = SolidQueue::Job.order(:id).to_a
@@ -93,7 +93,7 @@ class SolidQueue::CoalesceOnFullTest < ActiveSupport::TestCase
     assert_equal [ 100, 100, 50 ], jobs.map { |job| job.coalesced_calls.count }
   end
 
-  test "the next batch takes its own first call's schedule, queue and priority" do
+  test "the next job takes its own first call's schedule, queue and priority" do
     2.times { |i| DispatchedJob.set(wait: 1.hour).perform_later("g", i) }
     next_call = DispatchedJob.set(wait: 2.hours, queue: "later", priority: 7).perform_later("g", 2)
 

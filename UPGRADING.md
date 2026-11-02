@@ -53,12 +53,13 @@ Deploy these changes together with the migration:
 | 0.1.0 | 0.2.0 |
 | --- | --- |
 | `collect: true` | `on_conflict: :collect` |
-| `limit: 100` | `batch_size: 100` |
+| `limit: 100` | `max_calls: 100` |
 | `flush_when_full: true`, which was the default | `on_full: :dispatch` |
-| `flush_when_full: false` | Remove it. A full batch waits for its time by default |
-| `perform(array)` on a collecting job | `perform_batch(calls)`, and read `call.arguments` |
+| `flush_when_full: false` | Remove it. A full job waits for its time by default |
+| `perform(array)` on a collecting job | `perform_calls(calls)`, and read `call.arguments` |
 | `coalesced?` | `coalesce_status`, which is `:discarded` or `:collected` for a call that joined a job |
 | `:dropped` in `coalesce.solid_queue` | `:discarded` |
+| `action` in `coalesce.solid_queue` | `status` |
 | `drop_coalesced_argument.solid_queue` | `drop_coalesced_call.solid_queue` |
 | `argument_id` in that event's payload | `call_id` |
 | `SolidQueue::CoalescedArgument` | `SolidQueue::CoalescedCall` |
@@ -66,5 +67,5 @@ Deploy these changes together with the migration:
 These behaviours change too:
 
 - If you relied on reaching `limit` to dispatch a scheduled job early, jobs now wait for their time unless you set `on_full: :dispatch`.
-- A retry runs its whole batch again, so make `perform_batch` idempotent. Cursors over `perform`'s array don't carry over.
+- A retry runs all of the job's calls again, so make `perform_calls` idempotent. Cursors over `perform`'s array don't carry over.
 - The key column uses the database's default collation. If that's case-insensitive, keys that differ only by case now coalesce together. Use a case-sensitive collation in the migration above if they have to stay apart.

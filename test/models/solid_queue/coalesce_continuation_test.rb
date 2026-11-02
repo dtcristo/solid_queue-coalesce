@@ -24,7 +24,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
   test "a resumed job whose class stopped coalescing fails, and runs its remaining steps once restored" do
     perform_ready_jobs
     resumed = SolidQueue::Job.where(finished_at: nil).sole
-    key, on_conflict, batch_size = ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_batch_size
+    key, on_conflict, max_calls = ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_max_calls
 
     begin
       stop_coalescing(ResumableCollectedJob)
@@ -34,7 +34,7 @@ class SolidQueue::CoalesceContinuationTest < ActiveSupport::TestCase
       assert resumed.reload.failed?
       assert_equal 3, resumed.coalesced_calls.count
     ensure
-      ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_batch_size = key, on_conflict, batch_size
+      ResumableCollectedJob.coalesce_key, ResumableCollectedJob.coalesce_on_conflict, ResumableCollectedJob.coalesce_max_calls = key, on_conflict, max_calls
     end
 
     ResumableCollectedJob.stop_after = nil

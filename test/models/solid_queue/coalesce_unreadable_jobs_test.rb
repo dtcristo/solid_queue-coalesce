@@ -10,7 +10,7 @@ class SolidQueue::CoalesceUnreadableJobsTest < ActiveSupport::TestCase
   class CollectingJob < ApplicationJob
     coalesce key: "unreadable", on_conflict: :collect
 
-    def perform_batch(_calls); end
+    def perform_calls(_calls); end
   end
 
   class DiscardingJob < ApplicationJob
