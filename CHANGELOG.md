@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+Batch coalescing keys now use the shorter `Batch/` prefix. Upgrading requires draining affected batches before deploying; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
+
+### Changed
+
+- **Breaking:** Batched coalescing keys start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`, including keys in `coalesce.solid_queue` notifications. Drain affected batches before upgrading so new calls don't create separate jobs under the new keys.
+
 ## [0.2.0] - 2026-11-02
 
 Adds debouncing with `debounce:` and `max_wait:`, batches that run as soon as they fill with `on_full: :dispatch`, and support for [`SolidQueue::Batch`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#batch-jobs). Collecting jobs now use `perform_calls(calls)`, so upgrading from 0.1.0 needs code changes, a drain and a migration. See [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).

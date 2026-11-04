@@ -387,7 +387,10 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
       [ [ 1, 2 ], [ 2, 3 ] ].each { |product_ids| ImportSupplierJob.perform_later(product_ids) }
     end
 
-    perform_ready_jobs
+    events = []
+    callback = ->(*, payload) { events << payload }
+    ActiveSupport::Notifications.subscribed(callback, "coalesce.solid_queue") { perform_ready_jobs }
+    assert_equal [ 1, 2, 2, 3 ].map { |id| "Batch/#{batch.id}/SolidQueue::CoalesceRecipesTest::ReindexProductJob/#{id}" }, events.map { |payload| payload[:key] }.sort
     assert_equal 5, batch.reload.total_jobs
     assert_not batch.finished?
 

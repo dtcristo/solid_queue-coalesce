@@ -239,7 +239,7 @@ module ActiveJob
 
     private
       def coalesce_batch_scope
-        [ SolidQueue::Batch.name, batch_id ] if batch_id
+        [ "Batch", batch_id ] if batch_id
       end
 
       # Only the run of a job a worker has claimed. perform_now on an instance that
