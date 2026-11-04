@@ -193,8 +193,14 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
 
   test "calls with the same key in a batch share one job" do
     calls = []
-    batch = SolidQueue::Batch.enqueue { 3.times { |i| calls << DiscardJob.perform_later("a", i) } }
+    events = []
+    batch = nil
+    callback = ->(*, payload) { events << payload }
+    ActiveSupport::Notifications.subscribed(callback, "coalesce.solid_queue") do
+      batch = SolidQueue::Batch.enqueue { 3.times { |i| calls << DiscardJob.perform_later("a", i) } }
+    end
 
+    assert_equal [ "Batch/#{batch.id}/SolidQueue::CoalesceBatchTest::DiscardJob/a" ] * 3, events.map { |payload| payload[:key] }
     assert_equal [ :created, :discarded, :discarded ], calls.map(&:coalesce_status)
     assert_equal [ batch.jobs.sole.id ], calls.map(&:provider_job_id).uniq
     assert_equal 1, batch.reload.total_jobs

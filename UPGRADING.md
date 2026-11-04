@@ -1,4 +1,15 @@
-# Upgrading to version 0.2.x
+# Upgrading from version 0.2.0 to the next release
+
+Batched coalescing keys now start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`. Existing jobs can still run, but new calls won't join pending jobs under the old keys and can create separate jobs for the same work. No database migration is needed.
+
+1. Pause producers that start batches or enqueue work into them. Keep the old workers and dispatcher running so jobs can finish their batch work.
+2. Wait for affected batches to finish, including scheduled and blocked work. Retry or discard failed jobs. To conservatively check all batches, wait until `SolidQueue::Batch.where(finished_at: nil).count` is zero.
+3. Stop the old application and Solid Queue processes, deploy the new version together, then resume producers. Don't run both versions against active affected batches.
+
+Update notification subscribers, log parsers or other consumers that match the old key prefix. `coalesce.solid_queue` now reports keys such as `Batch/7/ReindexProductJob/42`.
+
+# Upgrading from version 0.1.0 to 0.2.0
+
 This version replaces the gem's tables and the options of `coalesce`. There's no in-place migration for waiting calls, so drain them first. The generator skips an app that already has its migration, so this upgrade needs a migration of your own.
 
 Stop enqueuing jobs that use `coalesce`, and on 0.1.0 wait until none of those jobs are left. This query includes scheduled, blocked, running and failed jobs, so retry or discard the failed ones:
