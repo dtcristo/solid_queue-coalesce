@@ -10,7 +10,7 @@ Batch coalescing keys now use the shorter `Batch/` prefix. Upgrading requires dr
 
 ### Changed
 
-- **Breaking:** Batched coalescing keys start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`, including keys in `coalesce.solid_queue` notifications. Drain affected batches before upgrading so new calls don't create separate jobs under the new keys.
+- **Breaking:** Batched coalescing keys start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`, including keys in `coalesce.solid_queue` notifications. Drain affected batches before upgrading so new calls don't create separate jobs under the new keys. ([#43](https://github.com/dtcristo/solid_queue-coalesce/pull/43))
 
 ## [0.2.0] - 2026-11-02
 
