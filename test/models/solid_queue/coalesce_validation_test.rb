@@ -18,6 +18,13 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
+  class ReplacingRecurringJob < ApplicationJob
+    coalesce key: "recurring", on_conflict: :replace
+
+    def perform
+    end
+  end
+
   class DebouncedRecurringJob < ApplicationJob
     coalesce key: "recurring", debounce: 30.seconds
 
@@ -32,11 +39,12 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_nil job_class.coalesce_max_calls
   end
 
-  test "on_conflict is discard or collect, and anything else raises" do
+  test "on_conflict is discard, replace or collect, and anything else raises" do
     assert_equal :discard, new_job_class { coalesce key: "a", on_conflict: :discard }.coalesce_on_conflict
     assert_equal :collect, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_on_conflict
+    assert_equal :replace, new_job_class { coalesce key: "a", on_conflict: :replace }.coalesce_on_conflict
 
-    [ :replace, :block, "collect", nil ].each do |value|
+    [ :block, "replace", "collect", nil ].each do |value|
       error = assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: value } }
       assert_match(/on_conflict/, error.message)
     end
@@ -46,6 +54,18 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     error = assert_raises(ArgumentError) { new_job_class { coalesce key: "a", max_calls: 5 } }
     assert_match(/on_conflict: :collect/, error.message)
     assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :discard, max_calls: 5 } }
+  end
+
+  test "max_calls and on_full need on_conflict collect, not replace" do
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :replace, max_calls: 5 } }
+    assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :replace, on_full: :dispatch } }
+  end
+
+  test "replace takes debounce and max_wait" do
+    job_class = new_job_class { coalesce key: "a", on_conflict: :replace, debounce: 30.seconds, max_wait: 5.minutes }
+
+    assert_equal 30.seconds, job_class.coalesce_debounce
+    assert_equal 5.minutes, job_class.coalesce_max_wait
   end
 
   test "max_calls has to be a positive integer" do
@@ -143,6 +163,28 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     end
   end
 
+  test "replace can't be combined with on_conflict discard, whichever comes first" do
+    assert_raises(ArgumentError) do
+      new_job_class do
+        coalesce key: "a", on_conflict: :replace
+        limits_concurrency key: "b", on_conflict: :discard
+      end
+    end
+
+    error = assert_raises(ArgumentError) do
+      new_job_class do
+        limits_concurrency key: "b", on_conflict: :discard
+        coalesce key: "a", on_conflict: :replace
+      end
+    end
+    assert_match(/on_conflict: :replace/, error.message)
+
+    assert new_job_class {
+      coalesce key: "a", on_conflict: :replace
+      limits_concurrency key: "b"
+    }
+  end
+
   test "collect composes with blocking concurrency limits, and simple mode with discarding ones" do
     assert new_job_class {
       coalesce key: "a", on_conflict: :collect
@@ -167,6 +209,13 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
 
     assert_not configuration.valid?
     assert_match(/collect/, configuration.errors.full_messages.to_sentence)
+  end
+
+  test "a recurring task for a replacing job is invalid" do
+    task = SolidQueue::RecurringTask.new(key: "replacing", class_name: ReplacingRecurringJob.name, schedule: "every hour")
+
+    assert_not task.valid?
+    assert_match(/replace/, task.errors.full_messages.to_sentence)
   end
 
   test "a recurring task for a debounced job is invalid" do

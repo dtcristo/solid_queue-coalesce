@@ -5,7 +5,7 @@ module ActiveJob
   module Coalescing
     extend ActiveSupport::Concern
 
-    COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard collect ]
+    COALESCE_ON_CONFLICT_BEHAVIOUR = %i[ discard replace collect ]
     COALESCE_ON_FULL_BEHAVIOUR = %i[ wait dispatch ]
     DEFAULT_COALESCE_MAX_CALLS = 100
 
@@ -53,9 +53,9 @@ module ActiveJob
       class_attribute :coalesce_max_wait, instance_accessor: false
     end
 
-    # What happened to this call: +:created+, +:discarded+, +:collected+, or +nil+ if
-    # this instance has no recorded admission. It isn't serialized, so it's +nil+ on
-    # a worker's instance.
+    # What happened to this call: +:created+, +:discarded+, +:replaced+, +:collected+,
+    # or +nil+ if this instance has no recorded admission. It isn't serialized, so it's
+    # +nil+ on a worker's instance.
     #
     #   job = ReindexProductJob.perform_later(product.id)
     #   job.coalesce_status # => :discarded
@@ -86,7 +86,8 @@ module ActiveJob
       #   +nil+ and +false+ disable coalescing; other types give a class-wide key. Blank
       #   declarations still coalesce. All keys are scoped to the batch when present.
       # * +:on_conflict+ - +:discard+, the default, suppresses a call that finds a pending
-      #   job. +:collect+ stores every call for #perform_calls.
+      #   job. +:replace+ gives the pending job the call's arguments, so it runs +perform+
+      #   with the latest ones. +:collect+ stores every call for #perform_calls.
       # * +:max_calls+ - The most calls one run takes with +:collect+. Defaults to 100.
       # * +:on_full+ - With +:collect+, +:wait+, the default, leaves a full job to wait for
       #   its time. +:dispatch+ makes it ready as it fills.
@@ -97,7 +98,7 @@ module ActiveJob
       # https://github.com/dtcristo/solid_queue-coalesce#recipes
       def coalesce(key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: nil, max_wait: nil)
         unless on_conflict.in?(COALESCE_ON_CONFLICT_BEHAVIOUR)
-          raise ArgumentError, "`on_conflict` must be :discard or :collect"
+          raise ArgumentError, "`on_conflict` must be :discard, :replace or :collect"
         end
 
         if on_conflict == :collect
@@ -144,15 +145,20 @@ module ActiveJob
         coalesce_on_conflict == :collect
       end
 
+      def coalesce_replace? # :nodoc:
+        coalesce_on_conflict == :replace
+      end
+
       def limits_concurrency(**) # :nodoc:
         super.tap { ensure_coalesce_compatible_with_concurrency_controls(coalesce_on_conflict, concurrency_on_conflict) }
       end
 
       private
-        # A conflict destroys the job, and with it the calls it has collected
+        # A conflict destroys the job, and with it the arguments that replaced its own
+        # or the calls it has collected
         def ensure_coalesce_compatible_with_concurrency_controls(coalesce_on_conflict, concurrency_on_conflict)
-          if coalesce_on_conflict == :collect && concurrency_on_conflict == :discard
-            raise ArgumentError, "`coalesce` with `on_conflict: :collect` can't be combined with `limits_concurrency` with `on_conflict: :discard`"
+          if coalesce_on_conflict.in?(%i[ replace collect ]) && concurrency_on_conflict == :discard
+            raise ArgumentError, "`coalesce` with `on_conflict: :#{coalesce_on_conflict}` can't be combined with `limits_concurrency` with `on_conflict: :discard`"
           end
         end
     end
@@ -243,7 +249,10 @@ module ActiveJob
       # Only the run of a job a worker has claimed. perform_now on an instance that
       # went through perform_later also has a provider_job_id. A collecting job always
       # looks for its run, because the marker outlives the class's key and adapter.
+      # A replacing job's run started before its payload was read.
       def start_coalesced_run
+        return if @coalesce_on_conflict == "replace"
+
         ensure_still_collecting if created_collecting?
 
         if created_collecting? || (self.class.coalesce_key && provider_job_id && self.class.queue_adapter_name == "solid_queue")

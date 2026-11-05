@@ -135,3 +135,46 @@ class SolidQueue::CoalesceResumeRecipeTest < ActiveSupport::TestCase
     assert_equal ids.each_slice(2).to_a, JobBuffer.values
   end
 end
+
+class SolidQueue::CoalesceReplaceContinuationTest < ActiveSupport::TestCase
+  self.use_transactional_tests = false
+
+  class ResumableReplacingJob < ApplicationJob
+    include ActiveJob::Continuable
+
+    coalesce key: "resumable", on_conflict: :replace
+
+    self.resume_options = { wait: 0 }
+
+    def perform(ids)
+      step :process, start: 0 do |step|
+        ids.drop(step.cursor).each do |id|
+          JobBuffer.add(id)
+          step.advance!
+        end
+      end
+    end
+  end
+
+  teardown { ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false }
+
+  test "a resume runs the arguments the job started with from its saved progress, and a later call opens its own job" do
+    ResumableReplacingJob.perform_later([ 1, 2, 3 ])
+    ResumableReplacingJob.perform_later([ 4, 5, 6 ])
+    ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = true
+    late = nil
+
+    perform_ready_jobs_with_callback { late = ResumableReplacingJob.perform_later([ 7 ]) }
+    assert_equal [ 4 ], JobBuffer.values
+    resumed = SolidQueue::Job.where(finished_at: nil).where.not(id: late.provider_job_id).sole
+
+    assert_equal :created, late.coalesce_status
+    assert_equal [ [ 4, 5, 6 ] ], resumed.arguments["arguments"]
+
+    ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false
+    perform_ready_jobs
+
+    assert_equal [ 4, 5, 6, 7 ], JobBuffer.values.sort
+    assert resumed.reload.finished?
+  end
+end

@@ -119,6 +119,14 @@ flowchart TD
     Store --> Full{"Job is full now?"}
     Full -->|"yes"| Seal["Delete the row"]
     Full -->|"no"| Count["Add to calls_count"]
+
+    Mode -->|":replace"| ReplaceLock["Take an exclusive lock,<br/>inserting the key if needed"]
+    ReplaceLock --> ReplaceNull{"job_id is null?"}
+    ReplaceNull -->|"yes"| CreateReplace["Create the job from the last call"]
+    ReplaceNull -->|"no"| Replacing{"No calls, and the job<br/>is marked replacing?"}
+    Replacing -->|"no"| SealOther["Delete the row, then start again"]
+    SealOther --> ReplaceLock
+    Replacing -->|"yes"| Replace["Lock the job, write the payload"]
 ```
 
 ### Discarding calls
@@ -145,6 +153,14 @@ sequenceDiagram
 A collecting call takes an exclusive lock, because it goes on to change the row. Nearly every call finds a row, so it tries the lock before the insert. On MySQL, an insert that hits a duplicate locks the row and the gap next to it, and the calls queued on a row that gets sealed would deadlock on those locks.
 
 The call stores its payload in a call row, then adds to `calls_count`, or deletes the key row once the job is full. Deleting the row seals the job, and sealing alone changes nothing about the job.
+
+### Replacing calls
+
+A replacing call takes an exclusive lock, like a collecting one, and then locks the job and reads its payload again. It writes the last call's payload with what the job keeps: its identity, queue, priority, times, batch, marker and the `solid_queue_concurrency_lock` that Solid Queue recorded. Calls are serialized under the key's lock, so the last one admitted wins. The key row's `calls_count` stays at zero, so a discarding call can't tell the job from a discarding one, and joins it without reading the job.
+
+Solid Queue records a semaphore by writing the whole payload from the copy it read before it locked anything. `ConcurrencyLocks` makes it read a replacing job's payload again under the job's lock first. A replacement holds that lock while it writes, so whichever goes second sees the other's write.
+
+The start step for a replacing job is in `ClaimedExecution#execute`, before Active Job deserializes the payload. It releases the key in a transaction of its own, then reads the job again, so a payload replaced after the worker claimed the job, but before the release, is the one that runs. The `perform_now` start step does nothing for it.
 
 ### Filling with `on_full: :dispatch`
 
@@ -194,6 +210,11 @@ A job that gets a key has a `solid_queue_coalesce_on_conflict` marker in its pay
 | Discards | Collecting | Seals it after the transaction that found it, then opens a new job. The old job fails on a worker, with its calls. See [Running a job](#running-a-job) |
 | Collects | Discarding | Seals it and opens a new job. The old job runs one call from its own arguments |
 | Collects, with a smaller `max_calls` | Collecting, over the new limit | Seals it and opens a new job |
+| Replaces | Discarding or collecting | Seals it, still holding the key exclusively, and opens a new job. A discarding job runs its own arguments, and a collecting one fails on a worker with its calls |
+| Collects | Replacing | Seals it and opens a new job. The old job runs its latest payload as one call |
+| Discards | Replacing | Joins it. The job runs its latest payload |
+
+A job marked as replacing releases its key and reads its payload before running, whatever its class says now, so a replacement admitted before the release isn't lost.
 
 ## Release
 
@@ -306,7 +327,8 @@ sequenceDiagram
 | Failing or finishing a job | `failed_with` and `finished!` release the key before calling `super` |
 | Bulk discards | `CoalesceKey.release_all` runs before `super`, in key order, so two of them can't deadlock with each other |
 | Finding a job's key | `lock_for_release` finds the row's key and then locks through the key's index. Locking through the `job_id` index takes InnoDB's locks on the row's indexes in the opposite order to admission |
-| Bulk enqueues | Calls sort by key, with one transaction per discard admission or collecting job, so one call holds one key's lock at a time. Inside a batch's transaction they hold them all until it commits. See [Batches](#batches) |
+| Recording a semaphore | Takes no key. A replacing job's payload is read again under the job's lock, which a replacement takes after the key |
+| Bulk enqueues | Calls sort by key, with one transaction per discard admission, replacing key or collecting job, so one call holds one key's lock at a time. Inside a batch's transaction they hold them all until it commits. See [Batches](#batches) |
 
 ### The exception
 
@@ -422,8 +444,8 @@ Solid Queue's bulk discards do one read per pass, whatever the jobs are. [The be
 | Idea | File | Names |
 | --- | --- | --- |
 | Declaring `coalesce`, running a job | `lib/active_job/coalescing.rb` | `coalesce`, `perform_now`, `retry_job`, `_perform_job` |
-| Admission, retries, the start step | `app/models/solid_queue/job/coalescible.rb` | `enqueue_coalesced`, `continuing_coalesced_run`, `start_coalesced_run`, `retrying_deadlocks` |
+| Admission, retries, the start step | `app/models/solid_queue/job/coalescible.rb` | `enqueue_coalesced`, `admit_replacing`, `continuing_coalesced_run`, `start_coalesced_run`, `start_replacing_run`, `retrying_deadlocks` |
 | Key locking and sealing | `app/models/solid_queue/coalesce_key.rb` | `admit`, `admit_exclusively`, `lock_for_release`, `seal_collecting`, `release_all` |
 | Stored calls | `app/models/solid_queue/coalesced_call.rb` | `waiting` |
-| Every place the gem reaches into Solid Queue | `lib/solid_queue/coalesce/patches.rb` | `Enqueuing`, `Failing`, `Finishing`, `ConcurrencyConflicts`, `BulkDiscarding` |
+| Every place the gem reaches into Solid Queue | `lib/solid_queue/coalesce/patches.rb` | `Enqueuing`, `Failing`, `Finishing`, `ConcurrencyConflicts`, `ConcurrencyLocks`, `ReplacingExecution`, `BulkDiscarding` |
 | Tables | `lib/generators/solid_queue/coalesce/install/templates/db/create_solid_queue_coalesce_tables.rb` | |

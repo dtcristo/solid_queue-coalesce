@@ -66,11 +66,36 @@ module SolidQueue
 
       # A class can start discarding conflicts after it stopped collecting, and a
       # conflict destroys the job. A collecting job blocks instead, whatever its class
-      # says now, so it reaches a worker and fails with its calls.
+      # says now, so it reaches a worker and fails with its calls. A replacing job
+      # blocks too, because a conflict would destroy the arguments that replaced its own.
       module ConcurrencyConflicts
         private
           def handle_concurrency_conflict
-            arguments["solid_queue_coalesce_on_conflict"] == "collect" ? block : super
+            arguments["solid_queue_coalesce_on_conflict"].in?(%w[ replace collect ]) ? block : super
+          end
+      end
+
+      # Solid Queue writes the whole payload when it records a semaphore, from a copy
+      # read before it locked anything. For a replacing job it reads the payload again
+      # under the job's lock, which a replacement holds while it writes.
+      module ConcurrencyLocks
+        private
+          def record_concurrency_lock(**)
+            self.arguments = self.class.lock.find(id).arguments if created_replacing?
+            super
+          end
+      end
+
+      # A replacing job releases its key and reads its payload again before Active
+      # Job deserializes it, so the run has every replacement admitted before the
+      # release. Raises like super, into a failed execution.
+      module ReplacingExecution
+        private
+          def execute
+            job.start_replacing_run if job.created_replacing?
+            super
+          rescue Exception => e
+            ClaimedExecution::Result.new(false, e)
           end
       end
 
@@ -101,6 +126,7 @@ module SolidQueue
 
         included do
           validate :ensure_job_class_not_collecting
+          validate :ensure_job_class_not_replacing
           validate :ensure_job_class_not_debounced
         end
 
@@ -110,6 +136,13 @@ module SolidQueue
           def ensure_job_class_not_collecting
             if class_name.present? && job_class&.try(:coalesce_collect?)
               errors.add :class_name, :collecting, message: "can't be a job that uses `coalesce` with `on_conflict: :collect`"
+            end
+          end
+
+          # A tick that replaces would record the open job again, and roll back its replacement
+          def ensure_job_class_not_replacing
+            if class_name.present? && job_class&.try(:coalesce_replace?)
+              errors.add :class_name, :replacing, message: "can't be a job that uses `coalesce` with `on_conflict: :replace`"
             end
           end
 
@@ -128,6 +161,8 @@ module SolidQueue
         SolidQueue::Job.prepend Failing
         SolidQueue::Job.prepend Finishing
         SolidQueue::Job.prepend ConcurrencyConflicts
+        SolidQueue::Job.prepend ConcurrencyLocks
+        SolidQueue::ClaimedExecution.prepend ReplacingExecution
         [ ReadyExecution, ScheduledExecution, BlockedExecution, FailedExecution ].each { |execution| execution.singleton_class.prepend BulkDiscarding }
         SolidQueue::RecurringTask.include RecurringValidation
       end

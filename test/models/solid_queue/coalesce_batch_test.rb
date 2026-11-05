@@ -32,6 +32,14 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     end
   end
 
+  class ReplaceJob < ImmediateJob
+    coalesce key: ->(group, *) { group }, on_conflict: :replace
+
+    def perform(*arguments)
+      JobBuffer.add(arguments)
+    end
+  end
+
   class DispatchingJob < ApplicationJob
     coalesce key: ->(group, *) { group }, on_conflict: :collect, max_calls: 2, on_full: :dispatch
 
@@ -208,6 +216,23 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
     perform_ready_jobs
 
     assert_equal [ [ "a", 0 ] ], JobBuffer.values
+    assert batch.reload.finished?
+    assert_equal 1, batch.completed_jobs
+  end
+
+  test "replacing calls in a batch share one job, counted once, that runs the latest arguments" do
+    calls = []
+    batch = SolidQueue::Batch.enqueue { 3.times { |i| calls << ReplaceJob.perform_later("a", i) } }
+    outside = ReplaceJob.perform_later("a", :outside)
+
+    assert_equal [ :created, :replaced, :replaced ], calls.map(&:coalesce_status)
+    assert_equal [ batch.jobs.sole.id ], calls.map(&:provider_job_id).uniq
+    assert_equal :created, outside.coalesce_status
+    assert_equal 1, batch.reload.total_jobs
+
+    perform_ready_jobs
+
+    assert_equal [ [ "a", 2 ], [ "a", :outside ] ], JobBuffer.values
     assert batch.reload.finished?
     assert_equal 1, batch.completed_jobs
   end

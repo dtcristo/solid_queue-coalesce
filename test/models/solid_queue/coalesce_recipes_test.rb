@@ -52,6 +52,14 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  class SyncContactJob < ApplicationJob
+    coalesce key: ->(user_id, *) { user_id }, on_conflict: :replace, debounce: 10.seconds
+
+    def perform(user_id, attributes)
+      JobBuffer.add([ user_id, attributes ])
+    end
+  end
+
   class SealingJob < ApplicationJob
     coalesce key: "sealing", on_conflict: :collect, max_calls: 2
 
@@ -234,6 +242,21 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     calls_at(0, 10, 20) { CappedJob.perform_later }
 
     assert_equal @start + 40.seconds, SolidQueue::Job.sole.scheduled_at
+  end
+
+  test "a replacing job runs 10 seconds after the last call, with that call's arguments" do
+    names = %w[ Ada Grace Edsger ].each
+    calls_at(0, 4, 8) { SyncContactJob.perform_later(1, { "name" => names.next }) }
+
+    job = SolidQueue::Job.sole
+    assert_equal @start + 18.seconds, job.scheduled_at
+
+    travel_to(@start + 18.seconds) do
+      SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+      perform_ready_jobs
+    end
+
+    assert_equal [ [ 1, { "name" => "Edsger" } ] ], JobBuffer.values
   end
 
   test "a key opens, seals and starts as the lifecycle diagram draws it" do
