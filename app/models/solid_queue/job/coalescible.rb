@@ -349,7 +349,7 @@ module SolidQueue
       # The caller holds the job's lock, and Solid Queue takes it too before it records
       # the job's semaphore, so neither write can undo the other.
       def replace_arguments(payload)
-        update_column :arguments, payload.merge(arguments.slice(*REPLACEMENT_KEPT_KEYS))
+        update_column :arguments, payload.except(*REPLACEMENT_KEPT_KEYS).merge(arguments.slice(*REPLACEMENT_KEPT_KEYS))
       end
 
       # A replacing job's start step, before its payload is read. Releasing the key

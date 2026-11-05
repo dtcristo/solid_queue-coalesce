@@ -95,7 +95,7 @@ module SolidQueue
             job.start_replacing_run if job.created_replacing?
             super
           rescue Exception => e
-            Result.new(false, e)
+            ClaimedExecution::Result.new(false, e)
           end
       end
 

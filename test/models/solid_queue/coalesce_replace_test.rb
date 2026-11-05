@@ -140,6 +140,41 @@ class SolidQueue::CoalesceReplaceTest < ActiveSupport::TestCase
     assert_equal [ "a", 2 ], job.arguments["arguments"]
   end
 
+  test "a start that can't release its key fails the job with its payload, and a retry runs it" do
+    ReplacingJob.perform_later("a", 1)
+    job = SolidQueue::Job.sole
+    raised = false
+    callback = ->(*, payload) do
+      if !raised && payload[:sql].match?(/solid_queue_coalesce_keys/)
+        raised = true
+        raise ActiveRecord::StatementInvalid, "database went away"
+      end
+    end
+
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+      assert_raises(ActiveRecord::StatementInvalid) { perform_ready_jobs }
+    end
+
+    assert job.reload.failed?
+    assert_nil job.claimed_execution
+    assert_empty JobBuffer.values
+
+    job.retry
+    perform_ready_jobs
+    assert_equal [ [ "a", 1, {} ] ], JobBuffer.values
+  end
+
+  test "a replacement keeps metadata the job doesn't have out of it" do
+    ReplacingJob.perform_later("a", 1)
+    replacing = ReplacingJob.new("a", 2)
+    replacing.callback_batch_id = "callback"
+    SolidQueue::Job.enqueue(replacing)
+
+    arguments = SolidQueue::Job.sole.arguments
+    assert_equal [ "a", 2 ], arguments["arguments"]
+    assert_not arguments.key?("callback_batch_id")
+  end
+
   test "different keys are independent" do
     ReplacingJob.perform_later("a", 1)
     ReplacingJob.perform_later("b", 2)
@@ -372,18 +407,24 @@ class SolidQueue::CoalesceReplaceTest < ActiveSupport::TestCase
     assert_equal [ [ :perform, [ 1 ] ], [ :perform, [ 3 ] ] ], JobBuffer.values
   end
 
-  test "a class that starts replacing seals a collecting job, which runs its calls" do
+  test "a class that starts replacing seals a collecting job, which fails with its calls until it's restored" do
     ChangingJob.coalesce key: "changing", on_conflict: :collect
     ChangingJob.perform_later(1)
     ChangingJob.perform_later(2)
+    collecting = SolidQueue::Job.sole
     ChangingJob.coalesce key: "changing", on_conflict: :replace
 
     assert_equal :created, ChangingJob.perform_later(3).coalesce_status
     assert_coalesce_invariants
 
+    assert_raises(ActiveJob::Coalescing::CollectedJobMismatch) { perform_ready_jobs }
+    assert collecting.reload.failed?
+    assert_equal 2, collecting.coalesced_calls.count
+
     ChangingJob.coalesce key: "changing", on_conflict: :collect
+    collecting.retry
     perform_ready_jobs
-    assert_includes JobBuffer.values, [ :perform_calls, [ [ 1 ], [ 2 ] ] ]
+    assert_equal [ :perform_calls, [ [ 1 ], [ 2 ] ] ], JobBuffer.values.last
   end
 
   test "a class that starts collecting seals a replacing job, which runs its latest payload as one call" do

@@ -210,7 +210,7 @@ A job that gets a key has a `solid_queue_coalesce_on_conflict` marker in its pay
 | Discards | Collecting | Seals it after the transaction that found it, then opens a new job. The old job fails on a worker, with its calls. See [Running a job](#running-a-job) |
 | Collects | Discarding | Seals it and opens a new job. The old job runs one call from its own arguments |
 | Collects, with a smaller `max_calls` | Collecting, over the new limit | Seals it and opens a new job |
-| Replaces | Discarding or collecting | Seals it, still holding the key exclusively, and opens a new job. The old job runs as it was created |
+| Replaces | Discarding or collecting | Seals it, still holding the key exclusively, and opens a new job. A discarding job runs its own arguments, and a collecting one fails on a worker with its calls |
 | Collects | Replacing | Seals it and opens a new job. The old job runs its latest payload as one call |
 | Discards | Replacing | Joins it. The job runs its latest payload |
 

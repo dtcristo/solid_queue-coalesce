@@ -852,7 +852,8 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Remove `:collect` or `coalesce` | The job fails with its calls, as above |
 | Switch `:collect` to `:discard` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
 | Switch `:discard` to `:collect` | The next call doesn't join the discarding job, and creates a new one. The old job runs one call from its own arguments |
-| Switch `:discard` or `:collect` to `:replace` | The next call doesn't replace the old job's arguments, and creates a new one. The old job runs as it was created |
+| Switch `:discard` to `:replace` | The next call doesn't replace the discarding job's arguments, and creates a new one. The old job runs with its own arguments |
+| Switch `:collect` to `:replace` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
 | Switch `:replace` to `:collect` | The next call doesn't join the replacing job, and creates a new one. The old job runs its latest arguments as one call |
 | Switch `:replace` to `:discard`, or remove `coalesce` | Calls are discarded into the replacing job, or run on their own. It runs its latest arguments, and nothing needs draining |
 | Change `limits_concurrency` to `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
