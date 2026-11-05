@@ -16,6 +16,21 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     end
   end
 
+  class LimitedReplaceJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :replace
+    limits_concurrency key: ->(*) { "limited" }, to: 1
+
+    def perform(*); end
+  end
+
+  class ReplaceJob < ApplicationJob
+    coalesce key: ->(group, *) { group }, on_conflict: :replace
+
+    def perform(_group, value)
+      RACED_RUNS << [ provider_job_id, value ]
+    end
+  end
+
   RACED_RUNS = Concurrent::Array.new
 
   setup do
@@ -58,6 +73,80 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
 
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_equal results.count { |active_job| active_job.coalesce_status == :created }, RACED_RUNS.size
+  end
+
+  test "replacements racing starts run every job once, and the last one admitted runs" do
+    done = Concurrent::AtomicBoolean.new(false)
+    worker = Thread.new { work_until(done) }
+    counter = Concurrent::AtomicFixnum.new
+
+    results = begin
+      race(6) { 40.times.map { ReplaceJob.perform_later("g", counter.increment) } }.flatten
+    ensure
+      done.make_true
+      worker.join rescue nil
+    end
+    worker.value
+    drain
+
+    assert_equal 0, SolidQueue::CoalesceKey.count
+    assert_equal results.count { |active_job| active_job.coalesce_status == :created }, RACED_RUNS.size
+    assert_equal RACED_RUNS.size, RACED_RUNS.map(&:first).uniq.size
+    assert_equal counter.value, RACED_RUNS.map(&:last).max
+  end
+
+  test "a replacement waiting on a start opens a new job, and the start runs the payload it released with" do
+    skip_on_sqlite
+
+    ReplaceJob.perform_later("g", 1)
+    execution = SolidQueue::ReadyExecution.claim("*", 1, @process.id).sole
+    locked = Concurrent::Event.new
+
+    starter = in_thread do
+      SolidQueue::Record.transaction do
+        coalesce_key = SolidQueue::CoalesceKey.lock_for_release(execution.job_id)
+        locked.set
+        sleep 0.3
+        coalesce_key.destroy!
+      end
+    end
+
+    locked.wait(5)
+    second = in_thread { ReplaceJob.perform_later("g", 2) }.value
+    starter.value
+    execution.perform
+
+    assert_equal :created, second.coalesce_status
+    assert_equal [ [ execution.job_id, 1 ] ], RACED_RUNS.to_a
+  end
+
+  test "a replacement and a stale semaphore writer keep both writes, whichever goes first" do
+    skip_on_sqlite
+
+    [ :replacement, :semaphore ].each do |first|
+      SolidQueue::Semaphore.delete_all
+      job = SolidQueue::Job.find(LimitedReplaceJob.perform_later(first.to_s, 1).provider_job_id)
+      stale = SolidQueue::Job.find(job.id)
+      SolidQueue::Semaphore.delete_all
+      writes = { replacement: -> { SolidQueue::Job.enqueue(LimitedReplaceJob.new(first.to_s, 2)) }, semaphore: -> { stale.acquire_concurrency_lock } }
+      locked = Concurrent::Event.new
+
+      holder = in_thread do
+        SolidQueue::Record.transaction do
+          writes.fetch(first).call
+          locked.set
+          sleep 0.3
+        end
+      end
+
+      locked.wait(5)
+      in_thread { SolidQueue::Record.transaction { writes.except(first).values.sole.call } }.value
+      holder.value
+
+      job.reload
+      assert_equal [ first.to_s, 2 ], job.arguments["arguments"], "#{first} first"
+      assert job.arguments.dig("solid_queue_concurrency_lock", "semaphore_id"), "#{first} first"
+    end
   end
 
   test "a call waiting on a start that deletes the key opens a new job" do

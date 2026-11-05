@@ -13,13 +13,23 @@ module SolidQueue
         before_destroy :release_coalesce_key, prepend: true
       end
 
+      # What a replacement keeps from the job: what identifies it, its place in line,
+      # its batch, its marker and the semaphore Solid Queue recorded for it.
+      REPLACEMENT_KEPT_KEYS = %w[ job_class job_id queue_name priority enqueued_at scheduled_at batch_id callback_batch_id solid_queue_coalesce_on_conflict ] + [ ConcurrencyControls::CONCURRENCY_LOCK_KEY ]
+
       class_methods do
         # Every call in active_jobs has the same key. Returns the job if a call
-        # created one, nil if the calls joined the open job.
+        # created one, nil if the calls joined the open job. A replacing call's
+        # payloads are only its last call's.
         def enqueue_coalesced(key, active_jobs, payloads = nil, wrap_errors: false)
           if active_jobs.first.class.coalesce_collect?
             payloads ||= raising_enqueue_errors(wrap_errors) { active_jobs.map(&:serialize) }
             return collect_coalesced(key, active_jobs, payloads, wrap_errors: wrap_errors)
+          end
+
+          if active_jobs.first.class.coalesce_replace?
+            payloads ||= raising_enqueue_errors(wrap_errors) { [ active_jobs.last.serialize ] }
+            return replace_coalesced(key, active_jobs, payloads.last, wrap_errors: wrap_errors)
           end
 
           enqueued_job, open_job_id = raising_enqueue_errors(wrap_errors) do
@@ -34,11 +44,14 @@ module SolidQueue
         # So a key or a payload that can't be built raises before anything is written.
         # A repeated :discard call is never stored, so its arguments don't have to
         # serialize, as with perform_later. The first one's only get checked here,
-        # because its job is built later, if there's no open job to find.
+        # because its job is built later, if there's no open job to find. Only the
+        # last :replace call is stored, so the ones it supersedes don't serialize either.
         def prepare_all_coalesced(active_jobs)
           active_jobs.group_by(&:coalesce_key).sort_by(&:first).map do |key, calls|
             if calls.first.class.coalesce_collect?
               [ key, calls, calls.map(&:serialize) ]
+            elsif calls.first.class.coalesce_replace?
+              [ key, calls, [ calls.last.serialize ] ]
             else
               calls.first.serialize
               [ key, calls ]
@@ -129,17 +142,19 @@ module SolidQueue
             coalesce_key = CoalesceKey.admit(key)
 
             unless coalesce_key.collecting?
-              enqueued_job = create_for_coalesce_key(coalesce_key, active_jobs.first) if coalesce_key.job_id.nil?
+              if coalesce_key.job_id.nil?
+                attributes = attributes_from_active_job(active_jobs.first)
+                enqueued_job = create_for_coalesce_key(coalesce_key, **attributes, arguments: attributes[:arguments].merge("solid_queue_coalesce_on_conflict" => "discard"))
+              end
+
               debounce_coalesced(coalesce_key, coalesce_key.job_id, enqueued_job ? active_jobs.drop(1) : active_jobs)
 
               [ enqueued_job, coalesce_key.job_id ]
             end
           end
 
-          def create_for_coalesce_key(coalesce_key, active_job)
-            attributes = attributes_from_active_job(active_job)
-
-            create!(**attributes, arguments: attributes[:arguments].merge("solid_queue_coalesce_on_conflict" => "discard")).tap do |job|
+          def create_for_coalesce_key(coalesce_key, **attributes)
+            create!(**attributes).tap do |job|
               # limits_concurrency with on_conflict: :discard destroys the job right away
               if job.persisted?
                 coalesce_key.update_columns(job_id: job.id)
@@ -182,7 +197,7 @@ module SolidQueue
               coalesce_key.destroy!
               [ 0 ]
             else
-              created_job = create_collecting(*calls.first) if coalesce_key.job_id.nil?
+              created_job = create!(**attributes_from_payload(*calls.first, "collect")) if coalesce_key.job_id.nil?
               job_id = coalesce_key.job_id || created_job.id
 
               CoalescedCall.insert_all(calls.map { |_, payload| { job_id: job_id, arguments: payload } })
@@ -246,31 +261,75 @@ module SolidQueue
 
           # Not attributes_from_active_job, which serializes the call again, and that
           # could raise after earlier jobs committed.
-          def create_collecting(active_job, payload)
+          def attributes_from_payload(active_job, payload, on_conflict)
             attributes = {
               queue_name: active_job.queue_name || singleton_class::DEFAULT_QUEUE_NAME,
               active_job_id: active_job.job_id,
               priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
               scheduled_at: active_job.scheduled_at,
               class_name: active_job.class.name,
-              arguments: payload.merge("solid_queue_coalesce_on_conflict" => "collect"),
+              arguments: payload.merge("solid_queue_coalesce_on_conflict" => on_conflict),
               concurrency_key: active_job.concurrency_key
             }
             attributes[:batch_id] = active_job.batch_id if Batch.migrated?
+            attributes
+          end
 
-            create!(**attributes)
+          # Like a collecting job, serialized once and before anything is written. The
+          # last call is the one admitted: it creates the job, or its payload replaces
+          # the job's. The calls before it are superseded, and only move the job later.
+          def replace_coalesced(key, active_jobs, payload, wrap_errors:)
+            enqueued_job, job_id = raising_enqueue_errors(wrap_errors) do
+              retrying_deadlocks { transaction { admit_replacing(key, active_jobs, payload) } }
+            end
+
+            record_coalesced(key, active_jobs, enqueued_job.present?, job_id)
+
+            enqueued_job
+          end
+
+          # A job from when the class discarded or collected runs the way it was
+          # created, and can't take a payload, so the call seals it and tries again.
+          # It holds the key exclusively, so it can do that without letting go of it.
+          def admit_replacing(key, active_jobs, payload)
+            loop do
+              coalesce_key = CoalesceKey.admit_exclusively(key)
+              job = lock.find_by(id: coalesce_key.job_id) if coalesce_key.discarding?
+
+              if coalesce_key.job_id.nil?
+                enqueued_job = create_for_coalesce_key(coalesce_key, **attributes_from_payload(active_jobs.last, payload, "replace"))
+                debounce_coalesced(coalesce_key, coalesce_key.job_id, active_jobs[0...-1])
+
+                return [ enqueued_job, coalesce_key.job_id ]
+              elsif job&.created_replacing?
+                job.replace_arguments(payload)
+                debounce_coalesced(coalesce_key, job.id, active_jobs)
+
+                return [ nil, job.id ]
+              else
+                coalesce_key.destroy!
+              end
+            end
           end
 
           # A call has an outcome only if it was admitted: when on_conflict: :discard
-          # destroys the job that was just created, nothing holds the key.
+          # destroys the job that was just created, nothing holds the key. The first
+          # call is the one that creates a job, except with :replace, where it's the last.
           def record_coalesced(key, active_jobs, created, job_id)
-            active_jobs.each_with_index do |active_job, index|
-              collect = active_job.class.coalesce_collect?
-              created_by_this_call = created && index.zero?
+            active_jobs.each do |active_job|
+              job_class = active_job.class
+              admitted = job_class.coalesce_replace? ? active_jobs.last : active_jobs.first
+
+              status = if job_id.nil? then nil
+              elsif created && active_job.equal?(admitted) then :created
+              elsif job_class.coalesce_collect? then :collected
+              elsif active_job.equal?(admitted) && job_class.coalesce_replace? then :replaced
+              else :discarded
+              end
 
               active_job.provider_job_id = job_id
-              active_job.successfully_enqueued = created_by_this_call || collect
-              active_job.send(:coalesce_status=, job_id && (created_by_this_call ? :created : (collect ? :collected : :discarded)))
+              active_job.successfully_enqueued = status.in?(%i[ created collected replaced ])
+              active_job.send(:coalesce_status=, status)
             end
 
             # After every outcome, because a subscriber can raise. These calls are stored,
@@ -281,6 +340,24 @@ module SolidQueue
               end
             end
           end
+      end
+
+      def created_replacing?
+        arguments.is_a?(Hash) && arguments["solid_queue_coalesce_on_conflict"] == "replace"
+      end
+
+      # The caller holds the job's lock, and Solid Queue takes it too before it records
+      # the job's semaphore, so neither write can undo the other.
+      def replace_arguments(payload)
+        update_column :arguments, payload.merge(arguments.slice(*REPLACEMENT_KEPT_KEYS))
+      end
+
+      # A replacing job's start step, before its payload is read. Releasing the key
+      # commits on its own, so the payload read after it has every replacement
+      # admitted before the release, and a call after it opens a new job.
+      def start_replacing_run
+        self.class.retrying_deadlocks { transaction { release_coalesce_key } }
+        reload
       end
 
       # The start step. Returns what the Active Job needs to know about this run,

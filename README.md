@@ -5,7 +5,7 @@
   </p>
 </div>
 
-Solid Queue Coalesce merges repeated `perform_later` calls with the same key into one job. You choose whether that job runs with the first call or with all of them.
+Solid Queue Coalesce merges repeated `perform_later` calls with the same key into one job. You choose whether that job runs with the first call, the latest one, or all of them.
 
 Dedupe when a repeat call adds nothing:
 
@@ -19,6 +19,20 @@ class ReindexProductJob < ApplicationJob
 end
 
 ReindexProductJob.perform_later(product.id)
+```
+
+Replace when each call carries the whole current state, and only the latest matters:
+
+```ruby
+class SyncContactJob < ApplicationJob
+  coalesce key: ->(user_id, *) { user_id }, on_conflict: :replace, debounce: 10.seconds
+
+  def perform(user_id, attributes)
+    Crm.update_contact(user_id, attributes)
+  end
+end
+
+SyncContactJob.perform_later(user.id, user.slice(:name, :email))
 ```
 
 Collect when every call carries data you need. The `wait` gives calls time to join:
@@ -41,6 +55,7 @@ A job accepts calls until it starts. A collecting job also stops at `max_calls`,
 ## Features
 
 - [Dedupe](#dedupe-jobs-with-one-pending-job-per-key). Calls with the same key share one pending job, which runs with the first call's arguments.
+- [Replace](#run-with-the-latest-arguments). One pending job runs `perform` with the latest call's arguments.
 - [Collect](#collect-calls-into-one-run). One job receives every call's arguments, for bulk APIs and digests.
 - [Debounce](#debounce-until-activity-stops). A job waits until calls stop, with an optional deadline.
 - [Throttle](#throttle-to-one-run-per-window). A key runs at most once per time window.
@@ -57,6 +72,7 @@ It also works with [recurring tasks](#coalesce-a-recurring-task), [bulk enqueues
 - [Compatibility](#compatibility)
 - [`coalesce` options](#coalesce-options)
 - [Keys](#keys)
+- [Replacing arguments](#replacing-arguments)
 - [Collecting calls](#collecting-calls)
 - [Collecting jobs and scheduling](#collecting-jobs-and-scheduling)
 - [Debouncing](#debouncing)
@@ -120,6 +136,10 @@ Dedupe, so one run gets the first call's arguments:
 - [Once calls stop, or by a deadline](#debounce-until-activity-stops)
 - [Now, then once more after the run](#run-on-the-leading-edge)
 - [On a schedule, without piling up](#coalesce-a-recurring-task)
+
+Replace, so one run gets the latest call's arguments:
+
+- [Once calls stop](#run-with-the-latest-arguments)
 
 Collect, so one run gets every call's arguments:
 
@@ -215,7 +235,25 @@ production:
     schedule: every minute
 ```
 
-A tick during a run creates one blocked job, later ticks merge into it, and it runs when the current run finishes. Without `limits_concurrency`, a slow run can overlap the next tick's. A recurring task can't use `:collect` or `debounce:`. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+A tick during a run creates one blocked job, later ticks merge into it, and it runs when the current run finishes. Without `limits_concurrency`, a slow run can overlap the next tick's. A recurring task can't use `:collect`, `:replace` or `debounce:`. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
+
+### Run with the latest arguments
+
+Use this when each call carries the whole current state, such as a contact to sync, and older calls are out of date.
+
+```ruby
+class SyncContactJob < ApplicationJob
+  coalesce key: ->(user_id, *) { user_id }, on_conflict: :replace, debounce: 10.seconds
+
+  def perform(user_id, attributes)
+    Crm.update_contact(user_id, attributes)
+  end
+end
+
+SyncContactJob.perform_later(user.id, user.slice(:name, :email))
+```
+
+The job runs 10 seconds after the last call, with that call's arguments. Each call replaces the pending job's arguments, and the job keeps its ID, queue, priority and place in line. A call after the job starts opens the next one. If `perform` can read the current state from an ID, use the default `:discard` instead. See [Replacing arguments](#replacing-arguments).
 
 ### Collect calls into one run
 
@@ -377,7 +415,7 @@ With `coalesce`, a retry can't be discarded by the key, and a blocked retry wait
 ## Things to know
 
 - It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
-- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
+- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. With `:replace`, they replace the arguments. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
 - With `:collect`, a full job is sealed but still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
 - Coalesced jobs can overlap, because the key is free as soon as a job starts. Use `limits_concurrency` to prevent that. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
 - `ActiveJob.perform_all_later` can admit some calls and then raise, unless you wrap it in a queue-database transaction. See [Bulk enqueues](#bulk-enqueues).
@@ -397,11 +435,11 @@ CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 
 | Feature | Behaviour |
 | --- | --- |
-| `perform_later` | Coalesces, and stores the call with `:collect` |
-| `perform_all_later` | Coalesces in sorted key order, with one transaction per discard admission or collecting job. See [Bulk enqueues](#bulk-enqueues) |
+| `perform_later` | Coalesces, and stores the call with `:collect` or `:replace` |
+| `perform_all_later` | Coalesces in sorted key order, with one transaction per discard admission, replacing key or collecting job. See [Bulk enqueues](#bulk-enqueues) |
 | `perform_now` | Runs the call on its own. `perform_calls` receives one call |
 | `SolidQueue::Batch` | Coalesces within each batch. See [Solid Queue batches](#solid-queue-batches) |
-| Recurring tasks | `:discard` works. `:collect` and `debounce:` make the task's configuration invalid |
+| Recurring tasks | `:discard` works. `:collect`, `:replace` and `debounce:` make the task's configuration invalid |
 | Retries | Keep the job's calls, and never coalesce. See [Retries](#retries) |
 | Other adapters | Ignore `coalesce`, including `debounce:` and `max_wait:`. Each call runs on its own. See [Testing](#testing) |
 
@@ -417,7 +455,7 @@ coalesce key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: ni
 ```
 
 - `key` is required. See [Keys](#keys).
-- `on_conflict` is `:discard` or `:collect`. Anything else raises `ArgumentError`.
+- `on_conflict` is `:discard`, `:collect` or `:replace`. Anything else raises `ArgumentError`. See [Replacing arguments](#replacing-arguments) and [Collecting calls](#collecting-calls).
 - `max_calls` is only allowed with `:collect`. It's a positive integer, 100 by default.
 - `on_full` is only allowed with `:collect`. It's `:wait`, the default, or `:dispatch`. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
 - `debounce` is a positive duration. Each call pushes a pending job back to that long from now. See [Debouncing](#debouncing).
@@ -449,6 +487,14 @@ coalesce key: ->(account_id, kind) { [ account_id, kind ] } # Composite key
 Keys are always scoped to the job class name, and there's no `group` option, so two classes can't share a key. In a [Solid Queue batch](#solid-queue-batches) they're scoped to the batch too.
 
 The key column is declared like the one on Solid Queue's semaphores, with the database's default collation and a unique index. That's upstream parity, and it isn't a guarantee of bytewise uniqueness. Under a case- and accent-insensitive collation such as MySQL's `utf8mb4_0900_ai_ci`, `Job/a`, `Job/A` and `Job/á` compare equal and coalesce together. Under a case-sensitive or binary collation they stay distinct.
+
+## Replacing arguments
+
+With `on_conflict: :replace`, a call that finds a pending job writes its whole Active Job payload over the job's, and the job runs `perform` with it. Custom fields from your own `serialize` come from that call too, and ones it doesn't set are gone. Nothing older is kept, so there's no call table to fill and no `max_calls`. The job keeps its ID, `active_job_id`, queue, priority, batch, concurrency key and schedule, unless [`debounce:`](#debouncing) moves it.
+
+The key is released when a worker starts the job, and the job's payload is read again after that, before Active Job deserializes it. So a replacement admitted before the start runs in that run, even if a worker had already claimed the job, and a call after it opens the next job. "Latest" means the last call admitted under the key's lock, not a timestamp or a revision of your data.
+
+A replaced call reports `:replaced`, and its `provider_job_id` is the pending job. A retry runs the arguments of the run it retries, with its own progress and counters, and new calls never replace it.
 
 ## Collecting calls
 
@@ -536,7 +582,7 @@ To raise throughput on one key, use `ActiveJob.perform_all_later`. It stores up 
 
 By default a job takes its time from its first call, so during a burst it can run partway through and need another run straight after. With `debounce:`, each call pushes the pending job back, so it runs once calls have stopped. With [this recipe's](#debounce-until-activity-stops) `debounce: 30.seconds, max_wait: 5.minutes`:
 
-A job comes due 30 seconds after the last call, and no later than 5 minutes after it opened. It works with `on_conflict: :discard` and `:collect`, and `coalesce_status` reports the same outcomes as before. It adds no table, column, timer or process: the job's `scheduled_at` holds the time, and the dispatcher fires it as usual.
+A job comes due 30 seconds after the last call, and no later than 5 minutes after it opened. It works with `on_conflict: :discard`, `:collect` and `:replace`, and `coalesce_status` reports the same outcomes as before. It adds no table, column, timer or process: the job's `scheduled_at` holds the time, and the dispatcher fires it as usual.
 
 A call's time comes from these rules, in this order:
 
@@ -607,9 +653,10 @@ job 1     A----B----C---------run
 - `:created` means it created a pending job. With `:collect`, that's the first call of each job.
 - `:discarded` means a pending job already held the key, and the call was suppressed.
 - `:collected` means it was stored for the pending job.
+- `:replaced` means its arguments replaced the pending job's.
 - `nil` means this instance has no recorded admission.
 
-So a call's data was stored if the status is `:created` or `:collected`, and it wasn't if it's `:discarded`:
+So a call's data was stored if the status is `:created`, `:collected` or `:replaced`, and it wasn't if it's `:discarded`. A replacement is a snapshot: a later call can replace it in turn.
 
 ```ruby
 # on_conflict: :collect
@@ -628,6 +675,8 @@ call.coalesce_status # :created, so a job runs with these arguments
 | --- | --- | --- | --- | --- |
 | Created a job | `:created` | The new job | `true` | Yes |
 | Joined with `:collect` | `:collected` | The open job | `true` | Yes |
+| Joined with `:replace` | `:replaced` | The open job | `true` | Yes, until a later call replaces it |
+| Superseded by a later `:replace` call in the same bulk enqueue | `:discarded` | The open job | `false` | No |
 | Joined with `:discard`, single | `:discarded` | The open job | `true`, set by Active Job | No |
 | Joined with `:discard`, bulk | `:discarded` | The open job | `false` | No |
 | Concurrency conflict destroyed the job, single | `nil` | `nil` | `true`, set by Active Job | No |
@@ -661,9 +710,9 @@ jobs = products.map { |product| ReindexProductJob.new(product.id) }
 ActiveJob.perform_all_later(jobs)
 ```
 
-This uses fewer locks and transactions than one `perform_later` per call. Native Solid Queue stores a whole [`ActiveJob.perform_all_later`](https://api.rubyonrails.org/classes/ActiveJob.html#method-c-perform_all_later) in one transaction, so it's all-or-nothing. With coalesced jobs in the list it isn't, unless you ask for it. Outside your own transaction, it stores ordinary jobs first, in one native transaction. Coalesced calls follow, sorted by key, with one transaction per discard admission or collecting job. A key's lock lasts until its transaction commits, and one transaction for the whole call would hold every key's lock until the last job was in. This way it holds one key's lock for one job's calls.
+This uses fewer locks and transactions than one `perform_later` per call. Native Solid Queue stores a whole [`ActiveJob.perform_all_later`](https://api.rubyonrails.org/classes/ActiveJob.html#method-c-perform_all_later) in one transaction, so it's all-or-nothing. With coalesced jobs in the list it isn't, unless you ask for it. Outside your own transaction, it stores ordinary jobs first, in one native transaction. Coalesced calls follow, sorted by key, with one transaction per discard admission, replacing key or collecting job. A key's lock lasts until its transaction commits, and one transaction for the whole call would hold every key's lock until the last job was in. This way it holds one key's lock for one job's calls.
 
-Before it writes anything, the call works out the keys of all coalesced calls, the payloads of all `:collect` calls, and the payload of each key's first `:discard` call. If a key Proc raises or an argument can't be serialized, the call raises with nothing written. A repeated `:discard` call is never stored, so an argument on it that can't be serialized stays silently discarded, as with a single `perform_later`.
+Before it writes anything, the call works out the keys of all coalesced calls, the payloads of all `:collect` calls, the payload of each key's first `:discard` call, and the payload of each key's last `:replace` call. With `:replace`, only that last call is admitted. If it creates the job, the job's queue, priority and other fields come from it. The calls before it report `:discarded` and don't have to serialize, though they can still move a debounced job. If a key Proc raises or an argument can't be serialized, the call raises with nothing written. A repeated `:discard` call is never stored, so an argument on it that can't be serialized stays silently discarded, as with a single `perform_later`.
 
 After that, only a database error or a `coalesce.solid_queue` subscriber that raises can fail the call. There's one exception. A job's concurrency key comes from its first call, and which call that is depends on the database, so a concurrency key Proc can raise on a later job's first call. In every case, earlier work stays committed and has its outcomes, and later calls have no outcome.
 
@@ -727,7 +776,7 @@ Every call row stays until its job is destroyed, including calls skipped because
 
 ## Recurring jobs and concurrency limits
 
-A [recurring task](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#recurring-tasks) can use `:discard`. A tick that finds a pending job is suppressed and not recorded in `solid_queue_recurring_executions`. A recurring task can't use `:collect` or `debounce:`: its configuration is invalid. A tick passes no time, so it would get the window, and an interval shorter than the window could stop the job from ever running.
+A [recurring task](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#recurring-tasks) can use `:discard`. A tick that finds a pending job is suppressed and not recorded in `solid_queue_recurring_executions`. A recurring task can't use `:collect`, `:replace` or `debounce:`: its configuration is invalid. A tick that joined with either of the first two would record the pending job again, and the unique index would roll back what it added. A tick passes no time, so it would get the window, and an interval shorter than the window could stop the job from ever running.
 
 To keep one follow-up, coalesce pending work and block on the limit, as in the [leading edge](#run-on-the-leading-edge) and [recurring](#coalesce-a-recurring-task) recipes. To drop busy ticks with no follow-up, use `limits_concurrency on_conflict: :discard` alone, after reading [`coalesce` or `limits_concurrency`?](#coalesce-or-limits_concurrency).
 
@@ -743,7 +792,7 @@ A runs right away. B arrives during that run and opens job 2, which blocks on th
 
 `:global` is a literal in both APIs, and coalescing and concurrency keep separate database records. A semaphore's [`duration`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls) can expire, so a concurrency limit isn't an absolute guarantee against overlap.
 
-The concurrency key of a coalesced job is the one computed for the call that created it, and a blocked job still holds its coalesce key, since it hasn't started. `:collect` works with `on_conflict: :block`. It can't be combined with `limits_concurrency` with `on_conflict: :discard`, in either order, because a conflict would destroy a job holding calls, so that raises `ArgumentError` when the class loads. `:discard` can, and the destroyed job frees the key.
+The concurrency key of a coalesced job is the one computed for the call that created it, and a blocked job still holds its coalesce key, since it hasn't started. `:collect` and `:replace` work with `on_conflict: :block`. They can't be combined with `limits_concurrency` with `on_conflict: :discard`, in either order, because a conflict would destroy a job holding calls or replaced arguments, so that raises `ArgumentError` when the class loads. `:discard` can, and the destroyed job frees the key.
 
 ## Solid Queue batches
 
@@ -778,7 +827,7 @@ Each importer adds to the batch while it runs, and that running job keeps the ba
 A few rules apply:
 
 - Calls with the same key share one job, and that job belongs to that batch alone. The same key in another batch, or outside a batch, runs separately. `limits_concurrency` isn't scoped to a batch, so it still stops those jobs overlapping.
-- `total_jobs` counts jobs, not calls. A call that joins a job adds nothing, and the job after a `:collect` job seals counts as another.
+- `total_jobs` counts jobs, not calls. A call that joins or replaces a job adds nothing, and the job after a `:collect` job seals counts as another.
 - A batched key starts with its batch, as in `Batch/7/ReindexProductJob/42`. `coalesce.solid_queue` reports it that way, and the prefix counts towards MySQL's 255 characters.
 - A running job adds to its batch with `batch.enqueue`. Without that a call isn't in the batch, because Solid Queue doesn't set a current batch while a job runs. Adding from anywhere else races the batch finishing, and raises `SolidQueue::Batch::AlreadyFinished` if it lost.
 - `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. A single enqueue raises `SolidQueue::Job::EnqueueError`, and a bulk enqueue raises `ActiveRecord::Deadlocked`; both roll back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the example.
@@ -794,7 +843,7 @@ A job that fails before starting, for example because its worker died or because
 
 ## Changing a job's configuration
 
-A job that gets a key records how it was created in its own payload, as `"solid_queue_coalesce_on_conflict": "collect"` or `"discard"`, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
+A job that gets a key records how it was created in its own payload, as `"solid_queue_coalesce_on_conflict": "collect"`, `"replace"` or `"discard"`, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
 
 That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce` without failures, stop enqueuing, wait for `SolidQueue::CoalescedCall.waiting` to be empty, and only then deploy the change. Workers on the old and new code can overlap in a rolling deploy, so a job can fail on one of them and need the same recovery.
 
@@ -803,6 +852,9 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 | Remove `:collect` or `coalesce` | The job fails with its calls, as above |
 | Switch `:collect` to `:discard` | The job fails with its calls, as above. The next call doesn't count on that job, and creates a new one |
 | Switch `:discard` to `:collect` | The next call doesn't join the discarding job, and creates a new one. The old job runs one call from its own arguments |
+| Switch `:discard` or `:collect` to `:replace` | The next call doesn't replace the old job's arguments, and creates a new one. The old job runs as it was created |
+| Switch `:replace` to `:collect` | The next call doesn't join the replacing job, and creates a new one. The old job runs its latest arguments as one call |
+| Switch `:replace` to `:discard`, or remove `coalesce` | Calls are discarded into the replacing job, or run on their own. It runs its latest arguments, and nothing needs draining |
 | Change `limits_concurrency` to `on_conflict: :discard` after removing `:collect` | A conflict blocks the job instead of destroying it, so it reaches a worker and fails with its calls |
 | Change the queue adapter | Waiting jobs still run their calls. A retry of one raises `CollectedJobMismatch`, and the job fails with its calls |
 | Remove `perform_calls` | The run raises `NotImplementedError`, and the job fails with its calls, unless a handler such as `discard_on Exception` takes it |
@@ -850,7 +902,7 @@ Two notifications exist:
 
 | Event | When | Payload |
 | --- | --- | --- |
-| `coalesce.solid_queue` | A call was admitted, including the one that created the job | `status` (`:created`, `:discarded`, `:collected`), `key`, `job_id`, `active_job_id`, `class_name` |
+| `coalesce.solid_queue` | A call was admitted, including the one that created the job | `status` (`:created`, `:discarded`, `:collected`, `:replaced`), `key`, `job_id`, `active_job_id`, `class_name` |
 | `drop_coalesced_call.solid_queue` | A collected call was skipped on this attempt because its record is gone | `call_id`, `job_id`, `active_job_id`, `class_name`, `exception_class` |
 
 `SolidQueue::LogSubscriber` logs the first at debug level and the second at warn level. Neither logs arguments or payloads, and neither logs the key, which your app defines. The key is only in the event's payload.

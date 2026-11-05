@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
+Adds `on_conflict: :replace`, which runs a pending job with its latest call's arguments. Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
+
+### Added
+
+- `on_conflict: :replace` for `coalesce`. A call writes its arguments over the pending job's, which keeps its ID, queue, priority and place in line, and runs `perform` with the latest ones. It reports `:replaced`, works with `debounce:`, `max_wait:`, blocking concurrency limits and batches, and can't be used by a recurring task.
 
 ### Changed
 
