@@ -10,7 +10,7 @@ Adds `on_conflict: :replace`, which runs a pending job with its latest call's ar
 
 ### Added
 
-- `on_conflict: :replace` for `coalesce`. A call writes its arguments over the pending job's, which keeps its ID, queue, priority and place in line, and runs `perform` with the latest ones. It reports `:replaced`, works with `debounce:`, `max_wait:`, blocking concurrency limits and batches, and can't be used by a recurring task.
+- `on_conflict: :replace` for `coalesce`. A call writes its arguments over the pending job's, which keeps its ID, queue, priority and place in line, and runs `perform` with the latest ones. It reports `:replaced`, works with `debounce:`, `max_wait:`, blocking concurrency limits and batches, and can't be used by a recurring task. ([#47](https://github.com/dtcristo/solid_queue-coalesce/pull/47))
 
 ### Changed
 
