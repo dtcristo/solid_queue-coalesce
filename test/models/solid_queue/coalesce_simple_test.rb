@@ -343,6 +343,22 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
     end
   end
 
+  test "a nil or false key declaration disables coalescing, like limits_concurrency" do
+    [ nil, false ].each do |key|
+      job_class = Class.new(ApplicationJob) do
+        def self.name = "ParityJob"
+
+        coalesce key: key
+        limits_concurrency key: key
+      end
+
+      assert_nil job_class.new.coalesce_key
+      assert_nil job_class.new.concurrency_key
+      assert_not job_class.new.coalesced_enqueue?
+      assert_not job_class.new.concurrency_limited?
+    end
+  end
+
   test "keys are built from a record's class and id, or a string" do
     result = JobResult.create!
 
