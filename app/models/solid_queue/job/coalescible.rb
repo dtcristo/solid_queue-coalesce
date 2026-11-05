@@ -16,10 +16,13 @@ module SolidQueue
       class_methods do
         # Every call in active_jobs has the same key. Returns the job if a call
         # created one, nil if the calls joined the open job.
-        def enqueue_coalesced(key, active_jobs, payloads = nil)
-          return collect_coalesced(key, active_jobs, payloads || active_jobs.map(&:serialize)) if active_jobs.first.class.coalesce_collect?
+        def enqueue_coalesced(key, active_jobs, payloads = nil, wrap_errors: false)
+          if active_jobs.first.class.coalesce_collect?
+            payloads ||= raising_enqueue_errors(wrap_errors) { active_jobs.map(&:serialize) }
+            return collect_coalesced(key, active_jobs, payloads, wrap_errors: wrap_errors)
+          end
 
-          enqueued_job, open_job_id = raising_enqueue_errors do
+          enqueued_job, open_job_id = raising_enqueue_errors(wrap_errors) do
             retrying_deadlocks { admit_discarding(key, active_jobs) }
           end
 
@@ -96,9 +99,11 @@ module SolidQueue
             enqueued_job
           end
 
-          def raising_enqueue_errors
+          def raising_enqueue_errors(wrap_errors = true)
             yield
           rescue ActiveRecord::ActiveRecordError => e
+            raise unless wrap_errors
+
             enqueue_error = EnqueueError.new("#{e.class.name}: #{e.message}").tap do |error|
               error.set_backtrace e.backtrace
             end
@@ -134,7 +139,7 @@ module SolidQueue
           def create_for_coalesce_key(coalesce_key, active_job)
             attributes = attributes_from_active_job(active_job)
 
-            create!(**attributes, arguments: attributes[:arguments].merge("coalesce_on_conflict" => "discard")).tap do |job|
+            create!(**attributes, arguments: attributes[:arguments].merge("solid_queue_coalesce_on_conflict" => "discard")).tap do |job|
               # limits_concurrency with on_conflict: :discard destroys the job right away
               if job.persisted?
                 coalesce_key.update_columns(job_id: job.id)
@@ -149,13 +154,13 @@ module SolidQueue
           # can't leave one behind. Serialized once and before any job exists, so the
           # first call's payload is like every other call's, and a retry doesn't take
           # a new snapshot.
-          def collect_coalesced(key, active_jobs, payloads)
+          def collect_coalesced(key, active_jobs, payloads, wrap_errors:)
             max_calls = active_jobs.first.class.coalesce_max_calls
             pending = active_jobs.zip(payloads)
             enqueued_job = nil
 
             until pending.empty?
-              admitted, created_job, job_id = raising_enqueue_errors do
+              admitted, created_job, job_id = raising_enqueue_errors(wrap_errors) do
                 retrying_deadlocks { transaction { admit_collected(key, pending, max_calls) } }
               end
 
@@ -248,7 +253,7 @@ module SolidQueue
               priority: active_job.priority || singleton_class::DEFAULT_PRIORITY,
               scheduled_at: active_job.scheduled_at,
               class_name: active_job.class.name,
-              arguments: payload.merge("coalesce_on_conflict" => "collect"),
+              arguments: payload.merge("solid_queue_coalesce_on_conflict" => "collect"),
               concurrency_key: active_job.concurrency_key
             }
             attributes[:batch_id] = active_job.batch_id if Batch.migrated?
@@ -296,14 +301,14 @@ module SolidQueue
       private
         # Whether this job's class coalesces
         def coalesced?
-          job_class.try(:coalesce_key).present?
+          !!job_class.try(:coalesce_key)
         end
 
         # Admission marks a job before giving it a key, and the class covers jobs from
         # before the marker. Anything that can't answer gets the read, so that failing
         # or discarding a job still works when its payload or its class can't be loaded.
         def may_hold_coalesce_key?
-          !arguments.is_a?(Hash) || arguments.key?("coalesce_on_conflict") || coalesced?
+          !arguments.is_a?(Hash) || arguments.key?("solid_queue_coalesce_on_conflict") || coalesced?
         rescue StandardError, ScriptError
           true
         end

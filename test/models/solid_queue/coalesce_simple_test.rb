@@ -759,7 +759,7 @@ class SolidQueue::CoalesceSimpleTest < ActiveSupport::TestCase
   private
     def enqueue_unmarked(name)
       job = SolidQueue::Job.find(CoalescedRefreshJob.perform_later(name).provider_job_id)
-      job.update!(arguments: job.arguments.except("coalesce_on_conflict"))
+      job.update!(arguments: job.arguments.except("solid_queue_coalesce_on_conflict"))
       SolidQueue::Job.find(job.id)
     end
 

@@ -188,7 +188,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     ordinary, collect_a, discard_b, collect_c = mixed_jobs_by_kind
 
     failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
-      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c ]) }
+      assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c ]) }
     end
 
     assert_equal [ ordinary, collect_a.first ].map(&:job_id), SolidQueue::Job.order(:id).pluck(:active_job_id)
@@ -204,7 +204,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
 
     events = capture_events do
       failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
-        assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(collect_a) }
+        assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all(collect_a) }
       end
     end
 
@@ -217,7 +217,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     discard_c = DiscardJob.new("c")
 
     failing(SolidQueue::Job, :create!, matching: creating(discard_b.first)) do
-      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c, discard_c ]) }
+      assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all([ ordinary, *collect_a, *discard_b, collect_c, discard_c ]) }
     end
 
     assert collect_a.all?(&:provider_job_id)
@@ -242,7 +242,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     jobs = [ ordinary, *collect_a, *discard_b, collect_c ]
 
     failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(collect_a[2])) do
-      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
+      assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all(jobs) }
     end
 
     SolidQueue::Job.enqueue_all(jobs.reject(&:provider_job_id))
@@ -287,7 +287,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     SolidQueue::Job.stubs(:create!).raises(ActiveRecord::StatementInvalid, "boom")
     SolidQueue::Job.find(job_id).destroy!
 
-    assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all([ call ]) }
+    assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all([ call ]) }
 
     assert_equal job_id, call.provider_job_id
     assert_equal :created, call.coalesce_status
@@ -331,7 +331,7 @@ class SolidQueue::CoalesceBulkEnqueueTest < ActiveSupport::TestCase
     jobs = mixed_jobs
 
     failing(SolidQueue::CoalescedCall, :insert_all, matching: storing(jobs.find { |job| job.is_a?(CollectJob) })) do
-      assert_raises(SolidQueue::Job::EnqueueError) do
+      assert_raises(ActiveRecord::StatementInvalid) do
         SolidQueue::Record.transaction { SolidQueue::Job.enqueue_all(jobs) }
       end
     end

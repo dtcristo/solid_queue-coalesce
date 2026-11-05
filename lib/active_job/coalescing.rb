@@ -83,6 +83,8 @@ module ActiveJob
       #
       # * +:key+ - Required. A String or Symbol literal, or a Proc that receives the job's
       #   arguments. It's scoped to the job class, and built like the key of +limits_concurrency+.
+      #   +nil+ and +false+ disable coalescing; other types give a class-wide key. Blank
+      #   declarations still coalesce. All keys are scoped to the batch when present.
       # * +:on_conflict+ - +:discard+, the default, suppresses a call that finds a pending
       #   job. +:collect+ stores every call for #perform_calls.
       # * +:max_calls+ - The most calls one run takes with +:collect+. Defaults to 100.
@@ -91,13 +93,9 @@ module ActiveJob
       # * +:debounce+ - A duration. Each call pushes a pending job back to that long from now.
       # * +:max_wait+ - A duration greater than +:debounce+ that caps how far a job can move.
       #
-      # An invalid option raises +ArgumentError+. The README has recipes for each of these:
+      # Except for +:key+, an invalid option raises +ArgumentError+. The README has recipes:
       # https://github.com/dtcristo/solid_queue-coalesce#recipes
       def coalesce(key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: nil, max_wait: nil)
-        unless (key.is_a?(String) || key.is_a?(Symbol) || key.is_a?(Proc)) && key.present?
-          raise ArgumentError, "`key` must be a non-blank String or Symbol, or a Proc"
-        end
-
         unless on_conflict.in?(COALESCE_ON_CONFLICT_BEHAVIOUR)
           raise ArgumentError, "`on_conflict` must be :discard or :collect"
         end
@@ -171,12 +169,12 @@ module ActiveJob
     # outlives the class's declaration. Only the job's row starts with this, when it
     # gets its key, so an instance only has it if it was read from one.
     def serialize # :nodoc:
-      @coalesce_on_conflict ? super.merge("coalesce_on_conflict" => @coalesce_on_conflict) : super
+      @coalesce_on_conflict ? super.merge("solid_queue_coalesce_on_conflict" => @coalesce_on_conflict) : super
     end
 
     def deserialize(job_data) # :nodoc:
       super
-      @coalesce_on_conflict = job_data["coalesce_on_conflict"]
+      @coalesce_on_conflict = job_data["solid_queue_coalesce_on_conflict"]
     end
 
     # Scoped to the job class name, and built like concurrency_key. In a batch it's
@@ -208,7 +206,7 @@ module ActiveJob
 
     # A retry is the same work continuing, so it can't join or suppress anything
     def coalesced_enqueue? # :nodoc:
-      self.class.coalesce_key.present? && executions.to_i.zero?
+      self.class.coalesce_key && executions.to_i.zero?
     end
 
     # A call's own time if it has one, and otherwise now plus the window. A longer

@@ -4,6 +4,7 @@
 - Don't add too much complexity.
 - Optimise the implementation for correctness, simple implementation and performance, all three of them, while still in the style of Solid Queue.
 - When there are multiple ways to implement something, implement it the way Solid Queue does.
+- Where something has a counterpart in Solid Queue or [solid_queue-rate_limit](https://github.com/dtcristo/solid_queue-rate_limit), make it work identically, such as how keys are built, column collations, and entry names in a job's serialized data. When the two differ, follow Solid Queue.
 - APIs should look very Rails-like.
 - Never alter Solid Queue's existing tables. Only add new ones.
 - Add user-visible changes to the top section of `CHANGELOG.md` in the same PR, and add steps to `UPGRADING.md` if an upgrade needs them. Only record what's on `main`, not what an open issue proposes.

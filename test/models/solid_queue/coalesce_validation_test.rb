@@ -117,15 +117,8 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) { new_job_class { coalesce key: "a", on_conflict: :collect, flush_when_full: false } }
   end
 
-  test "key is required and has to be a string, a symbol or a proc" do
+  test "key is required" do
     assert_raises(ArgumentError) { new_job_class { coalesce } }
-    assert_raises(ArgumentError) { new_job_class { coalesce key: 1 } }
-    assert_raises(ArgumentError) { new_job_class { coalesce key: nil } }
-    assert_raises(ArgumentError) { new_job_class { coalesce key: "" } }
-    assert_raises(ArgumentError) { new_job_class { coalesce key: :"" } }
-    assert new_job_class { coalesce key: :a }
-    assert new_job_class { coalesce key: "a" }
-    assert new_job_class { coalesce key: -> { "a" } }
   end
 
   test "unknown options raise" do

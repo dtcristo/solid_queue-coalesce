@@ -24,7 +24,7 @@ module JobsTestHelper
       job = coalesce_key.job
 
       assert job, "#{coalesce_key.key} has no job"
-      assert job.arguments.key?("coalesce_on_conflict"), "#{coalesce_key.key} is held by an unmarked job"
+      assert job.arguments.key?("solid_queue_coalesce_on_conflict"), "#{coalesce_key.key} is held by an unmarked job"
       assert_not job.finished?, "#{coalesce_key.key} is held by a finished job"
       assert_nil job.claimed_execution, "#{coalesce_key.key} is held by a job that started"
       assert_nil job.failed_execution, "#{coalesce_key.key} is held by a failed job"

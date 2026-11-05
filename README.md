@@ -423,7 +423,7 @@ coalesce key:, on_conflict: :discard, max_calls: nil, on_full: nil, debounce: ni
 - `debounce` is a positive duration. Each call pushes a pending job back to that long from now. See [Debouncing](#debouncing).
 - `max_wait` is a duration greater than `debounce`, and needs `debounce`. It's optional. See [Debouncing](#debouncing).
 
-An invalid option raises `ArgumentError` when the class loads.
+Except for `key:`, an invalid option raises `ArgumentError` when the class loads. The `key:` declaration accepts any value, like `limits_concurrency`.
 
 ## Keys
 
@@ -442,6 +442,8 @@ coalesce key: ->(account_id, kind) { [ account_id, kind ] } # Composite key
 - The result is joined into a string, so `1` and `"1"` give the same key.
 - An array's items are joined with `/`, so `[ "a/b" ]` and `[ "a", "b" ]` give the same key.
 - A Proc that returns `nil` gives the class-wide key, so all of those calls merge.
+- A declaration of `nil` or `false` disables coalescing. Other unsupported declaration types, such as `key: 123`, give the class-wide key.
+- Blank declarations still coalesce: `key: ""` gives `JobClass/`, and `key: []` or `key: {}` gives `JobClass`. These keys are scoped to the batch too.
 - Keys longer than 255 characters fail on MySQL.
 
 Keys are always scoped to the job class name, and there's no `group` option, so two classes can't share a key. In a [Solid Queue batch](#solid-queue-batches) they're scoped to the batch too.
@@ -641,7 +643,7 @@ call.coalesce_status # :created, so a job runs with these arguments
 
 - `false` here includes `nil`, which is what `successfully_enqueued?` returns until an enqueue has been tried.
 - After a `before_enqueue` abort, `perform_later` returns `false`, as it does for any job. Pass a block to `perform_later` if you need the instance.
-- A failed enqueue raises `SolidQueue::Job::EnqueueError`, so only an instance you built yourself can be read afterwards. Nothing resets a reused instance's status or `provider_job_id`.
+- A database failure during a single enqueue raises `SolidQueue::Job::EnqueueError`. Bulk enqueues raise the original Active Record error. Only an instance you built yourself can be read afterwards. Nothing resets a reused instance's status or `provider_job_id`.
 - A deferred call that gets rolled back stays as it was before the commit, and is never stored. Rails 7.2 with `load_defaults 7.2` defers by default on Solid Queue, so there a rollback looks like this too, instead of leaving stale values.
 - On Rails 7.2 and 8.0, `retry_job` enqueues a copy of the job, so the worker's instance doesn't change at all. Read the result from what `retry_job` returns.
 
@@ -675,7 +677,7 @@ This stores each call once. Calls destroyed by a `limits_concurrency` conflict w
 
 Trust outcomes only from a call that didn't raise, or for this recovery. A failed enqueue of an instance you've enqueued before can show its old outcome.
 
-A database failure on coalesced calls raises `SolidQueue::Job::EnqueueError`. One on ordinary jobs raises the raw Active Record error, as native bulk does. A single call can raise either.
+A database failure raises the original Active Record error for both ordinary and coalesced jobs, as native bulk does. A single `perform_later` wraps database failures in `SolidQueue::Job::EnqueueError`. Errors from `coalesce.solid_queue` subscribers propagate unchanged for both APIs, including Active Record errors. A subscriber failure doesn't undo work that has already committed or clear its outcomes.
 
 Only the order of each key's calls is guaranteed. Native bulk creates jobs in input order. Here, ordinary jobs come first, then coalesced calls sorted by key.
 
@@ -779,7 +781,7 @@ A few rules apply:
 - `total_jobs` counts jobs, not calls. A call that joins a job adds nothing, and the job after a `:collect` job seals counts as another.
 - A batched key starts with its batch, as in `Batch/7/ReindexProductJob/42`. `coalesce.solid_queue` reports it that way, and the prefix counts towards MySQL's 255 characters.
 - A running job adds to its batch with `batch.enqueue`. Without that a call isn't in the batch, because Solid Queue doesn't set a current batch while a job runs. Adding from anywhere else races the batch finishing, and raises `SolidQueue::Batch::AlreadyFinished` if it lost.
-- `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. It raises `SolidQueue::Job::EnqueueError` and rolls back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the example.
+- `batch.enqueue` is a transaction, so a block that raises rolls back everything in it. A deadlock isn't retried inside it. A single enqueue raises `SolidQueue::Job::EnqueueError`, and a bulk enqueue raises `ActiveRecord::Deadlocked`; both roll back the block, as in [your own transaction](#rules-and-limitations). A block that opens several keys holds the batch's row while it waits for the next key, so concurrent blocks on one batch can deadlock. If jobs add to a batch at the same time, use one `batch.enqueue` per call, as in the example.
 - With `enqueue_after_transaction_commit`, which `load_defaults 8.2` turns on, calls wait until the block commits. A failure then can't roll the block back, and a deferred `perform_all_later` only keeps the batch for jobs built inside the block. Solid Queue's ordinary jobs do the same.
 - Bulk discards delete jobs without callbacks, so a batch left with no jobs finishes when Solid Queue's batch maintenance next runs.
 - A callback job isn't part of its batch, so a coalesced one uses the key it would use outside a batch.
@@ -792,7 +794,7 @@ A job that fails before starting, for example because its worker died or because
 
 ## Changing a job's configuration
 
-A job that gets a key records how it was created in its own payload, as `"coalesce_on_conflict": "collect"` or `"discard"`, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
+A job that gets a key records how it was created in its own payload, as `"solid_queue_coalesce_on_conflict": "collect"` or `"discard"`, so a worker knows even if the class has changed since. If you remove `:collect` or `coalesce` while calls are waiting, each of those jobs raises `ActiveJob::Coalescing::CollectedJobMismatch` when it runs. Nothing has run at that point, `retry_on` and `discard_on` don't see the error, and the job fails with all of its calls. Restore the declaration and retry the failed job to run them, or discard the job to delete them.
 
 That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce` without failures, stop enqueuing, wait for `SolidQueue::CoalescedCall.waiting` to be empty, and only then deploy the change. Workers on the old and new code can overlap in a rolling deploy, so a job can fail on one of them and need the same recovery.
 
@@ -812,7 +814,7 @@ That's a way to recover, not a way to deploy. To remove `:collect` or `coalesce`
 
 Solid Queue only deletes calls along with their job. Deleting call rows yourself isn't supported, and neither is changing `calls_count`. If you do, a collecting job with no calls left raises `CollectedJobMismatch` instead of running its own arguments, which are a copy of its first call. A job that lost only some of its calls runs the rest, and nothing reports the loss.
 
-Jobs enqueued by version 0.1 don't have this record, so drain them before you upgrade. See [UPGRADING.md](UPGRADING.md).
+Jobs enqueued before 0.3.0 don't have the prefixed marker, and the old name isn't read. Drain coalesced jobs before upgrading, including retrying or discarding failed ones on the old version. See [UPGRADING.md](UPGRADING.md).
 
 ## Rules and limitations
 

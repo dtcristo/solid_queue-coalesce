@@ -323,7 +323,7 @@ module Coalesced
       if shape == "bulk"
         calls.each_slice(BULK_SIZE) do |slice|
           ActiveJob.perform_all_later(slice)
-        rescue SolidQueue::Job::EnqueueError
+        rescue ActiveRecord::ActiveRecordError
           errors.increment(slice.count { |call| call.coalesce_status.nil? })
         ensure
           active_jobs.concat(slice)
@@ -577,7 +577,7 @@ module Maintenance
     finished, failed, waiting = shape.values_at(:finished, :failed, :waiting)
     jobs = finished + failed + waiting
     timestamp = TARGET_DB == "sqlite" ? "'2026-10-01 00:00:00'" : "TIMESTAMP '2026-10-01 00:00:00'"
-    payload = connection.quote(CollectingJob.new("a").serialize.merge("coalesce_on_conflict" => "collect").to_json)
+    payload = connection.quote(CollectingJob.new("a").serialize.merge("solid_queue_coalesce_on_conflict" => "collect").to_json)
     finished_or_failed_calls = finished * shape[:finished_calls] + failed * shape[:failed_calls]
     calls = finished_or_failed_calls + waiting * shape[:waiting_calls]
     call_payload = connection.quote(CollectingJob.new("a").serialize.to_json)

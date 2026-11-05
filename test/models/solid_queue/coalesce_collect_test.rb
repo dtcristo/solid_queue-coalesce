@@ -732,15 +732,13 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
   end
 
   test "waiting is what hasn't started: pending, delayed and blocked jobs' calls, not those of running, failed or finished ones" do
-    LimitedCollectedJob.perform_later("running", "shared")
+    semaphore_holder = LimitedCollectedJob.perform_later("running", "shared")
     blocked = LimitedCollectedJob.perform_later("blocked", "shared")
     delayed = TwoCallsJob.set(wait: 1.hour).perform_later("delayed", 0)
     ready = TwoCallsJob.perform_later("ready", 0)
     SolidQueue::ReadyExecution.where.not(job_id: ready.provider_job_id).update_all(priority: 1)
     waiting = -> { SolidQueue::CoalescedCall.waiting.distinct.pluck(:job_id).sort }
-    semaphore_holder_id = SolidQueue::Job.find_by!(class_name: LimitedCollectedJob.name, concurrency_key: "#{LimitedCollectedJob.name}/shared").id
-
-    assert_equal [ semaphore_holder_id, blocked.provider_job_id, delayed.provider_job_id, ready.provider_job_id ].sort, waiting.call
+    assert_equal [ semaphore_holder.provider_job_id, blocked.provider_job_id, delayed.provider_job_id, ready.provider_job_id ].sort, waiting.call
 
     process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "waiting-worker")
     claimed = SolidQueue::ReadyExecution.claim("*", 1, process.id).sole
@@ -854,7 +852,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     jobs = 5.times.map { |i| TwoCallsJob.new("g", i) }
 
     failing_insert_all(on_attempt: 2, error: ActiveRecord::StatementInvalid) do
-      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
+      assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all(jobs) }
     end
 
     assert_equal [ :created, :collected, nil, nil, nil ], jobs.map(&:coalesce_status)
