@@ -21,6 +21,11 @@ class SolidQueue::CoalesceKeyDeclarationsTest < ActiveSupport::TestCase
     end
   end
 
+  teardown do
+    SolidQueue::Job.destroy_all
+    SolidQueue::Batch.destroy_all
+  end
+
   { integer: 123, blank: "", whitespace: " ", empty_symbol: :"", empty_array: [], empty_hash: {}, nil: nil, false: false }.each do |label, key|
     [ DiscardJob, CollectJob ].each do |job_class|
       [ false, true ].each do |bulk|
