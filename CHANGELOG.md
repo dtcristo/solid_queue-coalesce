@@ -10,10 +10,11 @@ Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and p
 
 ### Changed
 
-- **Breaking:** Serialized job data uses `solid_queue_coalesce_on_conflict` instead of `coalesce_on_conflict`, with no fallback. Drain all coalesced work, including retrying or discarding failures, before deploying.
-- **Breaking:** `coalesce(key:)` accepts declarations without type or blank validation, like `limits_concurrency`. Unsupported truthy types produce a class-wide key, blank declarations coalesce, and `nil` or `false` disables coalescing. Other options retain their validation.
-- **Breaking:** Bulk enqueues propagate original Active Record errors for coalesced jobs, like native bulk enqueue. Single enqueues retain `SolidQueue::Job::EnqueueError`; notification subscriber errors remain unwrapped.
+- **Breaking:** Serialized job data uses `solid_queue_coalesce_on_conflict` instead of `coalesce_on_conflict`, with no fallback. Drain all coalesced work, including retrying or discarding failures, before deploying. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
+- **Breaking:** `coalesce(key:)` accepts declarations without type or blank validation, like `limits_concurrency`. Unsupported truthy types produce a class-wide key, blank declarations coalesce, and `nil` or `false` disables coalescing. Other options retain their validation. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
+- **Breaking:** Bulk enqueues propagate original Active Record errors for coalesced jobs, like native bulk enqueue. Single enqueues retain `SolidQueue::Job::EnqueueError`; notification subscriber errors remain unwrapped. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** Batched coalescing keys start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`, including keys in `coalesce.solid_queue` notifications. Drain affected batches before upgrading so new calls don't create separate jobs under the new keys. ([#43](https://github.com/dtcristo/solid_queue-coalesce/pull/43))
+
 
 ## [0.2.0] - 2026-11-02
 
