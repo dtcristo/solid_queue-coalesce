@@ -6,6 +6,8 @@ class SolidQueue::CoalesceEnqueueErrorsTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class OrdinaryJob < ApplicationJob
+    self.enqueue_after_transaction_commit = ActiveJob.version < "8.0" ? :never : false if respond_to?(:enqueue_after_transaction_commit=)
+
     def perform(*); end
   end
 
