@@ -71,7 +71,7 @@ module SolidQueue
       module ConcurrencyConflicts
         private
           def handle_concurrency_conflict
-            arguments["solid_queue_coalesce_on_conflict"].in?(%w[ collect replace ]) ? block : super
+            arguments["solid_queue_coalesce_on_conflict"].in?(%w[ replace collect ]) ? block : super
           end
       end
 

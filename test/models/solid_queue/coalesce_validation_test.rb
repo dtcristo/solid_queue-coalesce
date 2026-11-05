@@ -39,12 +39,12 @@ class SolidQueue::CoalesceValidationTest < ActiveSupport::TestCase
     assert_nil job_class.coalesce_max_calls
   end
 
-  test "on_conflict is discard, collect or replace, and anything else raises" do
+  test "on_conflict is discard, replace or collect, and anything else raises" do
     assert_equal :discard, new_job_class { coalesce key: "a", on_conflict: :discard }.coalesce_on_conflict
     assert_equal :collect, new_job_class { coalesce key: "a", on_conflict: :collect }.coalesce_on_conflict
     assert_equal :replace, new_job_class { coalesce key: "a", on_conflict: :replace }.coalesce_on_conflict
 
-    [ :block, "collect", "replace", nil ].each do |value|
+    [ :block, "replace", "collect", nil ].each do |value|
       error = assert_raises(ArgumentError, value.inspect) { new_job_class { coalesce key: "a", on_conflict: value } }
       assert_match(/on_conflict/, error.message)
     end

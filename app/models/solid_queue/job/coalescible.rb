@@ -328,7 +328,7 @@ module SolidQueue
               end
 
               active_job.provider_job_id = job_id
-              active_job.successfully_enqueued = status.in?(%i[ created collected replaced ])
+              active_job.successfully_enqueued = status.in?(%i[ created replaced collected ])
               active_job.send(:coalesce_status=, status)
             end
 
