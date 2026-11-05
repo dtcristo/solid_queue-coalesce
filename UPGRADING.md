@@ -1,12 +1,28 @@
-# Upgrading from version 0.2.0 to the next release
+# Upgrading from version 0.2.0 to 0.3.0
 
-Batched coalescing keys now start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`. Existing jobs can still run, but new calls won't join pending jobs under the old keys and can create separate jobs for the same work. No database migration is needed.
+The serialized job marker is now `solid_queue_coalesce_on_conflict`, and the old `coalesce_on_conflict` name is no longer read. Drain all coalesced work on the old version before deploying. No database migration or payload conversion is provided.
 
-1. Pause producers that start batches or enqueue work into them. Keep the old workers and dispatcher running so jobs can finish their batch work.
-2. Wait for affected batches to finish, including scheduled and blocked work. Retry or discard failed jobs. To conservatively check all batches, wait until `SolidQueue::Batch.where(finished_at: nil).count` is zero.
-3. Stop the old application and Solid Queue processes, deploy the new version together, then resume producers. Don't run both versions against active affected batches.
+Batched coalescing keys also start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`. New calls won't join pending jobs under the old keys and can create separate jobs for the same work, so affected batches must finish too.
 
-Update notification subscribers, log parsers or other consumers that match the old key prefix. `coalesce.solid_queue` now reports keys such as `Batch/7/ReindexProductJob/42`.
+1. Pause every producer of coalesced work, including application requests, recurring tasks and batch producers. Keep the old workers and dispatcher running to drain the queue.
+2. Wait for all coalesced jobs to finish, including scheduled, ready, blocked, running and retrying jobs. Retry or discard failed jobs on the old version. Check every class that used `coalesce`, including ones whose declarations have since changed, with the query below.
+3. Wait for affected batches to finish. To conservatively check all batches, wait until `SolidQueue::Batch.where(finished_at: nil).count` is zero.
+4. Stop the old application and Solid Queue processes, deploy the new version to all producers, workers, dispatchers and schedulers together, then resume producers. Don't run both versions against coalesced work or affected batches.
+
+For example, replace these names with all your coalesced job classes and wait until the result is zero. Failed jobs are included, so retry or discard them before continuing:
+
+```ruby
+SolidQueue::Job.where(finished_at: nil, class_name: %w[ ReindexDocumentsJob SendDigestJob ]).count
+```
+
+Retrying an old failed job after deployment doesn't rewrite its payload and isn't a supported upgrade path. Preserved finished jobs need no drain, but replaying their old payloads after upgrading isn't supported either.
+
+Update code that depends on these errors or key declarations:
+
+- `ActiveJob.perform_all_later` now raises the original Active Record database error for coalesced calls, including `ActiveRecord::ValueTooLong` and `ActiveRecord::Deadlocked`. Update bulk error handlers that rescue `SolidQueue::Job::EnqueueError`. Single enqueues still wrap database errors in `SolidQueue::Job::EnqueueError`, and subscriber errors remain raw.
+- `coalesce(key:)` no longer rejects unsupported or blank declarations. Unsupported truthy types, such as `key: 123`, give a class-wide key. Blank strings and empty arrays or hashes still coalesce. Only `nil` and `false` disable coalescing. Check declarations that previously relied on `ArgumentError`; all other option validations remain.
+
+Update notification subscribers, log parsers or other consumers that match the old batch key prefix. `coalesce.solid_queue` now reports keys such as `Batch/7/ReindexProductJob/42`.
 
 # Upgrading from version 0.1.0 to 0.2.0
 

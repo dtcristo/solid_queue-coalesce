@@ -468,7 +468,7 @@ class SolidQueue::CoalesceBatchTest < ActiveSupport::TestCase
   test "a deadlock inside a batch isn't retried, and leaves the batch as it was" do
     batch = held_open_batch
 
-    assert_raises(SolidQueue::Job::EnqueueError) do
+    assert_raises(ActiveRecord::Deadlocked) do
       batch.enqueue { ActiveJob.perform_all_later(OrdinaryJob.new("x"), CollectJob.new("c"), DiscardJob.new("a"), TrailingDeadlockJob.new("z")) }
     end
 

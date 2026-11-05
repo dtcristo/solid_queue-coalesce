@@ -104,7 +104,7 @@ class SolidQueue::CoalesceUnreadableJobsTest < ActiveSupport::TestCase
 
       test "an unmarked #{job_class.name.demodulize} whose class is in a file that won't load, #{class_name}, gets discarded with its key" do
         job = enqueue(job_class)
-        job.update!(class_name: class_name, arguments: job.arguments.except("coalesce_on_conflict").merge("job_class" => class_name))
+        job.update!(class_name: class_name, arguments: job.arguments.except("solid_queue_coalesce_on_conflict").merge("job_class" => class_name))
 
         assert_discards(SolidQueue::Job.find(job.id))
         assert_equal 0, SolidQueue::CoalesceKey.count

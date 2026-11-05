@@ -32,7 +32,8 @@ module SolidQueue
           if active_job.coalesced_enqueue?
             active_job.scheduled_at = active_job.coalesced_scheduled_at(options[:scheduled_at])
             ensure_coalescible
-            enqueue_coalesced(active_job.coalesce_key, [ active_job ])
+            key = raising_enqueue_errors { active_job.coalesce_key }
+            enqueue_coalesced(key, [ active_job ], wrap_errors: true)
           elsif active_job.class.coalesce_key
             continuing_coalesced_run(active_job) { super }
           else
@@ -69,7 +70,7 @@ module SolidQueue
       module ConcurrencyConflicts
         private
           def handle_concurrency_conflict
-            arguments["coalesce_on_conflict"] == "collect" ? block : super
+            arguments["solid_queue_coalesce_on_conflict"] == "collect" ? block : super
           end
       end
 

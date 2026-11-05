@@ -208,8 +208,28 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     active_job.enqueue
     active_job.enqueue
 
-    assert_not SolidQueue::CoalescedCall.pluck(:arguments).any? { |payload| payload.key?("coalesce_on_conflict") }
-    assert_equal "collect", SolidQueue::Job.sole.arguments["coalesce_on_conflict"]
+    assert_not SolidQueue::CoalescedCall.pluck(:arguments).any? { |payload| payload.key?("solid_queue_coalesce_on_conflict") }
+    assert_equal "collect", SolidQueue::Job.sole.arguments["solid_queue_coalesce_on_conflict"]
+  end
+
+  test "the prefixed marker survives deserialization and serialization" do
+    job = enqueue_calls
+
+    payload = ActiveJob::Base.deserialize(job.arguments).serialize
+
+    assert_equal "collect", payload["solid_queue_coalesce_on_conflict"]
+    assert_not payload.key?("coalesce_on_conflict")
+  end
+
+  test "the old marker is neither recognized nor serialized" do
+    payload = ChangingJob.new(1).serialize.merge("coalesce_on_conflict" => "collect")
+    stop_coalescing(ChangingJob)
+    active_job = ActiveJob::Base.deserialize(payload)
+
+    assert_not active_job.serialize.key?("coalesce_on_conflict")
+    assert_not active_job.serialize.key?("solid_queue_coalesce_on_conflict")
+    active_job.perform_now
+    assert_equal [ [ :perform, [ 1 ] ] ], JobBuffer.values
   end
 
   test "a collecting job that lost all of its calls fails instead of running its own arguments" do
@@ -277,11 +297,11 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
   test "only the job's own payload is marked, not its calls, and ordinary jobs aren't" do
     job = enqueue_calls
 
-    assert_equal "collect", job.arguments["coalesce_on_conflict"]
-    assert_not job.coalesced_calls.any? { |call| call.arguments.key?("coalesce_on_conflict") }
+    assert_equal "collect", job.arguments["solid_queue_coalesce_on_conflict"]
+    assert_not job.coalesced_calls.any? { |call| call.arguments.key?("solid_queue_coalesce_on_conflict") }
 
-    assert_not AddToBufferJob.new("plain").serialize.key?("coalesce_on_conflict")
-    assert_not ChangingJob.new(1).serialize.key?("coalesce_on_conflict")
+    assert_not AddToBufferJob.new("plain").serialize.key?("solid_queue_coalesce_on_conflict")
+    assert_not ChangingJob.new(1).serialize.key?("solid_queue_coalesce_on_conflict")
   end
 
   test "a job created discarding is marked in its own payload, and its retries carry the marker" do
@@ -289,12 +309,12 @@ class SolidQueue::CoalesceConfigChangeTest < ActiveSupport::TestCase
     RetriedDiscardJob.perform_later("a")
     job = SolidQueue::Job.sole
 
-    assert_equal "discard", job.arguments["coalesce_on_conflict"]
+    assert_equal "discard", job.arguments["solid_queue_coalesce_on_conflict"]
 
     perform_ready_jobs
 
     retried = SolidQueue::Job.where(finished_at: nil).where.not(id: job.id).sole
-    assert_equal "discard", retried.arguments["coalesce_on_conflict"]
+    assert_equal "discard", retried.arguments["solid_queue_coalesce_on_conflict"]
     assert_equal 0, SolidQueue::CoalesceKey.count
   end
 

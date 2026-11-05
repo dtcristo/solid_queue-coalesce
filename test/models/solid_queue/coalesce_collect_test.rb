@@ -854,7 +854,7 @@ class SolidQueue::CoalesceCollectTest < ActiveSupport::TestCase
     jobs = 5.times.map { |i| TwoCallsJob.new("g", i) }
 
     failing_insert_all(on_attempt: 2, error: ActiveRecord::StatementInvalid) do
-      assert_raises(SolidQueue::Job::EnqueueError) { SolidQueue::Job.enqueue_all(jobs) }
+      assert_raises(ActiveRecord::StatementInvalid) { SolidQueue::Job.enqueue_all(jobs) }
     end
 
     assert_equal [ :created, :collected, nil, nil, nil ], jobs.map(&:coalesce_status)

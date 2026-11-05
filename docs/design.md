@@ -92,7 +92,7 @@ Reserved only exists inside the transaction that inserted the row, so other tran
 
 ## Admission
 
-`SolidQueue::Job.enqueue` and `enqueue_all` are prepended, so every enqueue passes through here, including those from `RecurringTask`. A call coalesces if its class has a key and `executions` is zero, so a retry never does.
+`SolidQueue::Job.enqueue` and `enqueue_all` are prepended, so every enqueue passes through here, including those from `RecurringTask`. A call coalesces if its class's key declaration is truthy and `executions` is zero, so a retry never does. Like upstream, `nil` and `false` disable it, while blank strings and unsupported truthy types still build a key scoped to the class and batch.
 
 ```mermaid
 flowchart TD
@@ -187,7 +187,7 @@ The app sets the key's `created_at` on insert, because MySQL's `CURRENT_TIMESTAM
 
 ### When a class changes
 
-A job that gets a key has a `coalesce_on_conflict` marker in its payload, and only the job's row has it, not its calls. The marker outlives the class's declaration, so a worker can tell how a job was created after a deploy changes the class.
+A job that gets a key has a `solid_queue_coalesce_on_conflict` marker in its payload, and only the job's row has it, not its calls. The marker outlives the class's declaration, so a worker can tell how a job was created after a deploy changes the class.
 
 | The class now | The open job was | What the next call does |
 | --- | --- | --- |
@@ -337,6 +337,10 @@ The holder is either the dispatcher, which is dispatching a job that's due, or a
 With `use_skip_locked` off, `non_blocking_lock` waits, and a fill or a move and a discard of the same job can deadlock. Admission retries unless it's nested, and a single discard has no retry. That takes a non-default setting and a discard racing a call, so we accept it.
 
 A `Job#discard` that loaded the scheduled execution before the fill dispatched the job raises `ActiveRecord::RecordNotFound` when it locks the row. The same happens when the dispatcher gets there first.
+
+## Enqueue errors
+
+Single coalesced enqueues wrap Active Record errors from key computation, payload serialization and admission in `SolidQueue::Job::EnqueueError`, retaining the cause and backtrace. Shared bulk admissions raise the original error. The wrapper ends before outcomes and `coalesce.solid_queue` events are published, so subscriber errors propagate unchanged, even after work has committed. Retrying a collecting job still wraps creation and transfer of its calls together.
 
 ## Deadlock retries
 
