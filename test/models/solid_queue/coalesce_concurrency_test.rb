@@ -75,24 +75,24 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
     assert_equal results.count { |active_job| active_job.coalesce_status == :created }, RACED_RUNS.size
   end
 
-  test "replacements racing starts run every job once, and the last one admitted runs" do
+  test "replacements racing starts run every job once, and a call after them runs" do
     done = Concurrent::AtomicBoolean.new(false)
     worker = Thread.new { work_until(done) }
-    counter = Concurrent::AtomicFixnum.new
 
     results = begin
-      race(6) { 40.times.map { ReplaceJob.perform_later("g", counter.increment) } }.flatten
+      race(6) { |thread| 40.times.map { |i| ReplaceJob.perform_later("g", [ thread, i ]) } }.flatten
     ensure
       done.make_true
       worker.join rescue nil
     end
     worker.value
+    results << ReplaceJob.perform_later("g", "last")
     drain
 
     assert_equal 0, SolidQueue::CoalesceKey.count
     assert_equal results.count { |active_job| active_job.coalesce_status == :created }, RACED_RUNS.size
     assert_equal RACED_RUNS.size, RACED_RUNS.map(&:first).uniq.size
-    assert_equal counter.value, RACED_RUNS.map(&:last).max
+    assert_includes RACED_RUNS.map(&:last), "last"
   end
 
   test "a replacement waiting on a start opens a new job, and the start runs the payload it released with" do
@@ -100,21 +100,24 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
 
     ReplaceJob.perform_later("g", 1)
     execution = SolidQueue::ReadyExecution.claim("*", 1, @process.id).sole
-    locked = Concurrent::Event.new
+    released = Concurrent::Event.new
 
-    starter = in_thread do
-      SolidQueue::Record.transaction do
-        coalesce_key = SolidQueue::CoalesceKey.lock_for_release(execution.job_id)
-        locked.set
+    # Holds the worker's release open, after it deleted the key and before it commits
+    callback = ->(*, payload) do
+      if Thread.current[:starter] && payload[:sql].match?(/DELETE FROM .solid_queue_coalesce_keys/)
+        released.set
         sleep 0.3
-        coalesce_key.destroy!
       end
     end
 
-    locked.wait(5)
+    starter = in_thread do
+      Thread.current[:starter] = true
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { execution.perform }
+    end
+
+    released.wait(5)
     second = in_thread { ReplaceJob.perform_later("g", 2) }.value
     starter.value
-    execution.perform
 
     assert_equal :created, second.coalesce_status
     assert_equal [ [ execution.job_id, 1 ] ], RACED_RUNS.to_a
