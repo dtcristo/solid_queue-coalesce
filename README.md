@@ -468,7 +468,7 @@ Except for `key:`, an invalid option raises `ArgumentError` when the class loads
 `key` takes the same forms as the `key` of [`limits_concurrency`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls), and is built the same way:
 
 ```ruby
-coalesce key: :global                                       # Static job-wide key
+coalesce key: :global                                       # Literal class-wide key: JobClass/global
 coalesce key: "global"                                      # Same literal component
 coalesce key: ->(account_id) { account_id }                 # Distinct per account
 coalesce key: ->(account) { account }                       # Active Record class and ID
@@ -479,8 +479,8 @@ coalesce key: ->(account_id, kind) { [ account_id, kind ] } # Composite key
 - A Proc receives the job's arguments.
 - The result is joined into a string, so `1` and `"1"` give the same key.
 - An array's items are joined with `/`, so `[ "a/b" ]` and `[ "a", "b" ]` give the same key.
-- A Proc that returns `nil` gives the class-wide key, so all of those calls merge.
-- A declaration of `nil` or `false` disables coalescing. Other unsupported declaration types, such as `key: 123`, give the class-wide key.
+- A Proc that returns `nil` gives the bare class-wide key, `JobClass`, so all of those calls merge.
+- A declaration of `nil` or `false` disables coalescing, as it disables `limits_concurrency`, so `key: nil` isn't a class-wide key. For one key per class, use a literal such as `:global`, or a Proc that returns `nil`. Other unsupported declaration types, such as `key: 123`, give the class-wide key.
 - Blank declarations still coalesce: `key: ""` gives `JobClass/`, and `key: []` or `key: {}` gives `JobClass`. These keys are scoped to the batch too.
 - Keys longer than 255 characters fail on MySQL.
 
