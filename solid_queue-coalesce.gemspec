@@ -23,16 +23,4 @@ Gem::Specification.new do |spec|
 
   # Patches private Solid Queue methods, so each new minor has to be tested first
   spec.add_dependency "solid_queue", "~> 1.7.0"
-
-  spec.add_development_dependency "appraisal"
-  spec.add_development_dependency "debug", "~> 1.9"
-  spec.add_development_dependency "minitest", "~> 5.0"
-  spec.add_development_dependency "mocha"
-  spec.add_development_dependency "mysql2"
-  spec.add_development_dependency "pg"
-  spec.add_development_dependency "sqlite3"
-  spec.add_development_dependency "rubocop-rails-omakase"
-  spec.add_development_dependency "solid_queue-rate_limit", "~> 0.2.1"
-  spec.add_development_dependency "rdoc"
-  spec.add_development_dependency "logger"
 end
