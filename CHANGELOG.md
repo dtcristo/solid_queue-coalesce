@@ -11,11 +11,11 @@ Adds `on_conflict: :replace`, which runs a pending job with its latest call's ar
 ### Added
 
 - `on_conflict: :replace` for `coalesce`. A call writes its arguments over the pending job's, which keeps its ID, queue, priority and place in line, and runs `perform` with the latest ones. It reports `:replaced`, works with `debounce:`, `max_wait:`, blocking concurrency limits and batches, and can't be used by a recurring task. ([#47](https://github.com/dtcristo/solid_queue-coalesce/pull/47))
-- README recipe that syncs the latest state one at a time under an API quota, combining `coalesce` with `limits_concurrency` and [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) 0.2, with a table of which control acts at each step.
+- README recipe that syncs the latest state one at a time under an API quota, combining `coalesce` with `limits_concurrency` and [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) 0.2, with a table of which control acts at each step. ([#53](https://github.com/dtcristo/solid_queue-coalesce/pull/53))
 
 ### Changed
 
-- A replacement keeps the pending job's [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) key, as it keeps its concurrency key, so the job is charged to the budget of the call that created it.
+- A replacement keeps the pending job's [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) key, as it keeps its concurrency key, so the job is charged to the budget of the call that created it. ([#53](https://github.com/dtcristo/solid_queue-coalesce/pull/53))
 - **Breaking:** Serialized job data uses `solid_queue_coalesce_on_conflict` instead of `coalesce_on_conflict`, with no fallback. Drain all coalesced work, including retrying or discarding failures, before deploying. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** `coalesce(key:)` accepts declarations without type or blank validation, like `limits_concurrency`. Unsupported truthy types produce a class-wide key, blank declarations coalesce, and `nil` or `false` disables coalescing. Other options retain their validation. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** Bulk enqueues propagate original Active Record errors for coalesced jobs, like native bulk enqueue. Single enqueues retain `SolidQueue::Job::EnqueueError`; notification subscriber errors remain unwrapped. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
