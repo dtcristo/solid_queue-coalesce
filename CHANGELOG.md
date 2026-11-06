@@ -14,7 +14,7 @@ Adds `on_conflict: :replace`, which runs a pending job with its latest call's ar
 
 ### Changed
 
-- **Breaking:** Requires Solid Queue 1.7.2 or newer, since `:replace` uses a constant 1.7.0 and 1.7.1 don't define. Earlier 1.7 releases raised `NameError` at boot.
+- **Breaking:** Requires Solid Queue 1.7.2 or newer, since `:replace` uses a constant 1.7.0 and 1.7.1 don't define. Earlier 1.7 releases raised `NameError` at boot. ([#52](https://github.com/dtcristo/solid_queue-coalesce/pull/52))
 - **Breaking:** Serialized job data uses `solid_queue_coalesce_on_conflict` instead of `coalesce_on_conflict`, with no fallback. Drain all coalesced work, including retrying or discarding failures, before deploying. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** `coalesce(key:)` accepts declarations without type or blank validation, like `limits_concurrency`. Unsupported truthy types produce a class-wide key, blank declarations coalesce, and `nil` or `false` disables coalescing. Other options retain their validation. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** Bulk enqueues propagate original Active Record errors for coalesced jobs, like native bulk enqueue. Single enqueues retain `SolidQueue::Job::EnqueueError`; notification subscriber errors remain unwrapped. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
