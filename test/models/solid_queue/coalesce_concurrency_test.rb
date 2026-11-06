@@ -125,6 +125,7 @@ class SolidQueue::CoalesceConcurrencyTest < ActiveSupport::TestCase
 
   test "a replacement and a stale semaphore writer keep both writes, whichever goes first" do
     skip_on_sqlite
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
 
     [ :replacement, :semaphore ].each do |first|
       SolidQueue::Semaphore.delete_all

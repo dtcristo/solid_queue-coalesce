@@ -23,3 +23,23 @@ end
 appraise "rails-main" do
   gem "railties", github: "rails/rails", branch: "main"
 end
+
+appraise "solid-queue-1-7-0" do
+  gem "railties", "~> 8.1.0"
+  gem "solid_queue", "1.7.0"
+end
+
+appraise "solid-queue-1-7-1" do
+  gem "railties", "~> 8.1.0"
+  gem "solid_queue", "1.7.1"
+end
+
+appraise "solid-queue-1-7-2" do
+  gem "railties", "~> 8.1.0"
+  gem "solid_queue", "1.7.2"
+end
+
+appraise "solid-queue-main" do
+  gem "railties", "~> 8.1.0"
+  gem "solid_queue", github: "rails/solid_queue", branch: "main"
+end
