@@ -428,7 +428,7 @@ With `coalesce`, a retry can't be discarded by the key, and a blocked retry wait
 | --- | --- |
 | Ruby | 3.2 and newer |
 | Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main, except on Ruby 3.2 |
-| Solid Queue | 1.7 |
+| Solid Queue | 1.7.2 and newer 1.7 releases |
 | Database | MySQL, PostgreSQL and SQLite |
 
 CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.

@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Adds `on_conflict: :replace`, which runs a pending job with its latest call's arguments. Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
+Adds `on_conflict: :replace`, which runs a pending job with its latest call's arguments. Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix, and Solid Queue 1.7.2 is the minimum. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
 
 ### Added
 
@@ -14,6 +14,7 @@ Adds `on_conflict: :replace`, which runs a pending job with its latest call's ar
 
 ### Changed
 
+- **Breaking:** Requires Solid Queue 1.7.2 or newer, since `:replace` uses a constant 1.7.0 and 1.7.1 don't define. Earlier 1.7 releases raised `NameError` at boot.
 - **Breaking:** Serialized job data uses `solid_queue_coalesce_on_conflict` instead of `coalesce_on_conflict`, with no fallback. Drain all coalesced work, including retrying or discarding failures, before deploying. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** `coalesce(key:)` accepts declarations without type or blank validation, like `limits_concurrency`. Unsupported truthy types produce a class-wide key, blank declarations coalesce, and `nil` or `false` disables coalescing. Other options retain their validation. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))
 - **Breaking:** Bulk enqueues propagate original Active Record errors for coalesced jobs, like native bulk enqueue. Single enqueues retain `SolidQueue::Job::EnqueueError`; notification subscriber errors remain unwrapped. ([#46](https://github.com/dtcristo/solid_queue-coalesce/pull/46))

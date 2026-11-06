@@ -1,5 +1,7 @@
 # Upgrading from version 0.2.0 to 0.3.0
 
+This version needs Solid Queue 1.7.2 or newer. Run `bundle update solid_queue-coalesce solid_queue` if your lockfile has an older 1.7 release.
+
 The serialized job marker is now `solid_queue_coalesce_on_conflict`, and the old `coalesce_on_conflict` name is no longer read. Drain all coalesced work on the old version before deploying. No database migration or payload conversion is provided.
 
 Batched coalescing keys also start with `Batch/<id>/` instead of `SolidQueue::Batch/<id>/`. New calls won't join pending jobs under the old keys and can create separate jobs for the same work, so affected batches must finish too.
