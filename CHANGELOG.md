@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- The gemspec lists only Solid Queue. Development dependencies are in the Gemfile, and CI tests the latest release of [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) alongside.
+- The gemspec lists only Solid Queue. Development dependencies are in the Gemfile, and CI tests the latest release of [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) alongside. ([#56](https://github.com/dtcristo/solid_queue-coalesce/pull/56))
 
 ## [0.3.0] - 2026-11-06
 
