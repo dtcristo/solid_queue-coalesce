@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
 Adds `on_conflict: :replace`, which runs a pending job with its latest call's arguments, and a recipe that combines it with `limits_concurrency` and [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit). Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
 
 ### Added
@@ -76,6 +78,7 @@ The first release lets many `perform_later` calls with the same key share one pe
 - The `coalesce.solid_queue` and `drop_coalesced_argument.solid_queue` notifications. ([#1](https://github.com/dtcristo/solid_queue-coalesce/pull/1))
 - Requires Solid Queue 1.7. ([#1](https://github.com/dtcristo/solid_queue-coalesce/pull/1))
 
-[Unreleased]: https://github.com/dtcristo/solid_queue-coalesce/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dtcristo/solid_queue-coalesce/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dtcristo/solid_queue-coalesce/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dtcristo/solid_queue-coalesce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dtcristo/solid_queue-coalesce/releases/tag/v0.1.0
