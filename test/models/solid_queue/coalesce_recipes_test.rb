@@ -60,6 +60,16 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     end
   end
 
+  class QuotaSyncContactJob < ApplicationJob
+    coalesce key: ->(user_id, *) { user_id }, on_conflict: :replace, debounce: 10.seconds
+    limits_concurrency key: ->(user_id, *) { user_id }
+    limits_rate to: 2, per: 1.second, burst: 2, group: "RecipesCrm", key: :global
+
+    def perform(user_id, attributes)
+      JobBuffer.add([ user_id, attributes ])
+    end
+  end
+
   class SealingJob < ApplicationJob
     coalesce key: "sealing", on_conflict: :collect, max_calls: 2
 
@@ -207,7 +217,7 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
   test "every job class in the README loads with the options it shows" do
     classes = File.read(File.expand_path("../../../README.md", __dir__)).scan(/^class \w+ < ApplicationJob$.*?^end$/m)
 
-    assert_operator classes.size, :>=, 9
+    assert_operator classes.size, :>=, 10
     classes.reject! { |definition| definition.include?("ActiveJob::Continuable") } unless defined?(ActiveJob::Continuable)
     classes.each { |definition| Module.new.module_eval(definition) }
   end
@@ -257,6 +267,24 @@ class SolidQueue::CoalesceRecipesTest < ActiveSupport::TestCase
     end
 
     assert_equal [ [ 1, { "name" => "Edsger" } ] ], JobBuffer.values
+  end
+
+  test "syncs under a quota run once for each user with the latest arguments, two at once and then one a second" do
+    calls_at(0) { [ 1, 2, 3 ].each { |user_id| QuotaSyncContactJob.perform_later(user_id, { "name" => "old" }) } }
+    calls_at(4) { [ 1, 2, 3 ].each { |user_id| QuotaSyncContactJob.perform_later(user_id, { "name" => "new" }) } }
+    assert_equal 3, SolidQueue::Job.count
+
+    travel_to(@start + 14.seconds) do
+      SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+      perform_ready_jobs
+    end
+    assert_equal 2, JobBuffer.values.size
+
+    travel_to(@start + 15.seconds) do
+      SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+      perform_ready_jobs
+    end
+    assert_equal [ 1, 2, 3 ].map { |user_id| [ user_id, { "name" => "new" } ] }, JobBuffer.values.sort_by(&:first)
   end
 
   test "a key opens, seals and starts as the lifecycle diagram draws it" do

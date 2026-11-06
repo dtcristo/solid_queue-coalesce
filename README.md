@@ -52,6 +52,8 @@ BulkReindexProductsJob.set(wait: 30.seconds).perform_later(product.account_id, p
 
 A job accepts calls until it starts. A collecting job also stops at `max_calls`, 100 by default. A call after that opens a new job, so no change gets missed, but two runs can overlap. Add [`limits_concurrency`](#coalesce-or-limits_concurrency) to stop that.
 
+To limit how fast the coalesced jobs run, pair it with [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit). The [last recipe](#sync-the-latest-state-one-at-a-time-under-an-api-quota) uses both.
+
 ## Features
 
 - [Dedupe](#dedupe-jobs-with-one-pending-job-per-key). Calls with the same key share one pending job, which runs with the first call's arguments.
@@ -153,6 +155,10 @@ Collect, so one run gets every call's arguments:
 Run every call:
 
 - [One at a time, without `coalesce`](#run-every-call-one-at-a-time)
+
+Under an API's quota:
+
+- [The latest state, one at a time for each key](#sync-the-latest-state-one-at-a-time-under-an-api-quota)
 
 `Product`, `SearchIndex` and the other names in these recipes stand in for your own code.
 
@@ -391,6 +397,37 @@ ApplyLedgerEntryJob.perform_later(account.id, entry.id)
 
 Each call creates its own job, and they wait their turn. See Solid Queue's [concurrency controls](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls).
 
+### Sync the latest state one at a time, under an API quota
+
+Use this when each call carries a contact's whole current state, two syncs for one contact mustn't overlap, and all syncs together have to stay under the CRM's quota. It needs [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit).
+
+```ruby
+class SyncContactJob < ApplicationJob
+  # One pending and one running sync for each user, and at most 2 claims in any second across them
+  coalesce key: ->(user_id, *) { user_id }, on_conflict: :replace, debounce: 10.seconds
+  limits_concurrency key: ->(user_id, *) { user_id }
+  limits_rate to: 2, per: 1.second, burst: 2, group: "Crm", key: :global
+
+  def perform(user_id, attributes)
+    Crm.update_contact(user_id, attributes)
+  end
+end
+
+SyncContactJob.perform_later(user.id, user.slice(:name, :email))
+```
+
+Each control acts at a different step of the job's life:
+
+| Step | What happens | Control |
+| --- | --- | --- |
+| `perform_later` | The call replaces the user's pending job's arguments, or creates the job. While the job is scheduled, the call can move it later, to 10 seconds after the call, but never earlier. The job keeps the concurrency and rate limit keys of the call that created it | `coalesce` |
+| The job is due | It takes the user's concurrency slot, or is blocked until the running sync finishes | `limits_concurrency` |
+| A worker claims it | The quota admits it, or it waits as a scheduled job and gives its concurrency slot back. When it's due again, it takes a slot or is blocked, and the next claim checks the quota again | `limits_rate` |
+| `perform` starts | The job reads its latest arguments, and the key is free, so the next call creates the next pending job | `coalesce` |
+| `perform` finishes | The concurrency slot is free, and the user's blocked job becomes ready | `limits_concurrency` |
+
+A job that's blocked or waiting on the quota hasn't started, so calls keep replacing its arguments. The quota counts claims, not requests to the CRM, so make one request in each run. See Solid Queue Rate Limit's [recipes](https://github.com/dtcristo/solid_queue-rate_limit#recipes) for picking `burst:`, and its recipe that [batches calls under a quota](https://github.com/dtcristo/solid_queue-rate_limit#batch-calls-under-a-quota).
+
 ## `coalesce` or `limits_concurrency`?
 
 `coalesce` limits how many jobs wait. [`limits_concurrency`](https://github.com/rails/solid_queue/blob/v1.7.0/README.md#concurrency-controls) limits how many run.
@@ -415,12 +452,13 @@ With `coalesce`, a retry can't be discarded by the key, and a blocked retry wait
 ## Things to know
 
 - It's a separate gem that adds to Solid Queue from the outside, with its own tables. It only works with the Solid Queue adapter, because a foreign key to the job and a shared transaction are what let it work without a time window to configure.
-- The first call wins. It sets the job's schedule, queue, priority and concurrency key, and later calls don't change them. With `debounce:`, later calls can move the schedule. With `:replace`, they replace the arguments. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
+- The first call wins. It sets the job's schedule, queue, priority, concurrency key and rate limit key, and later calls don't change them. With `debounce:`, later calls can move the schedule. With `:replace`, they replace the arguments. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling) and [Debouncing](#debouncing).
 - With `:collect`, a full job is sealed but still waits for its time, and the next call opens a new job. See [Collecting jobs and scheduling](#collecting-jobs-and-scheduling).
 - Coalesced jobs can overlap, because the key is free as soon as a job starts. Use `limits_concurrency` to prevent that. See [Recurring jobs and concurrency limits](#recurring-jobs-and-concurrency-limits).
 - `ActiveJob.perform_all_later` can admit some calls and then raise, unless you wrap it in a queue-database transaction. See [Bulk enqueues](#bulk-enqueues).
 - `successfully_enqueued?` doesn't tell you what happened to a call, and `ActiveJob.perform_all_later` skips enqueue callbacks. Read `coalesce_status`. See [Enqueue outcomes](#enqueue-outcomes).
 - A transaction on your app's database doesn't cover an enqueue to a separate queue database. See [Transactions](#transactions).
+- It works with [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit), which checks its limit when a worker claims the job, after calls have coalesced at enqueue. See [Sync the latest state one at a time, under an API quota](#sync-the-latest-state-one-at-a-time-under-an-api-quota).
 
 ## Compatibility
 
@@ -430,6 +468,7 @@ With `coalesce`, a retry can't be discarded by the key, and a blocked retry wait
 | Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main |
 | Solid Queue | 1.7. CI runs 1.7.0, 1.7.1, 1.7.2 and main |
 | Database | MySQL, PostgreSQL and SQLite |
+| [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) | Optional. CI tests 0.2 alongside |
 
 CI runs each Rails and Solid Queue version against all three databases. Ruby 3.2 runs with Rails 7.1, 3.3 with 7.2, 3.4 with 8.0, and 4.0 with the rest.
 
@@ -490,7 +529,7 @@ The key column is declared like the one on Solid Queue's semaphores, with the da
 
 ## Replacing arguments
 
-With `on_conflict: :replace`, a call that finds a pending job writes its whole Active Job payload over the job's, and the job runs `perform` with it. Custom fields from your own `serialize` come from that call too, and ones it doesn't set are gone. Nothing older is kept, so there's no call table to fill and no `max_calls`. The job keeps its ID, `active_job_id`, queue, priority, batch, concurrency key and schedule, unless [`debounce:`](#debouncing) moves it.
+With `on_conflict: :replace`, a call that finds a pending job writes its whole Active Job payload over the job's, and the job runs `perform` with it. Custom fields from your own `serialize` come from that call too, and ones it doesn't set are gone. Nothing older is kept, so there's no call table to fill and no `max_calls`. The job keeps its ID, `active_job_id`, queue, priority, batch, concurrency key, [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) key and schedule, unless [`debounce:`](#debouncing) moves it. Calls with the same coalescing key should give the same concurrency and rate limit keys, because only the first call's are used.
 
 The key is released when a worker starts the job, and the job's payload is read again after that, before Active Job deserializes it. So a replacement admitted before the start runs in that run, even if a worker had already claimed the job, and a call after it opens the next job. "Latest" means the last call admitted under the key's lock, not a timestamp or a revision of your data.
 

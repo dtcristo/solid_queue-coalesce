@@ -10,6 +10,7 @@ require "rails/test_unit/railtie"
 # you've limited to :test, :development, or :production.
 Bundler.require(*Rails.groups)
 require "solid_queue/coalesce"
+require "solid_queue/rate_limit"
 
 
 module Dummy
