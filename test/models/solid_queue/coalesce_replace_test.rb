@@ -275,6 +275,7 @@ class SolidQueue::CoalesceReplaceTest < ActiveSupport::TestCase
   end
 
   test "a replacement keeps the semaphore a job holds, and a stale writer keeps the replacement" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     LimitedReplacingJob.perform_later("a", 1)
     LimitedReplacingJob.perform_later("b", 1)
     held, blocked = SolidQueue::Job.order(:id).to_a
