@@ -185,27 +185,31 @@ class SolidQueue::CoalesceRateLimitTest < ActiveSupport::TestCase
     assert_equal [ [ "a", "us" ] ], JobBuffer.values
   end
 
-  test "a replacement after the claim keeps the key the claim charged" do
-    RegionalSpendJob.perform_later("us")
-    perform_claimed
-
-    RegionalJob.perform_later("a", "eu")
-    claimed = claim
-    RegionalJob.perform_later("a", "us")
-    claimed.each(&:perform)
-
-    assert_equal [ [ "a", "us" ] ], JobBuffer.values
-    assert_equal "CoalesceRateLimitTestRegions/eu", SolidQueue::Job.find_by!(class_name: RegionalJob.name).arguments[ActiveJob::RateControls::RATE_LIMIT_KEY]
-  end
-
-  test "a retry of a replaced job keeps the first call's rate limit key" do
+  test "a retry of a replaced job waits on the budget its run was charged to" do
     RegionalJob.fail_once = true
     RegionalJob.perform_later("a", "eu")
     RegionalJob.perform_later("a", "us")
     perform_claimed
 
-    retry_job = SolidQueue::Job.where(finished_at: nil).sole
-    assert_equal "CoalesceRateLimitTestRegions/eu", retry_job.arguments[ActiveJob::RateControls::RATE_LIMIT_KEY]
+    perform_claimed
+    assert_empty JobBuffer.values
+
+    pass_window
+    assert_equal [ [ "a", "us" ] ], JobBuffer.values
+  end
+
+  test "a replacement after the claim runs in that run, and its retry is charged to the key the claim charged" do
+    RegionalJob.fail_once = true
+    RegionalJob.perform_later("a", "eu")
+    claimed = claim
+    assert_equal :replaced, RegionalJob.perform_later("a", "us").coalesce_status
+    claimed.each(&:perform)
+
+    perform_claimed
+    assert_empty JobBuffer.values
+
+    pass_window
+    assert_equal [ [ "a", "us" ] ], JobBuffer.values
   end
 
   test "with a concurrency limit, a call during a run waits behind it and takes later arguments, and waits on the rate without holding the slot" do
