@@ -14,9 +14,10 @@ module SolidQueue
       end
 
       # What a replacement keeps from the job: what identifies it, its place in line,
-      # its batch, its marker and the semaphore Solid Queue recorded for it. Solid Queue
-      # 1.7.2 names that entry ConcurrencyControls::CONCURRENCY_LOCK_KEY, which 1.7.0 and 1.7.1 lack.
-      REPLACEMENT_KEPT_KEYS = %w[ job_class job_id queue_name priority enqueued_at scheduled_at batch_id callback_batch_id solid_queue_coalesce_on_conflict solid_queue_concurrency_lock ]
+      # its batch, its marker, the semaphore Solid Queue recorded for it and the key
+      # solid_queue-rate_limit charges it to, so the first call's keys win. Solid Queue 1.7.2
+      # names the semaphore entry ConcurrencyControls::CONCURRENCY_LOCK_KEY, which 1.7.0 and 1.7.1 lack.
+      REPLACEMENT_KEPT_KEYS = %w[ job_class job_id queue_name priority enqueued_at scheduled_at batch_id callback_batch_id solid_queue_coalesce_on_conflict solid_queue_concurrency_lock solid_queue_rate_limit_key ]
 
       class_methods do
         # Every call in active_jobs has the same key. Returns the job if a call
