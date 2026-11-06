@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The gemspec lists only Solid Queue. Development dependencies are in the Gemfile, and CI tests the latest release of [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit) alongside.
+
 ## [0.3.0] - 2026-11-06
 
 Adds `on_conflict: :replace`, which runs a pending job with its latest call's arguments, and a recipe that combines it with `limits_concurrency` and [Solid Queue Rate Limit](https://github.com/dtcristo/solid_queue-rate_limit). Aligns key declarations and bulk enqueue errors with upstream Solid Queue, and prefixes the serialized coalescing marker with `solid_queue_`. Batch coalescing keys also use the shorter `Batch/` prefix. Upgrading takes work: drain coalesced jobs and affected batches, retry or discard failed jobs on the old version, and deploy all processes together; see [UPGRADING.md](https://github.com/dtcristo/solid_queue-coalesce/blob/main/UPGRADING.md).
